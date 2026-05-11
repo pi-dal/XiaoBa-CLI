@@ -21,6 +21,9 @@ jobs:
         with:
           node-version: ${{ env.NODE_VERSION }}
 
+      - name: Verify source version matches stable tag
+        run: npm run release:verify-version
+
       - name: Validate release branding
         run: npm run release:check
 
