@@ -113,11 +113,11 @@
           "sources": [
             {
               "url": "https://github.com/astral-sh/python-build-standalone/releases/download/20241016/cpython-3.12.7%2B20241016-x86_64-apple-darwin-install_only_stripped.tar.gz",
-              "sha256": "8e92d65b245b572fa6f520d428a9807a9da36428c7379a11d41ae428e69ed921"
+              "sha256": "848405b92bda20fad1f9bba99234c7d3f11e0b31e46f89835d1cb3d735e932aa"
             },
             {
               "url": "https://github.com/indygreg/python-build-standalone/releases/download/20241016/cpython-3.12.7%2B20241016-x86_64-apple-darwin-install_only_stripped.tar.gz",
-              "sha256": "8e92d65b245b572fa6f520d428a9807a9da36428c7379a11d41ae428e69ed921"
+              "sha256": "848405b92bda20fad1f9bba99234c7d3f11e0b31e46f89835d1cb3d735e932aa"
             }
           ]
         },
