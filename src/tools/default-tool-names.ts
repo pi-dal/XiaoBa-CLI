@@ -11,6 +11,8 @@ export const DEFAULT_TOOL_NAMES = [
   'check_subagent',
   'stop_subagent',
   'resume_subagent',
+  'update_plan',
+  'record_decision',
   'skill',
 ] as const;
 
