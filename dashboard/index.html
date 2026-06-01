@@ -5862,7 +5862,7 @@
           '<div class="skill-desc">'+escapeHtml(item.description || '')+'</div>'+
           '<div class="skill-meta">'+tags+'<span class="tag">v'+escapeHtml(latestVersion || '-')+'</span></div>'+
           '<div class="skill-files">'+escapeHtml((item.triggerExamples || []).slice(0, 3).join(', '))+'</div>'+
-          '<div class="skill-actions"><button class="btn btn-primary" '+installAttrs+'>'+(installed?'Installed':'Install')+'</button><button class="btn" onclick="showSkillHubVersions(\''+escapeHtml(skillId).replace(/'/g, '&#39;')+'\')">Versions</button></div>'+
+          '<div class="skill-actions"><button class="btn btn-primary" '+installAttrs+'>'+(installed?'Installed':'Install')+'</button><button class="btn" data-skillhub-versions="true" data-skill-id="'+escapeHtml(skillId)+'">Versions</button></div>'+
         '</div>';
       }).join('');
     }
@@ -5875,6 +5875,24 @@
       const version = button.dataset.version || '';
       if (!skillId) return;
       installSkillHubSkill(skillId, version || undefined);
+    }
+
+    function handleSkillHubVersionsClick(event) {
+      const button = event.target?.closest?.('[data-skillhub-versions]');
+      if (!button || button.disabled) return;
+      event.preventDefault();
+      const skillId = button.dataset.skillId || '';
+      if (!skillId) return;
+      showSkillHubVersions(skillId);
+    }
+
+    function handleSkillHubYankVersionClick(event) {
+      const button = event.target?.closest?.('[data-skillhub-yank-version]');
+      if (!button || button.disabled) return;
+      event.preventDefault();
+      const packageVersionId = button.dataset.packageVersionId || '';
+      if (!packageVersionId) return;
+      yankOwnSkillHubVersion(packageVersionId);
     }
 
     async function installSkillHubSkill(skillId, version) {
@@ -5927,7 +5945,7 @@
             : 'disabled';
           const packageVersionId = ownerVersion?.packageVersionId || ownerVersion?.id || '';
           const removeButton = packageVersionId && (ownerVersion?.status || 'published') === 'published'
-            ? '<button class="btn btn-danger" onclick="yankOwnSkillHubVersion(\''+escapeHtml(packageVersionId).replace(/'/g, '&#39;')+'\')">Remove version</button>'
+            ? '<button class="btn btn-danger" data-skillhub-yank-version="true" data-package-version-id="'+escapeHtml(packageVersionId)+'">Remove version</button>'
             : '';
           return '<div class="portal-row">'+
             '<strong>v'+escapeHtml(version || '-')+'</strong>'+
@@ -5986,7 +6004,7 @@
             const downloads = Number(item.downloadCount || 0);
             const packageVersionId = item.packageVersionId || item.id || '';
             const actions = item.status === 'published' && packageVersionId
-              ? '<div class="config-actions" style="margin-top:8px"><button class="btn btn-danger" onclick="yankOwnSkillHubVersion(\''+escapeHtml(packageVersionId).replace(/'/g, '&#39;')+'\')">Remove version</button></div>'
+              ? '<div class="config-actions" style="margin-top:8px"><button class="btn btn-danger" data-skillhub-yank-version="true" data-package-version-id="'+escapeHtml(packageVersionId)+'">Remove version</button></div>'
               : '';
             return '<div class="portal-row"><strong>'+escapeHtml(item.skillId || item.name || '-')+'</strong><div class="settings-meta">v'+escapeHtml(item.latestVersion || item.version || '-')+' · '+escapeHtml(item.status || 'published')+' · downloads '+downloads+published+'</div><div class="settings-meta">'+escapeHtml(author)+' · owner managed</div>'+actions+'</div>';
           }).join('') : '<div class="loading">No published versions</div>';
@@ -9025,10 +9043,13 @@
     autoResizeCatsMessageInput();
     setupCatsAttachmentInputs();
     document.getElementById('skillhub-registry-grid')?.addEventListener('click', handleSkillHubInstallClick);
+    document.getElementById('skillhub-registry-grid')?.addEventListener('click', handleSkillHubVersionsClick);
     document.getElementById('skillhub-versions-body')?.addEventListener('click', handleSkillHubInstallClick);
+    document.getElementById('skillhub-versions-body')?.addEventListener('click', handleSkillHubYankVersionClick);
+    document.getElementById('skillhub-package-versions-list')?.addEventListener('click', handleSkillHubYankVersionClick);
     document.addEventListener('keydown',handleDashboardFontScaleShortcut);
     window.addEventListener('resize',()=>{refreshDashboardFontScaleForViewport(); autoResizeCatsMessageInput();});
-    document.addEventListener('keydown',e=>{if(e.key==='Escape'){closeLogs();closeUpdateModal();closeCatsMediaPreview();}});
+    document.addEventListener('keydown',e=>{if(e.key==='Escape'){closeLogs();closeUpdateModal();closeCatsMediaPreview();closeSkillHubVersionsModal();}});
     document.addEventListener('click',e=>{const shell=document.getElementById('floating-pet');if(shell && !shell.contains(e.target)) closeFloatingPetMenu();});
   </script>
 </body>
