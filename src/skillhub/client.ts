@@ -25,6 +25,16 @@ export interface SkillHubLoginInput {
   password: string;
 }
 
+export interface SkillHubCatsCoExchangeInput {
+  token: string;
+  baseUrl: string;
+  user?: {
+    uid?: string;
+    username?: string;
+    displayName?: string;
+  };
+}
+
 export class SkillHubClient {
   readonly config: SkillHubConfig;
   private readonly sessionStore: SkillHubSessionStore;
@@ -67,6 +77,11 @@ export class SkillHubClient {
 
   async login(input: SkillHubLoginInput): Promise<SkillHubAuthState> {
     await this.request('POST', '/api/auth/login', input);
+    return this.status();
+  }
+
+  async loginWithCatsCo(input: SkillHubCatsCoExchangeInput): Promise<SkillHubAuthState> {
+    await this.request('POST', '/api/auth/catsco-exchange', input);
     return this.status();
   }
 
@@ -117,17 +132,21 @@ export class SkillHubClient {
         submissions: [],
       };
     }
-    const [applicationResult, submissionsResult] = await Promise.all([
+    const [applicationResult, submissionsResult, packageVersionsResult] = await Promise.all([
       this.request<any>('GET', '/api/developer-applications/me').catch(error => ({ error })),
       status.roles.includes('developer')
         ? this.request<any>('GET', '/api/developer/submissions').catch(error => ({ error, submissions: [] }))
         : Promise.resolve({ submissions: [] }),
+      status.roles.includes('developer')
+        ? this.request<any>('GET', '/api/developer/package-versions').catch(error => ({ error, packageVersions: [] }))
+        : Promise.resolve({ packageVersions: [] }),
     ]);
     return {
       ...status,
       authenticated: true,
       application: applicationResult?.application || null,
       submissions: submissionsResult?.submissions || [],
+      packageVersions: packageVersionsResult?.packageVersions || [],
     };
   }
 
@@ -148,6 +167,14 @@ export class SkillHubClient {
       ...input,
       quickShare: true,
     });
+  }
+
+  async yankOwnPackageVersion(packageVersionId: string, reason = ''): Promise<any> {
+    return this.request(
+      'POST',
+      `/api/developer/package-versions/${encodeURIComponent(packageVersionId)}/yank`,
+      { reason },
+    );
   }
 
   private async request<T>(method: string, apiPath: string, body?: unknown): Promise<T> {

@@ -50,6 +50,26 @@ export class SkillHubService {
     });
   }
 
+  loginWithCatsCo(input: {
+    token: string;
+    baseUrl: string;
+    user?: { uid?: string; username?: string; displayName?: string };
+  }): Promise<SkillHubAuthState> {
+    const token = String(input.token || '').trim();
+    const baseUrl = String(input.baseUrl || '').trim();
+    if (!token || !baseUrl) {
+      const error: any = new Error('CatsCo login is required before connecting SkillHub.');
+      error.status = 401;
+      error.code = 'skillhub.catsco_login_required';
+      throw error;
+    }
+    return this.client.loginWithCatsCo({
+      token,
+      baseUrl,
+      user: input.user,
+    });
+  }
+
   logout(): Promise<{ ok: true }> {
     return this.client.logout();
   }
@@ -62,6 +82,10 @@ export class SkillHubService {
       ...response,
       installed: listInstalledSkillHubSkills(),
     };
+  }
+
+  async versions(skillId: string): Promise<any> {
+    return this.client.getSkill(skillId);
   }
 
   async install(skillId: string, version?: string): Promise<SkillHubInstallResult> {
@@ -111,6 +135,10 @@ export class SkillHubService {
       websiteUrl: String(input.websiteUrl || input.homepageUrl || '').trim(),
       reason: String(input.reason || '').trim(),
     });
+  }
+
+  yankOwnPackageVersion(packageVersionId: string, reason = ''): Promise<any> {
+    return this.client.yankOwnPackageVersion(packageVersionId, reason);
   }
 
   async createManifestDraft(input: any): Promise<any> {
@@ -207,13 +235,14 @@ export class SkillHubService {
 
   async getPublishedVersion(skillId: string, version: string): Promise<SkillHubRegistryEntry | undefined> {
     const detail = await this.client.getVersion(skillId, version);
-    return detail.version || detail.skill;
+    return normalizeRegistryEntryVersion(detail.version || detail.skill, version);
   }
 
   private async resolveRegistryEntry(skillId: string, version?: string): Promise<SkillHubRegistryEntry> {
     if (version) {
       const detail = await this.client.getVersion(skillId, version);
-      if (detail.version) return detail.version;
+      const entry = normalizeRegistryEntryVersion(detail.version || detail.skill, version);
+      if (entry) return entry;
     } else {
       const detail = await this.client.getSkill(skillId);
       if (detail.skill) return detail.skill;
@@ -225,9 +254,25 @@ export class SkillHubService {
   }
 }
 
+function normalizeRegistryEntryVersion(entry: SkillHubRegistryEntry | undefined, requestedVersion?: string): SkillHubRegistryEntry | undefined {
+  if (!entry) return undefined;
+  const version = String(entry.latestVersion || (entry as any).version || requestedVersion || '').trim();
+  return {
+    ...entry,
+    latestVersion: version,
+  };
+}
+
 const SOURCE_SKIP_DIRS = new Set([
   '.git',
   'node_modules',
+]);
+const SOURCE_SKIP_FILES = new Set([
+  'skill.json',
+  'REVIEW.json',
+  'SBOM.json',
+  '.xiaoba-bundled-skill.json',
+  '.xiaoba-skillhub-install.json',
 ]);
 const MAX_SOURCE_FILES = 200;
 const MAX_SOURCE_TOTAL_BYTES = 20 * 1024 * 1024;
@@ -268,7 +313,7 @@ function walk(dir: string): string[] {
       const fullPath = path.join(current, entry.name);
       if (entry.isDirectory()) {
         if (!SOURCE_SKIP_DIRS.has(entry.name)) visit(fullPath);
-      } else if (entry.isFile()) {
+      } else if (entry.isFile() && !SOURCE_SKIP_FILES.has(entry.name)) {
         result.push(fullPath);
       }
     }

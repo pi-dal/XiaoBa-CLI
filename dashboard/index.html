@@ -4864,11 +4864,11 @@
       <a class="nav-item" onclick="switchPage('services')" data-page="services">
         <span class="nav-icon">&gt;</span> <span>智能体中心</span>
       </a>
+      <a class="nav-item" onclick="switchPage('store')" data-page="store">
+        <span class="nav-icon">+</span> <span>Skills</span>
+      </a>
       <a class="nav-item" onclick="switchPage('companion')" data-page="companion">
         <span class="nav-icon">*</span> <span>伙伴中心</span>
-      </a>
-      <a class="nav-item" onclick="switchPage('developer')" data-page="developer">
-        <span class="nav-icon">{}</span> <span>开发者中心</span>
       </a>
     </nav>
     <div class="sidebar-footer">
@@ -5006,9 +5006,17 @@
           </section>
           </aside>
         </div>
-        <div id="companion-skillhub-section" style="margin-top:28px">
-          <div class="companion-skills-head">
-            <div class="section-title" style="margin-bottom:0">Skills</div>
+      </div>
+
+      <!-- Page: Store -->
+      <div class="page" id="page-store">
+        <div id="skillhub-section">
+          <div class="settings-header">
+            <div class="settings-heading">
+              <div class="settings-kicker">SkillHub</div>
+              <div class="section-title" style="margin-bottom:0">Skills</div>
+              <div class="settings-meta">公开 Skill 无需登录即可搜索和安装；登录后可分享本地 Skill 并管理已发布版本。</div>
+            </div>
             <button class="btn" onclick="refreshSkillHubPage()">刷新</button>
           </div>
           <div class="companion-skill-toolbar">
@@ -5035,6 +5043,72 @@
               <div class="skills-grid" id="store-grid"><div class="loading">加载中...</div></div>
             </div>
           </details>
+        </div>
+
+        <div class="settings-header" style="margin-top:28px">
+          <div class="settings-heading">
+            <div class="settings-kicker">SkillHub Developer</div>
+            <div class="section-title" style="margin-bottom:0">发布管理</div>
+            <div class="settings-meta">登录 SkillHub 后可申请开发者权限、提交 Skill、管理自己的已发布版本。</div>
+          </div>
+          <button class="btn" onclick="fetchSkillHubDeveloper()">刷新</button>
+        </div>
+
+        <div class="config-section" id="skillhub-account-card">
+          <div class="loading">正在检查 SkillHub 登录状态...</div>
+        </div>
+
+        <div class="config-section" id="skillhub-developer-status">
+          <div class="loading">正在读取开发者状态...</div>
+        </div>
+
+        <div class="config-section" id="skillhub-developer-apply">
+          <div class="config-group-title-main">申请成为开发者</div>
+          <div class="settings-meta" style="margin-bottom:14px">普通账号申请通过后，云端会给账号增加 developer 角色。</div>
+          <div class="chat-form-row" style="margin-bottom:10px">
+            <input class="config-input" id="skillhub-apply-name" placeholder="开发者显示名称" />
+            <input class="config-input" id="skillhub-apply-namespace" placeholder="命名空间，例如 contract-team" />
+          </div>
+          <div class="chat-form-row" style="margin-bottom:10px">
+            <input class="config-input" id="skillhub-apply-contact" placeholder="联系邮箱 / 微信 / 电话" />
+            <input class="config-input" id="skillhub-apply-homepage" placeholder="主页或组织链接（可选）" />
+          </div>
+          <textarea class="config-input" id="skillhub-apply-reason" rows="3" placeholder="简单说明你要发布哪些类型的 Skill"></textarea>
+          <div class="config-actions" style="margin-top:12px">
+            <button class="btn btn-primary" onclick="applySkillHubDeveloper()">提交申请</button>
+          </div>
+        </div>
+
+        <div class="config-section" id="skillhub-developer-console">
+          <div class="config-group-title-main">提交 Skill 审核</div>
+          <div class="settings-meta" style="margin-bottom:14px">选择本地 Skill 文件夹，填写基本信息；Agent 会读取文件、生成 manifest 草稿并提交云端扫描审核。</div>
+          <div class="settings-step-grid">
+            <label><span class="wizard-label">本地 Skill 文件夹</span><input class="config-input" id="skillhub-local-path" placeholder="例如 E:\skills\contract-review" /></label>
+            <label><span class="wizard-label">版本</span><input class="config-input" id="skillhub-version" value="1.0.0" /></label>
+            <label><span class="wizard-label">Skill 名称</span><input class="config-input" id="skillhub-name" placeholder="合同审查助手" /></label>
+            <label><span class="wizard-label">分类</span><input class="config-input" id="skillhub-category" placeholder="法务 / 办公 / 工程造价" /></label>
+            <label style="grid-column:1/-1"><span class="wizard-label">简介</span><input class="config-input" id="skillhub-description" placeholder="说明这个 Skill 解决什么问题" /></label>
+            <label style="grid-column:1/-1"><span class="wizard-label">关键词</span><input class="config-input" id="skillhub-keywords" placeholder="合同审查，采购合同，条款风险" /></label>
+            <label style="grid-column:1/-1"><span class="wizard-label">触发示例</span><textarea class="config-input" id="skillhub-triggers" rows="3" placeholder="帮我审查这份采购合同&#10;找出合同里的付款风险&#10;检查协议条款是否合理"></textarea></label>
+            <label><span class="wizard-label">权限</span><input class="config-input" id="skillhub-permissions" value="filesystem.read.user_selected" /></label>
+            <label><span class="wizard-label">仓库链接（可选）</span><input class="config-input" id="skillhub-repository-url" placeholder="https://github.com/org/repo" /></label>
+          </div>
+          <div class="config-actions" style="margin-top:14px">
+            <button class="btn" onclick="createSkillHubManifestDraft()">生成 skill.json 草稿</button>
+            <button class="btn btn-primary" onclick="submitSkillHubReview()">提交审核</button>
+          </div>
+          <pre class="manifest-preview" id="skillhub-manifest-preview" style="margin-top:14px">尚未生成 manifest。</pre>
+        </div>
+
+        <div class="config-section">
+          <div class="config-group-title-main">我的提交</div>
+          <div class="portal-list" id="skillhub-submissions-list"><div class="loading">暂无数据</div></div>
+        </div>
+
+        <div class="config-section">
+          <div class="config-group-title-main">My Published Versions</div>
+          <div class="settings-meta" style="margin-bottom:14px">Published SkillHub versions can be managed here. Public users can install any published version.</div>
+          <div class="portal-list" id="skillhub-package-versions-list"><div class="loading">No published versions</div></div>
         </div>
       </div>
 
@@ -5143,68 +5217,7 @@
         </div>
       </div>
 
-      <!-- Page: Developer -->
-      <div class="page" id="page-developer">
-        <div class="settings-header">
-          <div class="settings-heading">
-            <div class="settings-kicker">Developer Hub</div>
-            <div class="section-title" style="margin-bottom:0">Developer Hub</div>
-            <div class="settings-meta">申请开发者权限、生成 skill.json、提交 Skill 到云端审核。</div>
-          </div>
-          <button class="btn" onclick="fetchSkillHubDeveloper()">刷新</button>
-        </div>
 
-        <div class="config-section" id="skillhub-account-card">
-          <div class="loading">正在检查 SkillHub 登录状态...</div>
-        </div>
-
-        <div class="config-section" id="skillhub-developer-status">
-          <div class="loading">正在读取开发者状态...</div>
-        </div>
-
-        <div class="config-section" id="skillhub-developer-apply">
-          <div class="config-group-title-main">申请成为开发者</div>
-          <div class="settings-meta" style="margin-bottom:14px">普通账号申请通过后，云端会给账号增加 developer 角色。</div>
-          <div class="chat-form-row" style="margin-bottom:10px">
-            <input class="config-input" id="skillhub-apply-name" placeholder="开发者显示名称" />
-            <input class="config-input" id="skillhub-apply-namespace" placeholder="命名空间，例如 contract-team" />
-          </div>
-          <div class="chat-form-row" style="margin-bottom:10px">
-            <input class="config-input" id="skillhub-apply-contact" placeholder="联系邮箱 / 微信 / 电话" />
-            <input class="config-input" id="skillhub-apply-homepage" placeholder="主页或组织链接（可选）" />
-          </div>
-          <textarea class="config-input" id="skillhub-apply-reason" rows="3" placeholder="简单说明你要发布哪些类型的 Skill"></textarea>
-          <div class="config-actions" style="margin-top:12px">
-            <button class="btn btn-primary" onclick="applySkillHubDeveloper()">提交申请</button>
-          </div>
-        </div>
-
-        <div class="config-section" id="skillhub-developer-console">
-          <div class="config-group-title-main">提交 Skill 审核</div>
-          <div class="settings-meta" style="margin-bottom:14px">选择本地 Skill 文件夹，填写基本信息；Agent 会读取文件、生成 manifest 草稿并提交云端扫描审核。</div>
-          <div class="settings-step-grid">
-            <label><span class="wizard-label">本地 Skill 文件夹</span><input class="config-input" id="skillhub-local-path" placeholder="例如 E:\\skills\\contract-review" /></label>
-            <label><span class="wizard-label">版本</span><input class="config-input" id="skillhub-version" value="1.0.0" /></label>
-            <label><span class="wizard-label">Skill 名称</span><input class="config-input" id="skillhub-name" placeholder="合同审查助手" /></label>
-            <label><span class="wizard-label">分类</span><input class="config-input" id="skillhub-category" placeholder="法务 / 办公 / 工程造价" /></label>
-            <label style="grid-column:1/-1"><span class="wizard-label">简介</span><input class="config-input" id="skillhub-description" placeholder="说明这个 Skill 解决什么问题" /></label>
-            <label style="grid-column:1/-1"><span class="wizard-label">关键词</span><input class="config-input" id="skillhub-keywords" placeholder="合同审查，采购合同，条款风险" /></label>
-            <label style="grid-column:1/-1"><span class="wizard-label">触发示例</span><textarea class="config-input" id="skillhub-triggers" rows="3" placeholder="帮我审查这份采购合同&#10;找出合同里的付款风险&#10;检查协议条款是否合理"></textarea></label>
-            <label><span class="wizard-label">权限</span><input class="config-input" id="skillhub-permissions" value="filesystem.read.user_selected" /></label>
-            <label><span class="wizard-label">仓库链接（可选）</span><input class="config-input" id="skillhub-repository-url" placeholder="https://github.com/org/repo" /></label>
-          </div>
-          <div class="config-actions" style="margin-top:14px">
-            <button class="btn" onclick="createSkillHubManifestDraft()">生成 skill.json 草稿</button>
-            <button class="btn btn-primary" onclick="submitSkillHubReview()">提交审核</button>
-          </div>
-          <pre class="manifest-preview" id="skillhub-manifest-preview" style="margin-top:14px">尚未生成 manifest。</pre>
-        </div>
-
-        <div class="config-section">
-          <div class="config-group-title-main">我的提交</div>
-          <div class="portal-list" id="skillhub-submissions-list"><div class="loading">暂无数据</div></div>
-        </div>
-      </div>
 
     </div>
   </div>
@@ -5239,6 +5252,16 @@
         <button class="modal-close" onclick="closeLogs()">&times;</button>
       </div>
       <div class="modal-body" id="logs-body">暂无日志</div>
+    </div>
+  </div>
+  <!-- SkillHub Versions Modal -->
+  <div class="modal-overlay" id="skillhub-versions-modal">
+    <div class="modal">
+      <div class="modal-header">
+        <h3 id="skillhub-versions-title">SkillHub Versions</h3>
+        <button class="modal-close" onclick="closeSkillHubVersionsModal()">&times;</button>
+      </div>
+      <div class="modal-body" id="skillhub-versions-body">Loading...</div>
     </div>
   </div>
   <!-- Update Modal -->
@@ -5322,7 +5345,7 @@
     let appReadinessSnapshot = {};
     let appReadinessLoaded = false;
     let appReadinessError = '';
-    const pageTitles = { services:'Agent Hub', companion:'Companion Hub', chat:'CatsCo', developer:'Developer Hub' };
+    const pageTitles = { services:'Agent Hub', store:'SkillHub', companion:'Companion Hub', chat:'CatsCo' };
     let catsAuthMode = 'login';
     let catsState = {};
     let catsNextAction = 'none';
@@ -5958,12 +5981,12 @@
         if (!catsPollTimer) catsPollTimer = setInterval(fetchCatsStatus, 5000);
       } else if (name === 'companion') {
         setPetState(petState);
+      } else if (name === 'store') {
         refreshSkillHubPage();
+        fetchSkillHubDeveloper();
       } else if (name === 'services') {
         fetchStatus();
         refreshSettingsPage();
-      } else if (name === 'developer') {
-        fetchSkillHubDeveloper();
       }
     }
 
@@ -6091,7 +6114,7 @@
     function runReadinessAction(target) {
       if (target === 'settings') return switchPage('services');
       if (target === 'catsco') return switchPage('chat');
-      if (target === 'skills') return switchPage('companion');
+      if (target === 'skills') return switchPage('store');
       if (target === 'service') return svcAction('catscompany','start');
       fetchStatus();
       fetchReadiness();
@@ -6347,16 +6370,38 @@
       }
 
       card.innerHTML =
-        '<div class="settings-setup-head"><div><div class="settings-setup-title">登录 SkillHub</div><div class="settings-setup-copy">公开 Skill 可直接搜索和安装；登录用于申请开发者权限、提交 Skill 和查看个人提交记录。</div></div><span class="tag warm">login</span></div>'+
+        '<div class="settings-setup-head"><div><div class="settings-setup-title">连接 SkillHub</div><div class="settings-setup-copy">公开 Skill 可直接搜索和安装；上传和版本管理会复用当前 CatsCo 登录账号。</div></div><span class="tag warm">catsco login</span></div>'+
+        '<div class="config-actions" style="margin-top:14px">'+
+        '<button class="btn btn-primary" onclick="connectSkillHubWithCatsCo()">使用 CatsCo 账号连接</button>'+
+        '<button class="btn" onclick="fetchSkillHubDeveloper()">刷新状态</button>'+
+        '</div>'+
+        '<details style="margin-top:14px"><summary class="settings-meta">备用：使用 SkillHub 邮箱密码登录</summary>'+
         '<div class="chat-form-row" style="margin-top:14px;margin-bottom:10px">'+
         '<input class="config-input" id="skillhub-login-email" placeholder="邮箱" />'+
         '<input class="config-input" id="skillhub-login-password" type="password" placeholder="密码" />'+
         '</div>'+
         '<div class="chat-form-row">'+
         '<input class="config-input" id="skillhub-register-name" placeholder="显示名称（注册时填写）" />'+
-        '<button class="btn btn-primary" onclick="loginSkillHub()">登录</button>'+
+        '<button class="btn" onclick="loginSkillHub()">登录</button>'+
         '<button class="btn" onclick="registerSkillHub()">注册</button>'+
-        '</div>';
+        '</div></details>';
+    }
+
+    async function connectSkillHubWithCatsCo() {
+      try {
+        skillHubState = await parseSimpleResponse(await fetch(API + '/api/skillhub/auth/catsco', {
+          method:'POST',
+          headers:{'Content-Type':'application/json'},
+          body:JSON.stringify({}),
+        }));
+        renderSkillHubAccount();
+        await fetchSkillHubDeveloper();
+        await searchSkillHub('', true);
+      } catch (e) {
+        const message = e.message || String(e);
+        const loginHint = /catsco.*login|required|token|401|登录/i.test(message) ? '\n\n请先在 CatsCo 页面完成登录。' : '';
+        alert('连接 SkillHub 失败：' + message + loginHint);
+      }
     }
 
     async function loginSkillHub() {
@@ -6447,7 +6492,7 @@
           '<div class="skill-desc">'+escapeHtml(item.description || '')+'</div>'+
           '<div class="skill-meta">'+tags+'<span class="tag">v'+escapeHtml(latestVersion || '-')+'</span></div>'+
           '<div class="skill-files">'+escapeHtml((item.triggerExamples || []).slice(0, 3).join(', '))+'</div>'+
-          '<div class="skill-actions"><button class="btn btn-primary" '+installAttrs+'>'+(installed?'Installed':'Install')+'</button></div>'+
+          '<div class="skill-actions"><button class="btn btn-primary" '+installAttrs+'>'+(installed?'Installed':'Install')+'</button><button class="btn" data-skillhub-versions="true" data-skill-id="'+escapeHtml(skillId)+'">Versions</button></div>'+
         '</div>';
       }).join('');
     }
@@ -6460,6 +6505,24 @@
       const version = button.dataset.version || '';
       if (!skillId) return;
       installSkillHubSkill(skillId, version || undefined);
+    }
+
+    function handleSkillHubVersionsClick(event) {
+      const button = event.target?.closest?.('[data-skillhub-versions]');
+      if (!button || button.disabled) return;
+      event.preventDefault();
+      const skillId = button.dataset.skillId || '';
+      if (!skillId) return;
+      showSkillHubVersions(skillId);
+    }
+
+    function handleSkillHubYankVersionClick(event) {
+      const button = event.target?.closest?.('[data-skillhub-yank-version]');
+      if (!button || button.disabled) return;
+      event.preventDefault();
+      const packageVersionId = button.dataset.packageVersionId || '';
+      if (!packageVersionId) return;
+      yankOwnSkillHubVersion(packageVersionId);
     }
 
     async function installSkillHubSkill(skillId, version) {
@@ -6479,6 +6542,57 @@
       }
     }
 
+    async function showSkillHubVersions(skillId) {
+      if (!skillId) return;
+      const modal = document.getElementById('skillhub-versions-modal');
+      const title = document.getElementById('skillhub-versions-title');
+      const body = document.getElementById('skillhub-versions-body');
+      if (title) title.textContent = 'SkillHub Versions: ' + skillId;
+      if (body) body.innerHTML = '<div class="loading">Loading versions...</div>';
+      if (modal) modal.classList.add('show');
+      try {
+        const [data, ownerData] = await Promise.all([
+          parseSimpleResponse(await fetch(API + '/api/skillhub/versions?skillId=' + encodeURIComponent(skillId))),
+          skillHubState.authenticated
+            ? parseSimpleResponse(await fetch(API + '/api/skillhub/developer')).catch(() => ({ packageVersions: [] }))
+            : Promise.resolve({ packageVersions: [] }),
+        ]);
+        const versions = data.versions || [];
+        const ownerVersions = new Map((ownerData.packageVersions || []).map(item => [String(item.skillId || '') + '@' + String(item.latestVersion || item.version || ''), item]));
+        if (!body) return;
+        if (!versions.length) {
+          body.innerHTML = '<div class="loading">No versions found.</div>';
+          return;
+        }
+        body.innerHTML = versions.map(item => {
+          const version = String(item.latestVersion || item.version || '');
+          const ownerVersion = ownerVersions.get(String(skillId) + '@' + version);
+          const published = item.publishedAt ? '<span class="tag">'+escapeHtml(item.publishedAt)+'</span>' : '';
+          const downloads = '<span class="tag">downloads '+Number(item.downloadCount || 0)+'</span>';
+          const status = item.status && item.status !== 'published' ? '<span class="tag warm">'+escapeHtml(item.status)+'</span>' : '<span class="tag green">published</span>';
+          const installAttrs = version
+            ? 'data-skillhub-install="true" data-skill-id="'+escapeHtml(skillId)+'" data-version="'+escapeHtml(version)+'"'
+            : 'disabled';
+          const packageVersionId = ownerVersion?.packageVersionId || ownerVersion?.id || '';
+          const removeButton = packageVersionId && (ownerVersion?.status || 'published') === 'published'
+            ? '<button class="btn btn-danger" data-skillhub-yank-version="true" data-package-version-id="'+escapeHtml(packageVersionId)+'">Remove version</button>'
+            : '';
+          return '<div class="portal-row">'+
+            '<strong>v'+escapeHtml(version || '-')+'</strong>'+
+            '<div class="skill-meta">'+status+published+downloads+'</div>'+
+            '<div class="config-actions" style="margin-top:10px"><button class="btn btn-primary" '+installAttrs+'>Install this version</button>'+removeButton+'</div>'+
+          '</div>';
+        }).join('');
+      } catch (e) {
+        if (body) body.innerHTML = '<div class="runtime-note danger">Load versions failed: '+escapeHtml(e.message || String(e))+'</div>';
+      }
+    }
+
+    function closeSkillHubVersionsModal() {
+      const modal = document.getElementById('skillhub-versions-modal');
+      if (modal) modal.classList.remove('show');
+    }
+
     async function fetchSkillHubDeveloper() {
       const statusBox = document.getElementById('skillhub-developer-status');
       try {
@@ -6494,6 +6608,7 @@
       const applyBox = document.getElementById('skillhub-developer-apply');
       const consoleBox = document.getElementById('skillhub-developer-console');
       const list = document.getElementById('skillhub-submissions-list');
+      const versionList = document.getElementById('skillhub-package-versions-list');
       const roles = data.roles || [];
       const authenticated = Boolean(data.authenticated);
       const developer = roles.includes('developer');
@@ -6509,7 +6624,36 @@
         list.innerHTML = submissions.length ? submissions.map(item => {
           const manifest = item.normalizedManifest || item.manifest || {};
           return '<div class="portal-row"><strong>'+escapeHtml(manifest.displayName || manifest.name || item.id)+'</strong><div class="settings-meta">'+escapeHtml(item.status || '-')+' · '+escapeHtml(manifest.version || '')+'</div></div>';
-        }).join('') : '<div class="loading">暂无提交记录</div>';
+          }).join('') : '<div class="loading">暂无提交记录</div>';
+        }
+        if (versionList) {
+          const versions = data.packageVersions || [];
+          versionList.innerHTML = versions.length ? versions.map(item => {
+            const author = item.author?.name ? 'by ' + item.author.name : '';
+            const published = item.publishedAt ? ' · ' + item.publishedAt : '';
+            const downloads = Number(item.downloadCount || 0);
+            const packageVersionId = item.packageVersionId || item.id || '';
+            const actions = item.status === 'published' && packageVersionId
+              ? '<div class="config-actions" style="margin-top:8px"><button class="btn btn-danger" data-skillhub-yank-version="true" data-package-version-id="'+escapeHtml(packageVersionId)+'">Remove version</button></div>'
+              : '';
+            return '<div class="portal-row"><strong>'+escapeHtml(item.skillId || item.name || '-')+'</strong><div class="settings-meta">v'+escapeHtml(item.latestVersion || item.version || '-')+' · '+escapeHtml(item.status || 'published')+' · downloads '+downloads+published+'</div><div class="settings-meta">'+escapeHtml(author)+' · owner managed</div>'+actions+'</div>';
+          }).join('') : '<div class="loading">No published versions</div>';
+        }
+      }
+
+    async function yankOwnSkillHubVersion(packageVersionId) {
+      if (!packageVersionId) return;
+      if (!confirm('Remove this published SkillHub version from public search and downloads?')) return;
+      try {
+        await parseSimpleResponse(await fetch(API + '/api/skillhub/developer/package-versions/' + encodeURIComponent(packageVersionId) + '/yank', {
+          method:'POST',
+          headers:{'Content-Type':'application/json'},
+          body:JSON.stringify({ reason:'removed by owner from dashboard' }),
+        }));
+        await fetchSkillHubDeveloper();
+        await refreshSkillHubPage();
+      } catch (e) {
+        alert('Remove failed: ' + (e.message || String(e)));
       }
     }
 
@@ -9628,9 +9772,13 @@
     autoResizeCatsMessageInput();
     setupCatsAttachmentInputs();
     document.getElementById('skillhub-registry-grid')?.addEventListener('click', handleSkillHubInstallClick);
+    document.getElementById('skillhub-registry-grid')?.addEventListener('click', handleSkillHubVersionsClick);
+    document.getElementById('skillhub-versions-body')?.addEventListener('click', handleSkillHubInstallClick);
+    document.getElementById('skillhub-versions-body')?.addEventListener('click', handleSkillHubYankVersionClick);
+    document.getElementById('skillhub-package-versions-list')?.addEventListener('click', handleSkillHubYankVersionClick);
     document.addEventListener('keydown',handleDashboardFontScaleShortcut);
     window.addEventListener('resize',()=>{refreshDashboardFontScaleForViewport(); autoResizeCatsMessageInput();});
-    document.addEventListener('keydown',e=>{if(e.key==='Escape'){closeLogs();closeUpdateModal();closeCatsMediaPreview();}});
+    document.addEventListener('keydown',e=>{if(e.key==='Escape'){closeLogs();closeUpdateModal();closeCatsMediaPreview();closeSkillHubVersionsModal();}});
     document.addEventListener('click',e=>{const shell=document.getElementById('floating-pet');if(shell && !shell.contains(e.target)) closeFloatingPetMenu();});
   </script>
 </body>

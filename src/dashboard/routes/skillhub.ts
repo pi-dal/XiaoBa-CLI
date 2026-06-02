@@ -1,7 +1,21 @@
 import type { Router } from 'express';
 import { SkillHubService } from '../../skillhub/service';
 
-export function registerSkillHubRoutes(router: Router): void {
+export interface SkillHubCatsCoAuthPayload {
+  token: string;
+  baseUrl: string;
+  user?: {
+    uid?: string;
+    username?: string;
+    displayName?: string;
+  };
+}
+
+export interface SkillHubRouteOptions {
+  getCatsCoAuth?: () => Promise<SkillHubCatsCoAuthPayload> | SkillHubCatsCoAuthPayload;
+}
+
+export function registerSkillHubRoutes(router: Router, options: SkillHubRouteOptions = {}): void {
   router.get('/skillhub/status', async (req, res) => {
     try {
       res.json(await serviceFrom(req.query).status());
@@ -26,6 +40,21 @@ export function registerSkillHubRoutes(router: Router): void {
     }
   });
 
+  router.post('/skillhub/auth/catsco', async (req, res) => {
+    try {
+      if (!options.getCatsCoAuth) {
+        return res.status(501).json({
+          error: 'CatsCo SkillHub login is not configured',
+          code: 'skillhub.catsco_exchange_unavailable',
+        });
+      }
+      const cats = await options.getCatsCoAuth();
+      res.json(await serviceFrom(req.body).loginWithCatsCo(cats));
+    } catch (error: any) {
+      sendSkillHubError(res, error);
+    }
+  });
+
   router.post('/skillhub/auth/logout', async (req, res) => {
     try {
       res.json(await serviceFrom(req.body).logout());
@@ -39,6 +68,16 @@ export function registerSkillHubRoutes(router: Router): void {
       res.json(await serviceFrom(req.query).search(String(req.query.q || ''), {
         category: String(req.query.category || ''),
       }));
+    } catch (error: any) {
+      sendSkillHubError(res, error);
+    }
+  });
+
+  router.get('/skillhub/versions', async (req, res) => {
+    try {
+      const skillId = String(req.query.skillId || '').trim();
+      if (!skillId) return res.status(400).json({ error: 'skillId required' });
+      res.json(await serviceFrom(req.query).versions(skillId));
     } catch (error: any) {
       sendSkillHubError(res, error);
     }
@@ -89,6 +128,14 @@ export function registerSkillHubRoutes(router: Router): void {
   router.post('/skillhub/developer/share-local-skill', async (req, res) => {
     try {
       res.status(201).json(await serviceFrom(req.body).shareLocalSkill(req.body || {}));
+    } catch (error: any) {
+      sendSkillHubError(res, error);
+    }
+  });
+
+  router.post('/skillhub/developer/package-versions/:id/yank', async (req, res) => {
+    try {
+      res.json(await serviceFrom(req.body).yankOwnPackageVersion(String(req.params.id || ''), String(req.body?.reason || '')));
     } catch (error: any) {
       sendSkillHubError(res, error);
     }
