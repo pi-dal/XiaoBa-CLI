@@ -6370,16 +6370,36 @@
       }
 
       card.innerHTML =
-        '<div class="settings-setup-head"><div><div class="settings-setup-title">登录 SkillHub</div><div class="settings-setup-copy">公开 Skill 可直接搜索和安装；登录用于申请开发者权限、提交 Skill 和查看个人提交记录。</div></div><span class="tag warm">login</span></div>'+
+        '<div class="settings-setup-head"><div><div class="settings-setup-title">连接 SkillHub</div><div class="settings-setup-copy">公开 Skill 可直接搜索和安装；上传和版本管理会复用当前 CatsCo 登录账号。</div></div><span class="tag warm">catsco login</span></div>'+
+        '<div class="config-actions" style="margin-top:14px">'+
+        '<button class="btn btn-primary" onclick="connectSkillHubWithCatsCo()">使用 CatsCo 账号连接</button>'+
+        '<button class="btn" onclick="fetchSkillHubDeveloper()">刷新状态</button>'+
+        '</div>'+
+        '<details style="margin-top:14px"><summary class="settings-meta">备用：使用 SkillHub 邮箱密码登录</summary>'+
         '<div class="chat-form-row" style="margin-top:14px;margin-bottom:10px">'+
         '<input class="config-input" id="skillhub-login-email" placeholder="邮箱" />'+
         '<input class="config-input" id="skillhub-login-password" type="password" placeholder="密码" />'+
         '</div>'+
         '<div class="chat-form-row">'+
         '<input class="config-input" id="skillhub-register-name" placeholder="显示名称（注册时填写）" />'+
-        '<button class="btn btn-primary" onclick="loginSkillHub()">登录</button>'+
+        '<button class="btn" onclick="loginSkillHub()">登录</button>'+
         '<button class="btn" onclick="registerSkillHub()">注册</button>'+
-        '</div>';
+        '</div></details>';
+    }
+
+    async function connectSkillHubWithCatsCo() {
+      try {
+        skillHubState = await parseSimpleResponse(await fetch(API + '/api/skillhub/auth/catsco', {
+          method:'POST',
+          headers:{'Content-Type':'application/json'},
+          body:JSON.stringify({}),
+        }));
+        renderSkillHubAccount();
+        await fetchSkillHubDeveloper();
+        await searchSkillHub('', true);
+      } catch (e) {
+        alert('连接 SkillHub 失败：' + (e.message || String(e)) + '\n\n请先在 CatsCo 页面完成登录。');
+      }
     }
 
     async function loginSkillHub() {

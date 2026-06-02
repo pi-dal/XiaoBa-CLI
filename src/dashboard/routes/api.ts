@@ -1330,9 +1330,36 @@ function persistCatsUserSession(state: CatsAuthState, login: any): void {
   createCatsCoLocalConfigService({ runtimeRoot: process.cwd() }).persistAccountSession(state, login);
 }
 
+async function getCatsCoAuthForSkillHub(): Promise<{
+  token: string;
+  baseUrl: string;
+  user: {
+    uid?: string;
+    username?: string;
+    displayName?: string;
+  };
+}> {
+  const state = getCatsAuthState();
+  if (!state.token) {
+    const error = httpError('CatsCo login is required before connecting SkillHub', 401);
+    (error as any).code = 'skillhub.catsco_login_required';
+    throw error;
+  }
+  const me = await catsRequest('GET', state.httpBaseUrl, '/api/me', undefined, state.token, { timeoutMs: 6000 });
+  return {
+    token: state.token,
+    baseUrl: state.httpBaseUrl,
+    user: {
+      uid: String(me.uid || state.uid || '').trim() || undefined,
+      username: String(me.username || state.username || '').trim() || undefined,
+      displayName: String(me.display_name || me.displayName || state.displayName || me.username || '').trim() || undefined,
+    },
+  };
+}
+
 export function createApiRouter(serviceManager: ServiceManager, updateController?: UpdateController): Router {
   const router = Router();
-  registerSkillHubRoutes(router);
+  registerSkillHubRoutes(router, { getCatsCoAuth: getCatsCoAuthForSkillHub });
   registerPetRoutes(router);
 
   // ==================== 总览 ====================

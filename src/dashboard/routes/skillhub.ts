@@ -1,7 +1,21 @@
 import type { Router } from 'express';
 import { SkillHubService } from '../../skillhub/service';
 
-export function registerSkillHubRoutes(router: Router): void {
+export interface SkillHubCatsCoAuthPayload {
+  token: string;
+  baseUrl: string;
+  user?: {
+    uid?: string;
+    username?: string;
+    displayName?: string;
+  };
+}
+
+export interface SkillHubRouteOptions {
+  getCatsCoAuth?: () => Promise<SkillHubCatsCoAuthPayload> | SkillHubCatsCoAuthPayload;
+}
+
+export function registerSkillHubRoutes(router: Router, options: SkillHubRouteOptions = {}): void {
   router.get('/skillhub/status', async (req, res) => {
     try {
       res.json(await serviceFrom(req.query).status());
@@ -21,6 +35,21 @@ export function registerSkillHubRoutes(router: Router): void {
   router.post('/skillhub/auth/login', async (req, res) => {
     try {
       res.json(await serviceFrom(req.body).login(req.body || {}));
+    } catch (error: any) {
+      sendSkillHubError(res, error);
+    }
+  });
+
+  router.post('/skillhub/auth/catsco', async (req, res) => {
+    try {
+      if (!options.getCatsCoAuth) {
+        return res.status(501).json({
+          error: 'CatsCo SkillHub login is not configured',
+          code: 'skillhub.catsco_exchange_unavailable',
+        });
+      }
+      const cats = await options.getCatsCoAuth();
+      res.json(await serviceFrom(req.body).loginWithCatsCo(cats));
     } catch (error: any) {
       sendSkillHubError(res, error);
     }

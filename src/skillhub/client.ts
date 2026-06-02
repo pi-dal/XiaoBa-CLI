@@ -25,6 +25,16 @@ export interface SkillHubLoginInput {
   password: string;
 }
 
+export interface SkillHubCatsCoExchangeInput {
+  token: string;
+  baseUrl: string;
+  user?: {
+    uid?: string;
+    username?: string;
+    displayName?: string;
+  };
+}
+
 export class SkillHubClient {
   readonly config: SkillHubConfig;
   private readonly sessionStore: SkillHubSessionStore;
@@ -67,6 +77,11 @@ export class SkillHubClient {
 
   async login(input: SkillHubLoginInput): Promise<SkillHubAuthState> {
     await this.request('POST', '/api/auth/login', input);
+    return this.status();
+  }
+
+  async loginWithCatsCo(input: SkillHubCatsCoExchangeInput): Promise<SkillHubAuthState> {
+    await this.request('POST', '/api/auth/catsco-exchange', input);
     return this.status();
   }
 

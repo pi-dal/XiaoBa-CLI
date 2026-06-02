@@ -16,6 +16,7 @@ describe('dashboard connected SkillHub API', () => {
   let originalEnv: string | undefined;
   let dashboardServer: Server | undefined;
   let cloudServer: Server | undefined;
+  let catsServer: Server | undefined;
   let maliciousServer: Server | undefined;
   let dashboardBaseUrl: string;
   let cloudBaseUrl: string;
@@ -37,6 +38,10 @@ describe('dashboard connected SkillHub API', () => {
       await close(cloudServer);
       cloudServer = undefined;
     }
+    if (catsServer) {
+      await close(catsServer);
+      catsServer = undefined;
+    }
     if (maliciousServer) {
       await close(maliciousServer);
       maliciousServer = undefined;
@@ -44,6 +49,11 @@ describe('dashboard connected SkillHub API', () => {
     process.chdir(originalCwd);
     if (originalEnv === undefined) delete process.env.CATSCO_SKILLHUB_BASE_URL;
     else process.env.CATSCO_SKILLHUB_BASE_URL = originalEnv;
+    delete process.env.CATSCO_HTTP_BASE_URL;
+    delete process.env.CATSCO_USER_TOKEN;
+    delete process.env.CATSCO_USER_UID;
+    delete process.env.CATSCO_USER_NAME;
+    delete process.env.CATSCO_USER_DISPLAY_NAME;
     CATSCO_SKILLHUB_ROOT_PUBLIC_KEYS.splice(0);
     if (fs.existsSync(testRoot)) fs.rmSync(testRoot, { recursive: true, force: true });
   });
@@ -141,6 +151,25 @@ describe('dashboard connected SkillHub API', () => {
     assert.match(skillText, /skillhub_uploaded_at:/);
   });
 
+  test('connects SkillHub with the current CatsCo login token', async () => {
+    const fixture = createFixture();
+    await startCloud(fixture);
+    await startCatsCo();
+    process.env.CATSCO_SKILLHUB_BASE_URL = cloudBaseUrl;
+    process.env.CATSCO_HTTP_BASE_URL = serverBaseUrl(catsServer!);
+    process.env.CATSCO_USER_TOKEN = 'cats-token';
+    process.env.CATSCO_USER_UID = '116';
+    process.env.CATSCO_USER_NAME = 'lin';
+    process.env.CATSCO_USER_DISPLAY_NAME = 'Lin';
+    await startDashboard();
+
+    const exchange = await post('/api/skillhub/auth/catsco', {});
+    assert.equal(exchange.status, 200);
+    assert.equal(exchange.body.authenticated, true);
+    assert.equal(exchange.body.user.displayName, 'Lin');
+    assert.equal(fs.existsSync(path.join(testRoot, 'data/skillhub/session.json')), true);
+  });
+
   test('uses the official SkillHub cloud by default', () => {
     delete process.env.CATSCO_SKILLHUB_BASE_URL;
     assert.equal(loadSkillHubConfig().baseUrl, 'https://logs.catsco.fun:9000');
@@ -200,9 +229,32 @@ describe('dashboard connected SkillHub API', () => {
       res.setHeader('Set-Cookie', 'catsco_session=dashboard-session; Path=/; HttpOnly; SameSite=Lax; Max-Age=604800');
       res.json({ user: fixture.user, roles: ['user'], permissions: [] });
     });
+    app.post('/api/auth/catsco-exchange', (req, res) => {
+      assert.equal(req.body.token, 'cats-token');
+      assert.equal(req.body.baseUrl, serverBaseUrl(catsServer!));
+      assert.deepEqual(req.body.user, {
+        uid: '116',
+        username: 'lin',
+        displayName: 'Lin',
+      });
+      res.setHeader('Set-Cookie', 'catsco_session=catsco-exchange-session; Path=/; HttpOnly; SameSite=Lax; Max-Age=604800');
+      res.json({
+        user: { ...fixture.user, displayName: 'Lin' },
+        roles: ['user', 'developer'],
+        permissions: ['submission.create'],
+        developerProfile: { namespace: 'lin' },
+      });
+    });
     app.get('/api/auth/me', (req, res) => {
-      assert.match(req.header('cookie') || '', /catsco_session=dashboard-session/);
-      res.json({ user: fixture.user, roles: ['user'], permissions: [] });
+      const cookie = req.header('cookie') || '';
+      assert.match(cookie, /catsco_session=(dashboard-session|catsco-exchange-session)/);
+      const exchanged = cookie.includes('catsco-exchange-session');
+      res.json({
+        user: exchanged ? { ...fixture.user, displayName: 'Lin' } : fixture.user,
+        roles: exchanged ? ['user', 'developer'] : ['user'],
+        permissions: exchanged ? ['submission.create'] : [],
+        developerProfile: exchanged ? { namespace: 'lin' } : undefined,
+      });
     });
     app.post('/api/developer-applications', (req, res) => {
       assert.deepEqual(req.body, {
@@ -249,6 +301,20 @@ describe('dashboard connected SkillHub API', () => {
     app.get(/^\/api\/skills\/(.+)$/, (_req, res) => res.json({ skill: fixture.entry, versions: [fixture.entry] }));
     cloudServer = await listen(app);
     cloudBaseUrl = serverBaseUrl(cloudServer);
+  }
+
+  async function startCatsCo(): Promise<void> {
+    const app = express();
+    app.use(express.json());
+    app.get('/api/me', (req, res) => {
+      assert.equal(req.header('authorization'), 'Bearer cats-token');
+      res.json({
+        uid: '116',
+        username: 'lin',
+        display_name: 'Lin',
+      });
+    });
+    catsServer = await listen(app);
   }
 
   async function startMaliciousSkillHub(): Promise<{ baseUrl: string; hits: () => number }> {

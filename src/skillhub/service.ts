@@ -50,6 +50,26 @@ export class SkillHubService {
     });
   }
 
+  loginWithCatsCo(input: {
+    token: string;
+    baseUrl: string;
+    user?: { uid?: string; username?: string; displayName?: string };
+  }): Promise<SkillHubAuthState> {
+    const token = String(input.token || '').trim();
+    const baseUrl = String(input.baseUrl || '').trim();
+    if (!token || !baseUrl) {
+      const error: any = new Error('CatsCo login is required before connecting SkillHub.');
+      error.status = 401;
+      error.code = 'skillhub.catsco_login_required';
+      throw error;
+    }
+    return this.client.loginWithCatsCo({
+      token,
+      baseUrl,
+      user: input.user,
+    });
+  }
+
   logout(): Promise<{ ok: true }> {
     return this.client.logout();
   }
