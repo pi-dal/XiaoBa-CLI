@@ -14,6 +14,7 @@ describe('dashboard connected SkillHub API', () => {
   let testRoot: string;
   let originalCwd: string;
   let originalEnv: string | undefined;
+  let originalSkillsEnv: string | undefined;
   let dashboardServer: Server | undefined;
   let cloudServer: Server | undefined;
   let catsServer: Server | undefined;
@@ -24,8 +25,10 @@ describe('dashboard connected SkillHub API', () => {
   beforeEach(async () => {
     originalCwd = process.cwd();
     originalEnv = process.env.CATSCO_SKILLHUB_BASE_URL;
+    originalSkillsEnv = process.env.XIAOBA_SKILLS_DIR;
     testRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'xiaoba-dashboard-skillhub-connected-'));
     process.chdir(testRoot);
+    process.env.XIAOBA_SKILLS_DIR = path.join(testRoot, 'skills');
     fs.mkdirSync(path.join(testRoot, 'skills'), { recursive: true });
   });
 
@@ -54,6 +57,8 @@ describe('dashboard connected SkillHub API', () => {
     delete process.env.CATSCO_USER_UID;
     delete process.env.CATSCO_USER_NAME;
     delete process.env.CATSCO_USER_DISPLAY_NAME;
+    if (originalSkillsEnv === undefined) delete process.env.XIAOBA_SKILLS_DIR;
+    else process.env.XIAOBA_SKILLS_DIR = originalSkillsEnv;
     CATSCO_SKILLHUB_ROOT_PUBLIC_KEYS.splice(0);
     if (fs.existsSync(testRoot)) fs.rmSync(testRoot, { recursive: true, force: true });
   });

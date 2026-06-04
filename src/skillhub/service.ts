@@ -1,5 +1,4 @@
 import * as fs from 'fs';
-import * as os from 'os';
 import * as path from 'path';
 import { SkillParser } from '../skills/skill-parser';
 import type { Skill } from '../types/skill';
@@ -415,10 +414,7 @@ function listLocalSkillNames(): string[] {
 }
 
 function listLocalSkillFiles(): string[] {
-  const roots = [
-    PathResolver.getSkillsPath(),
-    getUserDataSkillsPath(),
-  ];
+  const roots = [PathResolver.getSkillsPath()];
   const files: string[] = [];
   for (const root of roots) {
     if (!root || !fs.existsSync(root)) continue;
@@ -428,10 +424,7 @@ function listLocalSkillFiles(): string[] {
 }
 
 function findSkillRoot(skillFilePath: string): string | undefined {
-  return [
-    PathResolver.getSkillsPath(),
-    getUserDataSkillsPath(),
-  ].find(root => {
+  return [PathResolver.getSkillsPath()].find(root => {
     const relative = path.relative(path.resolve(root), path.resolve(skillFilePath));
     return relative && !relative.startsWith('..') && !path.isAbsolute(relative);
   });
@@ -446,16 +439,6 @@ function skillHubMetadataFromShareResponse(response: any): { author: string; ver
     return { author, version, uploadedAt };
   }
   return undefined;
-}
-
-function getUserDataSkillsPath(): string {
-  if (process.platform === 'win32') {
-    return path.join(process.env.APPDATA || path.join(os.homedir(), 'AppData', 'Roaming'), 'xiaoba-cli', 'skills');
-  }
-  if (process.platform === 'darwin') {
-    return path.join(os.homedir(), 'Library', 'Application Support', 'xiaoba-cli', 'skills');
-  }
-  return path.join(process.env.XDG_CONFIG_HOME || path.join(os.homedir(), '.config'), 'xiaoba-cli', 'skills');
 }
 
 function listInstalledSkillHubSkills(): SkillHubPackageInstallMarker[] {

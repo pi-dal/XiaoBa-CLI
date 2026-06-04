@@ -8,6 +8,7 @@ const TRUSTED_DEEP_LINK_BASE_ORIGINS = new Set(['https://app.catsco.cc']);
 let mainWindow = null;
 let tray = null;
 let autoUpdater = null;
+let dashboardServerHandle = null;
 let hideNoticeShown = false;
 let dashboardServerReady = false;
 const pendingDeepLinks = [];
@@ -491,30 +492,13 @@ function shouldCopyBundledSkillEntry(srcPath) {
     && !normalized.endsWith('.pyo');
 }
 
-function readBundledSkillSyncVersion(fs, dest) {
-  try {
-    const markerPath = path.join(dest, SKILL_SYNC_MARKER);
-    if (!fs.existsSync(markerPath)) return null;
-    const marker = JSON.parse(fs.readFileSync(markerPath, 'utf8'));
-    return typeof marker.version === 'string' ? marker.version : null;
-  } catch {
-    return null;
-  }
-}
-
-function writeBundledSkillSyncMarker(fs, dest, skillName) {
+function removeBundledSkillSyncMarker(fs, dest, skillName) {
   try {
     const markerPath = path.join(dest, SKILL_SYNC_MARKER);
     if (fs.existsSync(markerPath)) fs.rmSync(markerPath, { force: true });
   } catch (error) {
     console.warn(`Failed to remove bundled skill sync marker for ${skillName}:`, error);
   }
-}
-
-function shouldRefreshBundledSkill(fs, skillName, dest) {
-  if (!app.isPackaged) return false;
-  if (!REFRESHABLE_BUNDLED_SKILLS.has(skillName)) return false;
-  return readBundledSkillSyncVersion(fs, dest) !== app.getVersion();
 }
 
 function removeRetiredBundledSkills(fs, skillsPath) {
@@ -535,15 +519,16 @@ function removeRetiredBundledSkills(fs, skillsPath) {
 }
 
 function syncBundledSkillDir(fs, skillName, src, dest, overwrite = false) {
-  if (overwrite && fs.existsSync(dest)) {
-    fs.rmSync(dest, { recursive: true, force: true });
+  if (fs.existsSync(dest)) {
+    removeBundledSkillSyncMarker(fs, dest, skillName);
+    return;
   }
   fs.cpSync(src, dest, {
     recursive: true,
     force: true,
     filter: shouldCopyBundledSkillEntry,
   });
-  writeBundledSkillSyncMarker(fs, dest, skillName);
+  removeBundledSkillSyncMarker(fs, dest, skillName);
 }
 
 async function startServer() {
@@ -581,13 +566,10 @@ async function startServer() {
       const dest = path.join(skillsPath, dir.name);
 
       // 闂備礁鎲￠悷顖涚濠婂煻鍥蓟閵夈儳顦梺鍝勭墢閺佹悂鎮峰┑瀣€垫繛鎴烆仾椤忓嫸鑰挎い蹇撶墛閸?skill
-      const shouldRefresh = shouldRefreshBundledSkill(fs, dir.name, dest);
       if (!fs.existsSync(dest)) {
         syncBundledSkillDir(fs, dir.name, src, dest, false);
-      } else if (shouldRefresh) {
-        syncBundledSkillDir(fs, dir.name, src, dest, true);
       } else {
-        writeBundledSkillSyncMarker(fs, dest, dir.name);
+        removeBundledSkillSyncMarker(fs, dest, dir.name);
       }
     }
 
@@ -640,7 +622,16 @@ async function startServer() {
 
   // 闂備胶鍎甸弲娑㈡偤閵娧勬殰闁圭虎鍠栭幑鍫曟煏婵炲灝鈧洟鎯佸鍫濈骇闁冲搫鍊婚妴鎺楁煃鐠囧眰鍋㈢€规洏鍎甸、娑橆潩椤戭偅顣筧shboard server
   const { startDashboard } = require(path.join(appRoot, 'dist', 'dashboard', 'server'));
-  await startDashboard(DASHBOARD_PORT, { updateController, projectRoot: appRoot });
+  dashboardServerHandle = await startDashboard(DASHBOARD_PORT, { updateController, projectRoot: appRoot });
+}
+
+function stopDashboardServer() {
+  if (!dashboardServerHandle) return;
+  const handle = dashboardServerHandle;
+  dashboardServerHandle = null;
+  handle.stop?.().catch((error) => {
+    console.warn('Failed to stop dashboard server:', error);
+  });
 }
 
 function createWindow() {
@@ -661,12 +652,11 @@ function createWindow() {
 
   mainWindow.loadURL(`http://127.0.0.1:${DASHBOARD_PORT}`);
 
-  mainWindow.on('close', (e) => {
-    if (!app.isQuitting && readCloseToTrayPreference()) {
-      e.preventDefault();
-      mainWindow.hide();
-      notifyWindowHidden();
-    }
+  mainWindow.on('close', (event) => {
+    if (app.isQuitting || !readCloseToTrayPreference()) return;
+    event.preventDefault();
+    mainWindow.hide();
+    notifyWindowHidden();
   });
 
   mainWindow.on('closed', () => {
@@ -938,4 +928,5 @@ app.on('window-all-closed', () => {
 
 app.on('before-quit', () => {
   app.isQuitting = true;
+  stopDashboardServer();
 });

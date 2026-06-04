@@ -5037,7 +5037,10 @@
           <details class="config-section" open>
             <summary class="settings-advanced-summary">
               <span>已安装技能</span>
-              <span class="tag">local</span>
+              <span style="display:flex;align-items:center;gap:8px">
+                <span class="tag">local</span>
+                <button class="btn" id="copy-skills-root-btn" type="button" onclick="event.preventDefault();event.stopPropagation();copySkillsRootPath()">Copy Skills path</button>
+              </span>
             </summary>
             <div class="settings-advanced-body">
               <div class="skills-grid" id="store-grid"><div class="loading">加载中...</div></div>
@@ -5045,7 +5048,7 @@
           </details>
         </div>
 
-        <div class="settings-header" style="margin-top:28px">
+        <div class="settings-header" style="margin-top:28px;display:none">
           <div class="settings-heading">
             <div class="settings-kicker">SkillHub Developer</div>
             <div class="section-title" style="margin-bottom:0">发布管理</div>
@@ -5058,11 +5061,11 @@
           <div class="loading">正在检查 SkillHub 登录状态...</div>
         </div>
 
-        <div class="config-section" id="skillhub-developer-status">
+        <div class="config-section" id="skillhub-developer-status" style="display:none">
           <div class="loading">正在读取开发者状态...</div>
         </div>
 
-        <div class="config-section" id="skillhub-developer-apply">
+        <div class="config-section" id="skillhub-developer-apply" style="display:none">
           <div class="config-group-title-main">申请成为开发者</div>
           <div class="settings-meta" style="margin-bottom:14px">普通账号申请通过后，云端会给账号增加 developer 角色。</div>
           <div class="chat-form-row" style="margin-bottom:10px">
@@ -5079,7 +5082,7 @@
           </div>
         </div>
 
-        <div class="config-section" id="skillhub-developer-console">
+        <div class="config-section" id="skillhub-developer-console" style="display:none">
           <div class="config-group-title-main">提交 Skill 审核</div>
           <div class="settings-meta" style="margin-bottom:14px">选择本地 Skill 文件夹，填写基本信息；Agent 会读取文件、生成 manifest 草稿并提交云端扫描审核。</div>
           <div class="settings-step-grid">
@@ -5100,12 +5103,12 @@
           <pre class="manifest-preview" id="skillhub-manifest-preview" style="margin-top:14px">尚未生成 manifest。</pre>
         </div>
 
-        <div class="config-section">
+        <div class="config-section" style="display:none">
           <div class="config-group-title-main">我的提交</div>
           <div class="portal-list" id="skillhub-submissions-list"><div class="loading">暂无数据</div></div>
         </div>
 
-        <div class="config-section">
+        <div class="config-section" style="display:none">
           <div class="config-group-title-main">My Published Versions</div>
           <div class="settings-meta" style="margin-bottom:14px">Published SkillHub versions can be managed here. Public users can install any published version.</div>
           <div class="portal-list" id="skillhub-package-versions-list"><div class="loading">No published versions</div></div>
@@ -6277,6 +6280,41 @@
       return '<div class="skill-actions">'+actions.join('')+'</div>';
     }
 
+    async function copySkillsRootPath() {
+      const btn = document.getElementById('copy-skills-root-btn');
+      const originalText = btn ? btn.textContent : '';
+      try {
+        const data = await parseSimpleResponse(await fetch(API + '/api/skills-root'));
+        await copyTextToClipboard(data.path || '');
+        if (btn) {
+          btn.textContent = 'Copied';
+          setTimeout(() => { btn.textContent = originalText || 'Copy Skills path'; }, 1400);
+        }
+      } catch (e) {
+        alert('Copy Skills path failed: ' + (e.message || String(e)));
+      }
+    }
+
+    async function copyTextToClipboard(text) {
+      if (!text) throw new Error('Empty path');
+      if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+        await navigator.clipboard.writeText(text);
+        return;
+      }
+      const textarea = document.createElement('textarea');
+      textarea.value = text;
+      textarea.setAttribute('readonly', '');
+      textarea.style.position = 'fixed';
+      textarea.style.left = '-9999px';
+      document.body.appendChild(textarea);
+      textarea.select();
+      try {
+        document.execCommand('copy');
+      } finally {
+        document.body.removeChild(textarea);
+      }
+    }
+
     function renderSkillHubLocalMeta(sk) {
       if (!sk.skillHub) return '';
       const modified = sk.skillHub.modified === true
@@ -6296,7 +6334,7 @@
       const g = document.getElementById('skills-grid');
       if (!g) return;
       if (!skills.length) { g.innerHTML = '<div class="loading">No Skills</div>'; return; }
-      g.innerHTML = skills.map(sk => '<div class="skill-card'+(sk.enabled===false?' disabled':'')+'"><div class="skill-name">'+sk.name+renderSkillSourceTag(sk)+(sk.enabled===false?' <span class="tag" style="background:rgba(220,93,115,0.12);color:var(--red)">disabled</span>':'')+'</div><div class="skill-desc">'+(sk.description||'')+'</div><div class="skill-meta">'+(sk.userInvocable?'<span class="tag active">user</span>':'')+(sk.autoInvocable?'<span class="tag active">auto</span>':'')+(sk.maxTurns?'<span class="tag">max '+sk.maxTurns+' turns</span>':'')+'</div>'+renderSkillHubLocalMeta(sk)+renderSkillGrowth(sk.name)+(sk.files?'<div class="skill-files">'+sk.files.join(', ')+'</div>':'')+'</div>').join('');
+      g.innerHTML = skills.map(sk => '<div class="skill-card'+(sk.enabled===false?' disabled':'')+'"><div class="skill-name">'+sk.name+renderSkillSourceTag(sk)+(sk.enabled===false?' <span class="tag" style="background:rgba(220,93,115,0.12);color:var(--red)">disabled</span>':'')+'</div><div class="skill-desc">'+(sk.description||'')+'</div><div class="skill-meta">'+(sk.userInvocable?'<span class="tag active">user</span>':'')+(sk.autoInvocable?'<span class="tag active">auto</span>':'')+(sk.maxTurns?'<span class="tag">max '+sk.maxTurns+' turns</span>':'')+'</div>'+renderSkillHubLocalMeta(sk)+renderSkillGrowth(sk.name)+(sk.files?'<div class="skill-files">'+sk.files.join(', ')+'</div>':'')+renderSkillActionButtons(sk)+'</div>').join('');
     }
 
     function renderLocalSkillStore(skills) {

@@ -1962,6 +1962,16 @@ export function createApiRouter(serviceManager: ServiceManager, updateController
     }
   });
 
+  router.get('/skills-root', async (_req, res) => {
+    try {
+      const skillsRoot = PathResolver.getSkillsPath();
+      PathResolver.ensureDir(skillsRoot);
+      res.json({ ok: true, path: skillsRoot });
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
   router.delete('/skills/:name', async (req, res) => {
     try {
       const manager = new SkillManager();
