@@ -14,7 +14,14 @@ let dashboardServerReady = false;
 const pendingDeepLinks = [];
 let deepLinkDrainPromise = null;
 const REFRESHABLE_BUNDLED_SKILLS = new Set([]);
-const RETIRED_BUNDLED_SKILLS = new Set(['advanced-reader', 'vision-analysis']);
+const RETIRED_BUNDLED_SKILLS = new Set([
+  'advanced-reader',
+  'vision-analysis',
+  'agent-browser',
+  'memory-search',
+  'officecli',
+  'self-evolution',
+]);
 const SKILL_SYNC_MARKER = '.xiaoba-bundled-skill.json';
 
 applyConfiguredUserDataPath();

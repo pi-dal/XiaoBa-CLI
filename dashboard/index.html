@@ -5437,6 +5437,7 @@
     let lastCatsMessageSignature = '';
     let catsWorkingActive = false;
     let skillHubState = { authenticated:false, roles:[], permissions:[], installed:[] };
+    let skillHubAutoConnectInFlight = null;
     let skillHubRegistryCache = [];
     let localSkillsCache = [];
     let skillHubDraftManifest = null;
@@ -6348,6 +6349,7 @@
       if (!skillName) return;
       if (!confirm('Share this local Skill to SkillHub?\n\n' + skillName)) return;
       try {
+        await ensureSkillHubAuthenticated();
         let data = await parseSimpleResponse(await fetch(API + '/api/skillhub/developer/share-local-skill', {
           method:'POST',
           headers:{'Content-Type':'application/json'},
@@ -6376,15 +6378,20 @@
     }
 
     async function refreshSkillHubPage() {
-      await Promise.allSettled([fetchSkills(), fetchSkillHubStatus()]);
+      await Promise.allSettled([fetchSkills(), fetchSkillHubStatus({ autoConnect: true })]);
       await searchSkillHub('', true);
     }
 
-    async function fetchSkillHubStatus() {
+    async function fetchSkillHubStatus(options) {
       const card = document.getElementById('skillhub-account-card');
+      const autoConnect = options?.autoConnect === true;
       try {
         const data = await parseSimpleResponse(await fetch(API + '/api/skillhub/status'));
         skillHubState = data || { authenticated:false, roles:[], permissions:[], installed:[] };
+        if (!skillHubState.authenticated && autoConnect) {
+          await autoConnectSkillHubWithCatsCo();
+          return;
+        }
         renderSkillHubAccount();
       } catch (e) {
         if (card) card.innerHTML = '<div class="runtime-note danger">SkillHub 状态加载失败：'+escapeHtml(e.message || String(e))+'</div>';
@@ -6485,6 +6492,78 @@
         await searchSkillHub('', true);
       } catch (e) {
         alert('退出失败：' + (e.message || String(e)));
+      }
+    }
+
+    function renderSkillHubAccount() {
+      const card = document.getElementById('skillhub-account-card');
+      if (!card) return;
+      if (skillHubState.authenticated) {
+        const user = skillHubState.user || {};
+        card.innerHTML =
+          '<div class="settings-setup-head"><div><div class="settings-setup-title">SkillHub 已连接 CatsCo</div><div class="settings-setup-copy">'+escapeHtml(user.displayName || user.email || 'CatsCo 用户')+' · '+escapeHtml((skillHubState.roles || ['user']).join(', '))+'</div></div><span class="tag green">connected</span></div>'+
+          '<div class="config-actions" style="margin-top:14px">'+
+          '<button class="btn" onclick="refreshSkillHubPage()">刷新</button>'+
+          '</div>'+
+          (!skillHubState.trustReady?'<div class="runtime-note warning" style="margin-top:12px">当前构建还没有内置 SkillHub root public key。</div>':'');
+        return;
+      }
+
+      const error = skillHubState.error ? '<div class="runtime-note warning" style="margin-top:12px">'+escapeHtml(skillHubState.error)+'</div>' : '';
+      card.innerHTML =
+        '<div class="settings-setup-head"><div><div class="settings-setup-title">SkillHub 使用 CatsCo 账号</div><div class="settings-setup-copy">公开 Skill 可直接搜索和安装；分享和版本管理会自动复用当前 CatsCo 登录。</div></div><span class="tag warm">catsco login</span></div>'+
+        '<div class="config-actions" style="margin-top:14px">'+
+        '<button class="btn btn-primary" onclick="switchPage(\'chat\')">去 CatsCo 登录</button>'+
+        '<button class="btn" onclick="connectSkillHubWithCatsCo()">重试连接</button>'+
+        '</div>'+error;
+    }
+
+    async function ensureSkillHubAuthenticated() {
+      if (skillHubState.authenticated) return skillHubState;
+      return autoConnectSkillHubWithCatsCo({ throwOnError: true });
+    }
+
+    async function autoConnectSkillHubWithCatsCo(options) {
+      if (skillHubAutoConnectInFlight) return skillHubAutoConnectInFlight;
+      skillHubAutoConnectInFlight = connectSkillHubWithCatsCo({
+        quiet: true,
+        throwOnError: Boolean(options?.throwOnError),
+      }).finally(() => {
+        skillHubAutoConnectInFlight = null;
+      });
+      return skillHubAutoConnectInFlight;
+    }
+
+    async function connectSkillHubWithCatsCo(options) {
+      const quiet = Boolean(options?.quiet);
+      const throwOnError = Boolean(options?.throwOnError);
+      try {
+        skillHubState = await parseSimpleResponse(await fetch(API + '/api/skillhub/auth/catsco', {
+          method:'POST',
+          headers:{'Content-Type':'application/json'},
+          body:JSON.stringify({}),
+        }));
+        renderSkillHubAccount();
+        await fetchSkillHubDeveloper();
+        await searchSkillHub('', true);
+        return skillHubState;
+      } catch (e) {
+        const message = e.message || String(e);
+        const loginRequired = /catsco.*login|required|token|401|登录/i.test(message);
+        skillHubState = {
+          authenticated:false,
+          roles:[],
+          permissions:[],
+          installed: skillHubState.installed || [],
+          error: loginRequired ? '请先在 CatsCo 页面完成登录。' : ('SkillHub 连接失败：' + message),
+        };
+        renderSkillHubAccount();
+        if (throwOnError) throw e;
+        if (!quiet) {
+          const loginHint = loginRequired ? '\n\n请先在 CatsCo 页面完成登录。' : '';
+          alert('连接 SkillHub 失败：' + message + loginHint);
+        }
+        return skillHubState;
       }
     }
 

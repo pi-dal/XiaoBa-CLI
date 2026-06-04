@@ -1942,6 +1942,16 @@ export function createApiRouter(serviceManager: ServiceManager, updateController
     }
   });
 
+  router.get('/skills-root', async (_req, res) => {
+    try {
+      const skillsRoot = PathResolver.getSkillsPath();
+      PathResolver.ensureDir(skillsRoot);
+      res.json({ ok: true, path: skillsRoot });
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
   router.get('/skills/:name', async (req, res) => {
     try {
       const manager = new SkillManager();
@@ -1957,16 +1967,6 @@ export function createApiRouter(serviceManager: ServiceManager, updateController
         files: getSkillFiles(skill.filePath),
         ...management,
       });
-    } catch (e: any) {
-      res.status(500).json({ error: e.message });
-    }
-  });
-
-  router.get('/skills-root', async (_req, res) => {
-    try {
-      const skillsRoot = PathResolver.getSkillsPath();
-      PathResolver.ensureDir(skillsRoot);
-      res.json({ ok: true, path: skillsRoot });
     } catch (e: any) {
       res.status(500).json({ error: e.message });
     }
@@ -2263,11 +2263,11 @@ export function createApiRouter(serviceManager: ServiceManager, updateController
         username,
         password,
         code,
-      });
+      }, undefined, { timeoutMs: 10000 });
       const login = await catsRequest('POST', state.httpBaseUrl, '/api/auth/login', {
         account: email,
         password,
-      });
+      }, undefined, { timeoutMs: 10000 });
       persistCatsUserSession(state, login);
       res.json({
         ok: true,
@@ -2289,7 +2289,7 @@ export function createApiRouter(serviceManager: ServiceManager, updateController
       const password = String(req.body?.password || '');
       if (!account || !password) return res.status(400).json({ error: 'account and password are required' });
 
-      const login = await catsRequest('POST', state.httpBaseUrl, '/api/auth/login', { account, password });
+      const login = await catsRequest('POST', state.httpBaseUrl, '/api/auth/login', { account, password }, undefined, { timeoutMs: 10000 });
       persistCatsUserSession(state, login);
       res.json({
         ok: true,
