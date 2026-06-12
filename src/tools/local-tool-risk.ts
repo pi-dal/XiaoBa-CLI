@@ -1,5 +1,6 @@
 import type { ToolExecutionContext, ToolExecutionResult, ToolRiskLevel } from '../types/tool';
 import { isCatsCoToolGatewayContext } from './tool-gateway';
+import * as fs from 'fs';
 import * as path from 'path';
 
 export interface LocalToolRiskDecision {
@@ -88,8 +89,7 @@ export function classifyLocalToolRisk(
   }
 
   if (toolName === 'read_file' || toolName === 'glob' || toolName === 'grep') {
-    const target = readonlyToolTarget(toolName, args);
-    const pathRisk = classifyReadPathRisk(target, context);
+    const pathRisk = classifyReadTargetsRisk(readonlyToolTargets(toolName, args), context);
     if (pathRisk === 'low') {
       return { requiresConfirmation: false, risk: 'low', reason: '读取当前工作区内的普通路径。' };
     }
@@ -109,7 +109,11 @@ export function classifyLocalToolRisk(
 
   if (toolName === 'write_file' || toolName === 'edit_file') {
     const target = stringField(args, 'file_path') || stringField(args, 'path') || stringField(args, 'target');
-    if (looksSensitivePath(target)) {
+    const pathRisk = classifyWritePathRisk(toolName, target, context);
+    if (pathRisk === 'low') {
+      return { requiresConfirmation: false, risk: 'low', reason: '在当前工作区内新建普通文件。' };
+    }
+    if (pathRisk === 'high') {
       return { requiresConfirmation: true, risk: 'high', reason: '目标看起来是环境变量、密钥、系统配置或工作区外路径。' };
     }
     return { requiresConfirmation: true, risk: 'medium', reason: '工具会修改本机文件，需要用户确认。' };
@@ -142,27 +146,61 @@ function looksSensitivePath(value: string): boolean {
     || text.includes('/etc/');
 }
 
-function readonlyToolTarget(toolName: string, args: unknown): string {
+function readonlyToolTargets(toolName: string, args: unknown): string[] {
   if (toolName === 'read_file') {
-    return stringField(args, 'file_path') || stringField(args, 'path');
+    return [stringField(args, 'file_path') || stringField(args, 'path')].filter(Boolean);
   }
-  if (toolName === 'glob' || toolName === 'grep') {
-    return stringField(args, 'path') || '.';
+  if (toolName === 'glob') {
+    return [
+      stringField(args, 'path') || '.',
+      stringField(args, 'pattern'),
+    ].filter(Boolean);
   }
-  return '';
+  if (toolName === 'grep') {
+    return [
+      stringField(args, 'path') || '.',
+      stringField(args, 'glob'),
+    ].filter(Boolean);
+  }
+  return [];
+}
+
+function classifyReadTargetsRisk(values: string[], context: ToolExecutionContext): ToolRiskLevel {
+  const risks = (values.length > 0 ? values : ['.']).map(value => classifyReadPathRisk(value, context));
+  if (risks.includes('high')) return 'high';
+  if (risks.includes('medium')) return 'medium';
+  return 'low';
 }
 
 function classifyReadPathRisk(value: string, context: ToolExecutionContext): ToolRiskLevel {
   const target = value.trim();
-  if (!target || target === '.' || target === './' || target === '.\\') return 'low';
   if (/^catsco_attachment:[A-Za-z0-9._:-]+$/.test(target)) return 'low';
+  if (looksSensitivePath(target)) return 'high';
+
+  const workingDirectory = context.workingDirectory || process.cwd();
+  const workspaceRoot = context.workspaceRoot || workingDirectory;
+  const resolvedWorkingDirectory = path.resolve(workingDirectory);
+  const resolvedWorkspaceRoot = path.resolve(workspaceRoot);
+  if (!target || target === '.' || target === './' || target === '.\\') {
+    return isWithin(resolvedWorkingDirectory, resolvedWorkspaceRoot) ? 'low' : 'medium';
+  }
+  const resolved = path.resolve(resolvedWorkingDirectory, target);
+  if (looksSensitivePath(resolved)) return 'high';
+  if (isWithin(resolved, resolvedWorkspaceRoot)) return 'low';
+  return 'medium';
+}
+
+function classifyWritePathRisk(toolName: string, value: string, context: ToolExecutionContext): ToolRiskLevel {
+  const target = value.trim();
+  if (!target) return 'medium';
   if (looksSensitivePath(target)) return 'high';
 
   const workingDirectory = context.workingDirectory || process.cwd();
   const workspaceRoot = context.workspaceRoot || workingDirectory;
   const resolved = path.resolve(workingDirectory, target);
   if (looksSensitivePath(resolved)) return 'high';
-  if (isWithin(resolved, workingDirectory) || isWithin(resolved, workspaceRoot)) return 'low';
+  if (!isWithin(resolved, workspaceRoot)) return 'high';
+  if (toolName === 'write_file' && !fs.existsSync(resolved)) return 'low';
   return 'medium';
 }
 
