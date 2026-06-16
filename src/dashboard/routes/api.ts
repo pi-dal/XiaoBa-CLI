@@ -31,6 +31,15 @@ import {
   writeDashboardEnvUpdates,
 } from '../settings';
 import {
+  RELAY_MODEL_PROFILES,
+  findRelayModelProfile,
+  relayModelProviderBaseUrl,
+  relayModelProviderProtocolLabel,
+  relayModelProviderSdkLabel,
+  type RelayModelProfile,
+  type RelayModelProvider,
+} from '../../utils/relay-model-profiles';
+import {
   RuntimeProfileEditInput,
   hasRuntimeProfileRollback,
   previewRuntimeProfileEdit,
@@ -153,16 +162,24 @@ interface RelayModelConfig {
   label: string;
   model: string;
   family?: string;
-  provider: 'anthropic' | 'openai';
+  provider: RelayModelProvider;
   protocol: string;
   baseUrl: string;
+  sdkLabel: string;
   enabled: boolean;
   default: boolean;
   quotaClass?: string;
   contextWindowTokens?: number;
+  capabilities?: {
+    tool_calling?: boolean;
+    vision?: boolean;
+    streaming?: boolean;
+  };
 }
 
 const MODEL_SOURCE_ENV_KEY = 'CATSCO_MODEL_SOURCE';
+const RELAY_MODEL_VISION_CAPABLE_ENV_KEY = 'CATSCO_RELAY_LLM_VISION_CAPABLE';
+const RELAY_MODEL_TOOL_CALLING_CAPABLE_ENV_KEY = 'CATSCO_RELAY_LLM_TOOL_CALLING_CAPABLE';
 const CUSTOM_MODEL_ENV_KEYS = {
   provider: 'CATSCO_CUSTOM_LLM_PROVIDER',
   apiBase: 'CATSCO_CUSTOM_LLM_API_BASE',
@@ -831,11 +848,17 @@ async function commitCatsBotBindingAndStartConnector(
 
 function normalizeRelayModelProtocol(value: unknown): RelayModelProtocol {
   const text = String(value || '').trim().toLowerCase();
-  return text === 'openai' ? 'openai' : 'anthropic';
+  return text.includes('openai') ? 'openai' : 'anthropic';
 }
 
-function normalizeRelayProvider(value: unknown): 'anthropic' | 'openai' {
-  return String(value || '').trim().toLowerCase() === 'openai' ? 'openai' : 'anthropic';
+function normalizeRelayProvider(value: unknown): RelayModelProvider {
+  return String(value || '').trim().toLowerCase().includes('openai') ? 'openai' : 'anthropic';
+}
+
+function explicitRelayProvider(item: any): RelayModelProvider | undefined {
+  if (!item || typeof item !== 'object') return undefined;
+  if (item.provider == null && item.protocol == null) return undefined;
+  return normalizeRelayProvider(item.provider ?? item.protocol);
 }
 
 function relayEndpointForProtocol(config: any, protocol: RelayModelProtocol): string {
@@ -845,7 +868,9 @@ function relayEndpointForProtocol(config: any, protocol: RelayModelProtocol): st
     return protocol === 'openai' ? label.includes('openai') : label.includes('anthropic');
   });
   const baseUrl = normalizeBaseUrl(config?.base_url, 'https://relay.catsco.cc');
-  const fallback = protocol === 'openai' ? `${baseUrl}/v1` : `${baseUrl}/anthropic`;
+  const fallback = baseUrl === 'https://relay.catsco.cc'
+    ? relayModelProviderBaseUrl(protocol)
+    : protocol === 'openai' ? `${baseUrl}/v1` : `${baseUrl}/anthropic`;
   return normalizeBaseUrl(endpoint?.base_url, fallback);
 }
 
@@ -857,86 +882,90 @@ function canonicalRelayModelName(value: unknown): string {
   return model;
 }
 
+function relayModelCapabilitiesPayload(item: any, profile?: RelayModelProfile): RelayModelConfig['capabilities'] {
+  const capabilities = item?.capabilities;
+  const payload: RelayModelConfig['capabilities'] = profile
+    ? {
+      tool_calling: profile.capabilities.toolCalling,
+      vision: profile.capabilities.vision,
+      streaming: profile.capabilities.streaming,
+    }
+    : {};
+  if (!capabilities || typeof capabilities !== 'object') {
+    return Object.keys(payload).length > 0 ? payload : undefined;
+  }
+
+  const toolCalling = optionalBoolean(capabilities.tool_calling ?? capabilities.toolCalling);
+  const vision = optionalBoolean(capabilities.vision);
+  const streaming = optionalBoolean(capabilities.streaming);
+  if (toolCalling !== undefined) payload.tool_calling = toolCalling;
+  if (vision !== undefined) payload.vision = vision;
+  if (streaming !== undefined) payload.streaming = streaming;
+  return Object.keys(payload).length > 0 ? payload : undefined;
+}
+
+function optionalBoolean(value: unknown): boolean | undefined {
+  if (typeof value === 'boolean') return value;
+  if (typeof value === 'number' && Number.isFinite(value)) return value !== 0;
+  if (typeof value === 'string') {
+    const text = value.trim().toLowerCase();
+    if (['true', '1', 'yes', 'y', 'on'].includes(text)) return true;
+    if (['false', '0', 'no', 'n', 'off'].includes(text)) return false;
+  }
+  return undefined;
+}
+
 function normalizeRelayModelConfig(item: any, config: any, index: number): RelayModelConfig | null {
-  const model = canonicalRelayModelName(item?.model);
-  if (!model) return null;
-  const provider: 'anthropic' = 'anthropic';
-  const protocol = 'Anthropic-compatible';
-  const baseUrl = relayEndpointForProtocol(config, 'anthropic');
+  const rawModel = canonicalRelayModelName(item?.model);
+  if (!rawModel) return null;
+  const profile = findRelayModelProfile(rawModel);
+  const model = profile?.model || rawModel;
+  const provider = explicitRelayProvider(item)
+    ?? profile?.preferredProvider
+    ?? normalizeRelayProvider(item?.provider ?? item?.protocol);
+  const protocol = relayModelProviderProtocolLabel(provider);
+  const baseUrl = relayEndpointForProtocol(config, provider);
   const contextWindowTokens = parsePositiveInteger(item?.context_window_tokens)
     ?? parsePositiveInteger(item?.contextWindowTokens)
+    ?? profile?.contextWindowTokens
     ?? resolveKnownModelContextWindowTokens(model);
   return {
-    id: String(item?.id || model || `relay-model-${index}`).trim(),
-    label: String(item?.label || model).trim(),
+    id: String(item?.id || profile?.id || model || `relay-model-${index}`).trim(),
+    label: String(item?.label || profile?.label || model).trim(),
     model,
-    family: String(item?.family || '').trim() || undefined,
+    family: String(item?.family || profile?.family || '').trim() || undefined,
     provider,
     protocol,
     baseUrl,
+    sdkLabel: relayModelProviderSdkLabel(provider),
     enabled: item?.enabled !== false,
     default: item?.default === true,
-    quotaClass: String(item?.quota_class || item?.quotaClass || '').trim() || undefined,
+    quotaClass: String(item?.quota_class || item?.quotaClass || profile?.quotaClass || '').trim() || undefined,
     contextWindowTokens,
+    capabilities: relayModelCapabilitiesPayload(item, profile),
   };
 }
 
 function fallbackRelayModelCatalog(config: any): RelayModelConfig[] {
-  const baseUrl = relayEndpointForProtocol(config, 'anthropic');
-  return [
-    {
-      id: 'minimax-m2.7',
-      label: 'MiniMax M2.7',
-      model: 'MiniMax-M2.7',
-      family: 'minimax',
-      provider: 'anthropic',
-      protocol: 'Anthropic-compatible',
-      baseUrl,
-      enabled: true,
-      default: true,
-      quotaClass: 'standard',
-      contextWindowTokens: 204_800,
+  return RELAY_MODEL_PROFILES.map((profile, index) => ({
+    id: profile.id,
+    label: profile.label,
+    model: profile.model,
+    family: profile.family,
+    provider: profile.preferredProvider,
+    protocol: relayModelProviderProtocolLabel(profile.preferredProvider),
+    baseUrl: relayEndpointForProtocol(config, profile.preferredProvider),
+    sdkLabel: relayModelProviderSdkLabel(profile.preferredProvider),
+    enabled: true,
+    default: index === 0,
+    quotaClass: profile.quotaClass,
+    contextWindowTokens: profile.contextWindowTokens,
+    capabilities: {
+      tool_calling: profile.capabilities.toolCalling,
+      vision: profile.capabilities.vision,
+      streaming: profile.capabilities.streaming,
     },
-    {
-      id: 'minimax-m3',
-      label: 'MiniMax M3',
-      model: 'MiniMax-M3',
-      family: 'minimax',
-      provider: 'anthropic',
-      protocol: 'Anthropic-compatible',
-      baseUrl,
-      enabled: true,
-      default: false,
-      quotaClass: 'multimodal',
-      contextWindowTokens: 1_000_000,
-    },
-    {
-      id: 'deepseek-v4-flash',
-      label: 'DeepSeek V4 Flash',
-      model: 'deepseek-v4-flash',
-      family: 'deepseek',
-      provider: 'anthropic',
-      protocol: 'Anthropic-compatible',
-      baseUrl,
-      enabled: true,
-      default: false,
-      quotaClass: 'flash-low',
-      contextWindowTokens: 1_000_000,
-    },
-    {
-      id: 'glm-5.1',
-      label: 'GLM 5.1',
-      model: 'glm-5.1',
-      family: 'glm',
-      provider: 'anthropic',
-      protocol: 'Anthropic-compatible',
-      baseUrl,
-      enabled: true,
-      default: false,
-      quotaClass: 'standard',
-      contextWindowTokens: 200_000,
-    },
-  ];
+  }));
 }
 
 function relayModelCatalog(config: any): RelayModelConfig[] {
@@ -1010,12 +1039,14 @@ function relayModelPayload(model: RelayModelConfig): Record<string, unknown> {
     provider: model.provider,
     protocol: model.protocol,
     base_url: model.baseUrl,
+    sdk_label: model.sdkLabel,
     enabled: model.enabled,
     default: model.default,
     quota_class: model.quotaClass,
     context_window_tokens: model.contextWindowTokens,
     prompt_budget_tokens: promptBudget,
     context_label: model.contextWindowTokens ? formatContextWindowTokens(model.contextWindowTokens) : undefined,
+    capabilities: model.capabilities,
   };
 }
 
@@ -1171,6 +1202,8 @@ function writeCustomModelStartupConfig(): { profile: ModelLaunchProfile; updated
     ...modelProfileUpdates(CUSTOM_MODEL_ENV_KEYS, profile),
     ...modelProfileUpdates(EFFECTIVE_MODEL_ENV_KEYS, profile),
     [MODEL_SOURCE_ENV_KEY]: 'custom',
+    [RELAY_MODEL_VISION_CAPABLE_ENV_KEY]: undefined,
+    [RELAY_MODEL_TOOL_CALLING_CAPABLE_ENV_KEY]: undefined,
   });
   return { profile, ...result };
 }
@@ -1188,6 +1221,8 @@ function writeRelayModelStartupConfig(model: RelayModelConfig, apiKey: string): 
     ...modelProfileUpdates(RELAY_MODEL_ENV_KEYS, profile),
     ...modelProfileUpdates(EFFECTIVE_MODEL_ENV_KEYS, profile),
     [MODEL_SOURCE_ENV_KEY]: 'relay',
+    [RELAY_MODEL_VISION_CAPABLE_ENV_KEY]: model.capabilities?.vision === undefined ? undefined : String(model.capabilities.vision),
+    [RELAY_MODEL_TOOL_CALLING_CAPABLE_ENV_KEY]: model.capabilities?.tool_calling === undefined ? undefined : String(model.capabilities.tool_calling),
   });
   return {
     updated: [...preserved, ...result.updated],
