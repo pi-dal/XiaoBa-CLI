@@ -783,7 +783,7 @@ export class CatsCompanyBot {
         await this.handleSubAgentFeedback(key, msg.topic, msg.senderId, text, msg.executionScope);
       },
       onSubAgentEvent: async (event: any, info?: SubAgentInfo) => {
-        await this.handleSubAgentRuntimeEvent(msg.topic, event, info);
+        await this.handleSubAgentRuntimeEvent(msg.topic, event, info, msg.executionScope?.channelSource);
       },
     } as any);
 
@@ -1132,9 +1132,14 @@ export class CatsCompanyBot {
     topic: string,
     event: any,
     info?: SubAgentInfo,
+    channelSource?: string,
   ): Promise<void> {
     const subAgentId = String(event?.subAgentId || info?.id || '');
     if (!subAgentId) return;
+
+    if (shouldSuppressStructuredToolProgress(channelSource)) {
+      return;
+    }
 
     const displayName = String(event?.subAgentName || (info as any)?.displayName || subAgentId.slice(0, 12));
     const toolUseId = `subagent:${subAgentId}`;

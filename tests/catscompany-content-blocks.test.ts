@@ -799,6 +799,52 @@ describe('CatsCo content blocks', () => {
     assert.match(toolResults[0].content, /logs\/report\.md/);
   });
 
+  test('subagent runtime events are suppressed for Weixin mobile bridge channels', async () => {
+    const { bot, sentThinking, toolUses, toolResults } = createProcessHarness();
+    const now = Date.now();
+    const info = {
+      id: 'sub-1',
+      skillName: 'explorer',
+      taskDescription: '扫描桌面文件',
+      status: 'running',
+      createdAt: now,
+      progressLog: [],
+      outputFiles: [],
+    };
+
+    await bot.handleSubAgentRuntimeEvent('p2p_1_2', {
+      subAgentId: 'sub-1',
+      subAgentName: '子agent1',
+      type: 'agent_spawned',
+      timestamp: now,
+      summary: '派遣子agent1 扫描桌面文件',
+    }, info, 'weixin');
+
+    await bot.handleSubAgentRuntimeEvent('p2p_1_2', {
+      subAgentId: 'sub-1',
+      subAgentName: '子agent1',
+      type: 'agent_progress',
+      timestamp: now + 1,
+      summary: '开始执行：扫描桌面文件',
+    }, info, 'weixin');
+
+    await bot.handleSubAgentRuntimeEvent('p2p_1_2', {
+      subAgentId: 'sub-1',
+      subAgentName: '子agent1',
+      type: 'agent_completed',
+      timestamp: now + 2,
+      summary: '完成',
+    }, {
+      ...info,
+      status: 'completed',
+      resultSummary: '桌面文件扫描完成',
+    }, 'weixin');
+
+    assert.deepStrictEqual(toolUses, []);
+    assert.deepStrictEqual(toolResults, []);
+    assert.deepStrictEqual(sentThinking, []);
+  });
+
   test('subagent feedback visible reply is sent back to CatsCompany', async () => {
     const { bot, runtimeObservations, replies, sentThinking, session } = createProcessHarness();
     session.handleRuntimeObservation = async (text: string, options: any) => {
