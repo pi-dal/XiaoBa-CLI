@@ -395,7 +395,7 @@ function openCustomModelFromChat(){
 }
 
 function relayActionBusy(){
-  return relayModelApplyInFlight || catsSetupInFlight;
+  return relayModelApplyInFlight || catsSetupInFlight || catsAutoStartInFlight;
 }
 
 function refreshRelayActionControls(){
@@ -410,6 +410,11 @@ function setRelayModelApplyBusy(busy){
 
 function setCatsSetupBusy(busy){
   catsSetupInFlight=Boolean(busy);
+  refreshRelayActionControls();
+}
+
+function setCatsAutoStartBusy(busy){
+  catsAutoStartInFlight=Boolean(busy);
   refreshRelayActionControls();
 }
 

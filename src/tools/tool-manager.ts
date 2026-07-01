@@ -18,10 +18,10 @@ import { UpdatePlanTool } from './update-plan-tool';
 import { RecordDecisionTool } from './record-decision-tool';
 import { ShareSkillHubSkillTool } from './share-skillhub-skill-tool';
 import { AskParentTool } from './ask-parent-tool';
-import { PromptModeTool } from './prompt-mode-tool';
 import { DEFAULT_TOOL_NAMES } from './default-tool-names';
 import { mergeToolExecutionContext } from '../utils/tool-context';
 import { confirmLocalToolExecution } from './local-tool-risk';
+import { buildToolTargetContext, operationForToolTargetContext } from './tool-target-context';
 
 const INTERNAL_TOOL_NAMES = ['ask_parent'] as const;
 
@@ -94,7 +94,6 @@ export class ToolManager implements ToolExecutor {
       new UpdatePlanTool(),
       new RecordDecisionTool(),
       new ShareSkillHubSkillTool(),
-      new PromptModeTool(),
       new SkillTool(),
     ];
 
@@ -207,6 +206,11 @@ export class ToolManager implements ToolExecutor {
       }
 
       const output = await tool.execute(args, context);
+      const targetContext = output.targetContext || buildToolTargetContext(context, {
+        toolName,
+        operation: operationForToolTargetContext(toolName),
+        cwd: resolveTargetContextCwd(toolName, args, context.workingDirectory),
+      });
 
       // 失败结果：统一走 ok=false 分支
       if (!output.ok) {
@@ -215,6 +219,7 @@ export class ToolManager implements ToolExecutor {
           role: 'tool',
           name: toolCall.function.name,
           content: output.message,
+          targetContext,
           ok: false,
           errorCode: output.errorCode,
           retryable: output.retryable ?? isRateLimitLikeMessage(output.message),
@@ -226,6 +231,7 @@ export class ToolManager implements ToolExecutor {
         role: 'tool',
         name: toolCall.function.name,
         content: output.content,
+        targetContext,
         ok: true,
         controlSignal: tool.definition.controlMode,
       };
@@ -255,4 +261,12 @@ export class ToolManager implements ToolExecutor {
   getAllTools(): Tool[] {
     return Array.from(this.tools.values());
   }
+}
+
+function resolveTargetContextCwd(toolName: string, args: unknown, currentDirectory: string): string {
+  if (toolName !== 'execute_shell' || !args || typeof args !== 'object') {
+    return currentDirectory;
+  }
+  const cwd = (args as Record<string, unknown>).cwd;
+  return typeof cwd === 'string' && cwd.trim() ? cwd.trim() : currentDirectory;
 }

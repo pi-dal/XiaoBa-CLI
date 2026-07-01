@@ -7,6 +7,7 @@ import type {
   ScopedLocalFileGrant,
   SessionRoute,
 } from '../types/session-identity';
+import type { TargetRoutes } from '../types/tool';
 import {
   SessionSkillRuntime,
   TRANSIENT_SKILLS_LIST_PREFIX,
@@ -18,19 +19,21 @@ import {
   buildSubAgentStatusMessage,
 } from './sub-agent-observation';
 import {
+  type ExecutionContextSnapshot,
   TRANSIENT_RUNTIME_CONTEXT_PREFIX,
   buildRuntimeContextMessage,
+  buildRuntimeContextSnapshot,
 } from './runtime-context-builder';
 import { stripAssistantArtifactsFromMessages } from '../utils/transcript-artifacts';
+import { TRANSIENT_ACTIVE_PROMPT_MODE_PREFIX } from './prompt-mode-runtime';
 import {
   TRANSIENT_FIXED_PROMPT_MODE_PREFIX,
   TRANSIENT_PROMPT_MODES_LIST_PREFIX,
   buildFixedPromptModeMessage,
-  buildPromptModesListMessage,
   findFixedPromptModeState,
-  findPreviousPromptModeState,
 } from '../runtime/prompt-modes';
 import { resolveTurnContextTransientPolicy } from './transient-injection-policy';
+import { TRANSIENT_PENDING_USER_INPUT_PREFIX } from './pending-user-input-boundary';
 
 const TRANSIENT_PLAN_STATUS_PREFIX = '[transient_plan_status]';
 const TRANSIENT_RUNNER_HINT_PREFIX = '[transient_runner_hint]';
@@ -45,16 +48,19 @@ export interface BuildTurnContextParams {
   localDeviceGrant?: ScopedLocalDeviceGrant;
   deviceGrants?: ScopedDeviceGrant[];
   deviceSelection?: ScopedDeviceSelection;
+  targetRoutes?: TargetRoutes;
   localFileGrants?: ScopedLocalFileGrant[];
   durableMessages: Message[];
   runtimeFeedback: string[];
   skillRuntime: SessionSkillRuntime;
   planRuntime?: PlanRuntime;
+  promptModeRoutingEnabled?: boolean;
 }
 
 export interface BuildTurnContextResult {
   messages: Message[];
   runtimeFeedbackForLog: string[];
+  executionContext?: ExecutionContextSnapshot;
 }
 
 /**
@@ -70,7 +76,9 @@ export class TurnContextBuilder {
     this.injectRuntimeFeedback(contextMessages, params.runtimeFeedback);
     this.injectPlanStatus(contextMessages, params.planRuntime);
     this.injectSubAgentStatus(contextMessages, params.sessionKey);
-    this.injectPromptModesList(contextMessages);
+    this.injectPromptModesList(contextMessages, {
+      promptModeRoutingEnabled: params.promptModeRoutingEnabled,
+    });
     const transientPolicy = resolveTurnContextTransientPolicy(contextMessages);
     if (transientPolicy.injectSkillsList) {
       await params.skillRuntime.reloadSkills();
@@ -85,6 +93,7 @@ export class TurnContextBuilder {
     return {
       messages: contextMessages,
       runtimeFeedbackForLog: this.extractRuntimeFeedback(contextMessages),
+      executionContext: buildRuntimeContextSnapshot(params) || undefined,
     };
   }
 
@@ -102,10 +111,16 @@ export class TurnContextBuilder {
         && typeof msg.content === 'string'
         && msg.content.startsWith(TRANSIENT_FIXED_PROMPT_MODE_PREFIX)
       ) return false;
+      if (
+        msg.role === 'system'
+        && typeof msg.content === 'string'
+        && msg.content.startsWith(TRANSIENT_ACTIVE_PROMPT_MODE_PREFIX)
+      ) return false;
       if (msg.role !== 'system' || typeof msg.content !== 'string') return true;
       if (msg.content.startsWith(TRANSIENT_SUBAGENT_STATUS_PREFIX)) return false;
       if (msg.content.startsWith(TRANSIENT_PLAN_STATUS_PREFIX)) return false;
       if (msg.content.startsWith(TRANSIENT_RUNNER_HINT_PREFIX)) return false;
+      if (msg.content.startsWith(TRANSIENT_PENDING_USER_INPUT_PREFIX)) return false;
       if (msg.content.startsWith(TRANSIENT_SOFT_CHECK_PREFIX)) return false;
       if (msg.content.startsWith(TRANSIENT_RUNTIME_OBSERVATION_RULES_PREFIX)) return false;
       if (msg.content.startsWith(TRANSIENT_SKILLS_LIST_PREFIX)) return false;
@@ -123,6 +138,7 @@ export class TurnContextBuilder {
       localDeviceGrant: params.localDeviceGrant,
       deviceGrants: params.deviceGrants,
       deviceSelection: params.deviceSelection,
+      targetRoutes: params.targetRoutes,
       localFileGrants: params.localFileGrants,
     });
     if (!message) return;
@@ -172,18 +188,14 @@ export class TurnContextBuilder {
     this.insertBeforeLastUser(messages, statusMessage);
   }
 
-  private injectPromptModesList(messages: Message[]): void {
+  private injectPromptModesList(
+    messages: Message[],
+    _options: { promptModeRoutingEnabled?: boolean } = {},
+  ): void {
     const fixedMode = findFixedPromptModeState(messages);
     if (fixedMode) {
       this.insertBeforeLastUser(messages, buildFixedPromptModeMessage(fixedMode));
-      return;
     }
-
-    const modeList = buildPromptModesListMessage({
-      previousMode: findPreviousPromptModeState(messages),
-    });
-    if (!modeList) return;
-    this.insertBeforeLastUser(messages, modeList);
   }
 
   private extractRuntimeFeedback(messages: Message[]): string[] {

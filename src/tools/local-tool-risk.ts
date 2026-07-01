@@ -1,6 +1,6 @@
 import type { DeviceGrantOperation } from '../types/session-identity';
 import type { ToolExecutionContext, ToolExecutionResult, ToolRiskLevel } from '../types/tool';
-import { isCatsCoLocalOwnerSelfContext, resolveToolGatewayAccess } from './tool-gateway';
+import { isCatsCoAgentLocalBodyContext, isCatsCoLocalOwnerSelfContext, resolveToolGatewayAccess } from './tool-gateway';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
@@ -26,6 +26,7 @@ const LOW_RISK_TOOLS = new Set([
   'memory_read_turn',
   'memory_neighbors',
   'finish_memory_search',
+  'finish_prompt_mode_routing',
 ]);
 
 const CONFIRM_TOOLS = new Set([
@@ -95,12 +96,16 @@ export function classifyLocalToolRisk(
   args: unknown,
   context: ToolExecutionContext,
 ): LocalToolRiskDecision {
+  if (context.surface === 'catscompany') {
+    return { requiresConfirmation: false, risk: 'low', reason: 'CatsCo lightweight execution routes do not require local confirmation.' };
+  }
+
   if (LOW_RISK_TOOLS.has(toolName)) {
     return { requiresConfirmation: false, risk: 'low', reason: '只读或状态类工具。' };
   }
 
-  if (isCatsCoLocalOwnerSelfContext(context)) {
-    return { requiresConfirmation: false, risk: 'low', reason: 'CatsCo 本地 owner 自用场景允许直接执行本机工具。' };
+  if (isCatsCoLocalOwnerSelfContext(context) || isCatsCoAgentLocalBodyContext(context)) {
+    return { requiresConfirmation: false, risk: 'low', reason: 'CatsCo 虚拟员工本机运行体允许直接执行本机工具。' };
   }
 
   const remoteFileOperation = REMOTE_DEVICE_FILE_TOOL_OPERATIONS[toolName];

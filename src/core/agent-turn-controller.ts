@@ -1,4 +1,5 @@
 import { ContentBlock, Message } from '../types';
+import { randomUUID } from 'crypto';
 import type {
   ExecutionScope,
   ScopedDeviceGrant,
@@ -10,6 +11,8 @@ import type {
 import {
   ChannelCallbacks,
   DeviceRpcTransport,
+  TargetRoutes,
+  ThinToolRpcTransport,
   ToolExecutionConfirmationRequest,
   ToolExecutionConfirmationResult,
 } from '../types/tool';
@@ -35,7 +38,10 @@ import {
   withSyntheticObservationTiming,
 } from './synthetic-observation';
 import { MemorySidecarBranchHandle, startMemorySidecarBranch } from './sidecar-memory-branch';
+import { ModeRouterSidecarBranchHandle, startModeRouterSidecarBranch } from './sidecar-mode-router-branch';
 import { isBranchAgentsEnabled } from './branch-agent-settings';
+import { PromptModeRuntime } from './prompt-mode-runtime';
+import { findFixedPromptModeState, listPromptModeDefinitions, FixedPromptModeState } from '../runtime/prompt-modes';
 
 export interface AgentTurnServices {
   aiService: AIService;
@@ -67,6 +73,8 @@ export interface RunAgentTurnParams {
   deviceGrants?: ScopedDeviceGrant[];
   deviceSelection?: ScopedDeviceSelection;
   deviceRpc?: DeviceRpcTransport;
+  thinToolRpc?: ThinToolRpcTransport;
+  targetRoutes?: TargetRoutes;
   localFileGrants?: ScopedLocalFileGrant[];
   pendingUserInputProvider?: PendingUserInputProvider;
   abortSignal?: AbortSignal;
@@ -105,21 +113,33 @@ interface MemoryBranchSlot {
   done: boolean;
 }
 
+interface ModeRouterBranchSlot {
+  queue: InMemorySyntheticObservationQueue;
+  handle: ModeRouterSidecarBranchHandle;
+  originTurn: number;
+  done: boolean;
+}
+
 /**
  * Runs one user turn: durable input -> transient context -> model/tool loop -> state/log sync.
  */
 export class AgentTurnController {
   private turnSequence = 0;
   private memoryBranchCarryover: MemoryBranchSlot | null = null;
+  private modeRouterCarryover: ModeRouterBranchSlot | null = null;
+  private promptModeRuntime = new PromptModeRuntime();
 
   constructor(private readonly options: AgentTurnControllerOptions) {}
 
   async run(params: RunAgentTurnParams): Promise<RunAgentTurnResult> {
     const turnNumber = ++this.turnSequence;
+    const episodeId = this.createEpisodeId(turnNumber);
     const previousCarryoverMemoryBranch = this.memoryBranchCarryover;
+    const previousCarryoverModeRouter = this.modeRouterCarryover;
     const branchAgentsEnabled = isBranchAgentsEnabled();
     const carryoverMemoryBranch = branchAgentsEnabled ? previousCarryoverMemoryBranch : null;
     this.memoryBranchCarryover = null;
+    this.modeRouterCarryover = null;
     if (!branchAgentsEnabled) {
       this.expireMemoryBranch(previousCarryoverMemoryBranch, 'branch_agents_disabled');
     }
@@ -127,11 +147,25 @@ export class AgentTurnController {
     params.messages.push({
       role: 'user',
       content: params.input,
+      __episodeId: episodeId,
+      __episodeInputKind: 'root',
       ...(params.runtimeObservationSource && {
         __runtimeObservation: true,
         runtimeObservationSource: params.runtimeObservationSource,
       }),
     });
+
+    this.promptModeRuntime.beginTurn(turnNumber);
+    const fixedMode = findFixedPromptModeState(params.messages);
+    const promptModeRouterEnabled = this.isPromptModeRouterEnabled(branchAgentsEnabled, fixedMode);
+    const carryoverModeRouter = promptModeRouterEnabled ? previousCarryoverModeRouter : null;
+    if (!promptModeRouterEnabled) {
+      this.promptModeRuntime.clear(fixedMode ? 'fixed_mode_active' : 'prompt_mode_router_disabled');
+      this.expireModeRouterBranch(
+        previousCarryoverModeRouter,
+        fixedMode ? 'fixed_mode_active' : 'prompt_mode_router_disabled',
+      );
+    }
 
     const turnContext = await this.options.turnContextBuilder.build({
       sessionKey: this.options.sessionKey,
@@ -141,14 +175,23 @@ export class AgentTurnController {
       localDeviceGrant: params.localDeviceGrant,
       deviceGrants: params.deviceGrants,
       deviceSelection: params.deviceSelection,
+      targetRoutes: params.targetRoutes,
       localFileGrants: params.localFileGrants,
       durableMessages: params.messages,
       runtimeFeedback: params.runtimeFeedback,
       skillRuntime: this.options.skillRuntime,
       planRuntime: this.options.planRuntime,
+      promptModeRoutingEnabled: promptModeRouterEnabled,
     });
 
     const currentMemoryBranch = this.startMemorySidecarIfEnabled({
+      turnNumber,
+      input: params.input,
+      messages: params.messages,
+      abortSignal: params.abortSignal,
+    });
+    const currentModeRouter = this.startModeRouterIfEnabled({
+      enabled: promptModeRouterEnabled,
       turnNumber,
       input: params.input,
       messages: params.messages,
@@ -162,12 +205,22 @@ export class AgentTurnController {
       deviceGrants: params.deviceGrants,
       deviceSelection: params.deviceSelection,
       deviceRpc: params.deviceRpc,
+      thinToolRpc: params.thinToolRpc,
+      targetRoutes: params.targetRoutes,
       localFileGrants: params.localFileGrants,
+      executionContext: turnContext.executionContext,
       pendingUserInputProvider: params.pendingUserInputProvider,
       confirmToolExecution: params.callbacks?.confirmToolExecution,
+      episodeId,
       syntheticObservationProvider: () => this.drainMemoryObservations(
         carryoverMemoryBranch,
         currentMemoryBranch,
+      ),
+      runtimeTransientProvider: () => this.buildPromptModeTransientMessages(
+        carryoverModeRouter,
+        currentModeRouter,
+        turnNumber,
+        fixedMode,
       ),
       abortSignal: params.abortSignal,
       shouldContinue: params.shouldContinue,
@@ -176,6 +229,7 @@ export class AgentTurnController {
     let result;
     try {
       result = await runner.run(turnContext.messages, this.toRunnerCallbacks(params.callbacks));
+      this.markEpisodeMessages(result.newMessages, episodeId);
     } catch (error: any) {
       const partialMessages = this.options.turnContextBuilder.removeTransientMessages(turnContext.messages);
       this.replaceBase64Images(partialMessages);
@@ -185,10 +239,16 @@ export class AgentTurnController {
       throw error;
     } finally {
       this.expireMemoryBranch(carryoverMemoryBranch, 'carryover_ttl_expired');
+      this.expireModeRouterBranch(carryoverModeRouter, 'carryover_ttl_expired');
       if (result && currentMemoryBranch && this.shouldCarryMemoryBranch(currentMemoryBranch)) {
         this.memoryBranchCarryover = currentMemoryBranch;
       } else {
         this.expireMemoryBranch(currentMemoryBranch, result ? 'current_branch_consumed' : 'turn_failed');
+      }
+      if (result && currentModeRouter && this.shouldCarryModeRouterBranch(currentModeRouter)) {
+        this.modeRouterCarryover = currentModeRouter;
+      } else {
+        this.expireModeRouterBranch(currentModeRouter, result ? 'current_branch_consumed' : 'turn_failed');
       }
     }
     const nextMessages = this.options.turnContextBuilder.removeTransientMessages(result.messages);
@@ -219,6 +279,17 @@ export class AgentTurnController {
     };
   }
 
+  private createEpisodeId(turnNumber: number): string {
+    return `episode:${turnNumber}:${randomUUID().slice(0, 8)}`;
+  }
+
+  private markEpisodeMessages(messages: Message[], episodeId: string): void {
+    for (const message of messages) {
+      if (message.__episodeId) continue;
+      message.__episodeId = episodeId;
+    }
+  }
+
   private createRunner(options: {
     channel?: ChannelCallbacks;
     executionScope?: ExecutionScope;
@@ -226,10 +297,15 @@ export class AgentTurnController {
     deviceGrants?: ScopedDeviceGrant[];
     deviceSelection?: ScopedDeviceSelection;
     deviceRpc?: DeviceRpcTransport;
+    thinToolRpc?: ThinToolRpcTransport;
+    targetRoutes?: TargetRoutes;
     localFileGrants?: ScopedLocalFileGrant[];
+    executionContext?: import('./runtime-context-builder').ExecutionContextSnapshot;
     pendingUserInputProvider?: PendingUserInputProvider;
     confirmToolExecution?: AgentTurnCallbacks['confirmToolExecution'];
+    episodeId?: string;
     syntheticObservationProvider?: () => SyntheticObservation[];
+    runtimeTransientProvider?: () => Message[];
     abortSignal?: AbortSignal;
     shouldContinue: () => boolean;
   }): ConversationRunner {
@@ -241,18 +317,21 @@ export class AgentTurnController {
         shouldContinue: options.shouldContinue,
         pendingUserInputProvider: options.pendingUserInputProvider,
         syntheticObservationProvider: options.syntheticObservationProvider,
+        runtimeTransientProvider: options.runtimeTransientProvider,
+        episodeId: options.episodeId,
         // AgentSession/ContextWindowManager compacts durable history before the turn.
         // Runner-level compaction can fold transient runtime feedback into summary.
         enableCompression: false,
         toolExecutionContext: {
           sessionId: this.options.sessionKey,
           surface,
-          permissionProfile: 'strict',
+          permissionProfile: options.confirmToolExecution ? 'strict' : undefined,
           workspaceRoot: this.options.workspaceRoot,
           workingDirectory: this.options.getCurrentDirectory(),
           getCurrentDirectory: this.options.getCurrentDirectory,
           updateCurrentDirectory: this.options.updateCurrentDirectory,
           planRuntime: this.options.planRuntime,
+          promptModeRuntime: this.promptModeRuntime,
           runtimeServices: {
             aiService: this.options.services.aiService,
             skillManager: this.options.services.skillManager,
@@ -264,6 +343,9 @@ export class AgentTurnController {
           deviceGrants: options.deviceGrants,
           deviceSelection: options.deviceSelection,
           deviceRpc: options.deviceRpc,
+          thinToolRpc: options.thinToolRpc,
+          targetRoutes: options.targetRoutes,
+          executionContext: options.executionContext,
           localFileGrants: options.localFileGrants,
           confirmToolExecution: options.confirmToolExecution,
         },
@@ -304,6 +386,40 @@ export class AgentTurnController {
     return slot;
   }
 
+  private startModeRouterIfEnabled(options: {
+    enabled: boolean;
+    turnNumber: number;
+    input: string | ContentBlock[];
+    messages: Message[];
+    abortSignal?: AbortSignal;
+  }): ModeRouterBranchSlot | null {
+    if (!options.enabled) {
+      return null;
+    }
+    if (!(this.options.services.aiService instanceof AIService)) {
+      return null;
+    }
+    if (listPromptModeDefinitions().length === 0) {
+      return null;
+    }
+    const queue = new InMemorySyntheticObservationQueue();
+    const slot: ModeRouterBranchSlot = {
+      queue,
+      originTurn: options.turnNumber,
+      done: false,
+      handle: this.createModeRouterHandle({
+        input: options.input,
+        messages: options.messages,
+        queue,
+        abortSignal: options.abortSignal,
+      }),
+    };
+    slot.handle.done.finally(() => {
+      slot.done = true;
+    });
+    return slot;
+  }
+
   private drainMemoryObservations(
     carryover: MemoryBranchSlot | null,
     current: MemoryBranchSlot | null,
@@ -325,6 +441,10 @@ export class AgentTurnController {
   }
 
   private shouldCarryMemoryBranch(slot: MemoryBranchSlot): boolean {
+    return !slot.done || slot.queue.size() > 0;
+  }
+
+  private shouldCarryModeRouterBranch(slot: ModeRouterBranchSlot): boolean {
     return !slot.done || slot.queue.size() > 0;
   }
 
@@ -362,6 +482,35 @@ export class AgentTurnController {
     }
   }
 
+  private expireModeRouterBranch(slot: ModeRouterBranchSlot | null, reason: string): void {
+    if (!slot) return;
+    slot.handle.cancel();
+    const droppedObservations = slot.queue.cancel();
+    if (droppedObservations.length > 0) {
+      Logger.info(
+        `[${this.options.sessionKey}] dropped ${droppedObservations.length} unconsumed prompt mode router observation(s): `
+        + `reason=${reason} origin_turn=${slot.originTurn} `
+        + droppedObservations.map(describeSyntheticObservationForLog).join(' | ')
+      );
+      for (const observation of droppedObservations) {
+        Logger.runtimeEvent(
+          'INFO',
+          `[${this.options.sessionKey}] prompt_mode_router_lifecycle dropped id=${observation.id || '(unassigned)'}`,
+          buildSyntheticObservationLifecycleEvent(observation, {
+            outcome: 'dropped',
+            reason,
+            originTurn: slot.originTurn,
+          }),
+        );
+      }
+    } else if (!slot.done && reason === 'carryover_ttl_expired') {
+      Logger.info(
+        `[${this.options.sessionKey}] cancelled unfinished prompt mode router carryover: `
+        + `reason=${reason} origin_turn=${slot.originTurn}`
+      );
+    }
+  }
+
   private createMemorySidecarHandle(options: {
     input: string | ContentBlock[];
     messages: Message[];
@@ -379,6 +528,65 @@ export class AgentTurnController {
     });
   }
 
+  private createModeRouterHandle(options: {
+    input: string | ContentBlock[];
+    messages: Message[];
+    queue: SyntheticObservationQueue;
+    abortSignal?: AbortSignal;
+  }): ModeRouterSidecarBranchHandle {
+    return startModeRouterSidecarBranch({
+      sessionKey: this.options.sessionKey,
+      input: options.input,
+      recentMessages: options.messages,
+      workingDirectory: this.options.getCurrentDirectory(),
+      aiService: this.options.services.aiService,
+      queue: options.queue,
+      activeMode: this.promptModeRuntime.getActiveMode(),
+      signal: options.abortSignal,
+    });
+  }
+
+  private buildPromptModeTransientMessages(
+    carryover: ModeRouterBranchSlot | null,
+    current: ModeRouterBranchSlot | null,
+    turnNumber: number,
+    fixedMode?: FixedPromptModeState,
+  ): Message[] {
+    if (fixedMode) return [];
+    const observations = [
+      ...this.drainModeRouterBranch(carryover, 'late_previous_turn'),
+      ...this.drainModeRouterBranch(current, 'current_turn'),
+    ];
+    this.promptModeRuntime.applyRouterObservations(observations, turnNumber);
+    const message = this.promptModeRuntime.buildTransientMessage({
+      turnNumber,
+      fixedMode,
+    });
+    return message ? [message] : [];
+  }
+
+  private drainModeRouterBranch(
+    slot: ModeRouterBranchSlot | null,
+    timing: SyntheticObservationTiming,
+  ): SyntheticObservation[] {
+    if (!slot) return [];
+    return slot.queue.drain().map(observation =>
+      this.withModeRouterObservationMetadata(observation, timing, slot.originTurn)
+    );
+  }
+
+  private isPromptModeRouterEnabled(
+    branchAgentsEnabled: boolean,
+    fixedMode?: FixedPromptModeState,
+  ): boolean {
+    if (fixedMode) return false;
+    if (!branchAgentsEnabled) return false;
+    if (process.env.XIAOBA_PROMPT_MODE_ROUTER_ENABLED !== 'true') return false;
+    if (!(this.options.services.aiService instanceof AIService)) return false;
+    if (listPromptModeDefinitions().length === 0) return false;
+    return true;
+  }
+
   private withMemoryBranchObservationMetadata(
     observation: SyntheticObservation,
     timing: SyntheticObservationTiming,
@@ -389,6 +597,22 @@ export class AgentTurnController {
       ...timed,
       metadata: {
         ...(timed.metadata || {}),
+        originTurn,
+      },
+    };
+  }
+
+  private withModeRouterObservationMetadata(
+    observation: SyntheticObservation,
+    timing: SyntheticObservationTiming,
+    originTurn: number,
+  ): SyntheticObservation {
+    return {
+      ...observation,
+      timing,
+      metadata: {
+        ...(observation.metadata || {}),
+        timing,
         originTurn,
       },
     };

@@ -1,5 +1,6 @@
 import { Message, ContentBlock, ChatConfig, ChatResponse } from '../types';
 import type { ScopedDeviceGrant, ScopedDeviceSelection, ScopedLocalFileGrant } from '../types/session-identity';
+import type { TargetRoutes } from '../types/tool';
 import { AIService } from '../utils/ai-service';
 import { ToolCall, ToolDefinition, ToolExecutionContext, ToolExecutor, ToolResult, ToolTranscriptMode } from '../types/tool';
 import { StreamCallbacks } from '../providers/provider';
@@ -22,6 +23,7 @@ import {
   foldToolResultsTowardPromptBudget,
   resolveAdaptiveToolResultFoldingOptions,
 } from './adaptive-tool-result-folder';
+import { resolveToolResultArtifactStoreOptions } from './tool-result-artifact-store';
 import {
   buildExplicitPlanRequestHintIfUseful,
   buildInitialDecisionHintIfUseful,
@@ -41,6 +43,7 @@ import {
   TRANSIENT_RUNTIME_CONTEXT_PREFIX,
   buildRuntimeContextMessage,
 } from './runtime-context-builder';
+import { buildPendingUserInputBoundaryMessage } from './pending-user-input-boundary';
 import {
   TRANSIENT_CURRENT_DIRECTORY_PREFIX,
   buildTransientEnvironmentHint,
@@ -52,11 +55,18 @@ import { formatProviderErrorForLog } from '../utils/provider-error-log-sanitizer
 import { renderRequiredDefaultPromptFile } from '../utils/prompt-template';
 import { PromptTraceLogger } from '../utils/prompt-trace-logger';
 import {
+  restoreProviderReplayToolCalls,
+  stripAssistantArtifactsFromMessages,
+  stripAssistantTranscriptArtifacts,
+} from '../utils/transcript-artifacts';
+import { prependToolTargetContext } from '../tools/tool-target-context';
+import {
   buildSyntheticObservationLifecycleEvent,
   buildSyntheticObservationMessages,
   describeSyntheticObservationForLog,
   SyntheticObservation,
 } from './synthetic-observation';
+import { TRANSIENT_ACTIVE_PROMPT_MODE_PREFIX } from './prompt-mode-runtime';
 import * as fs from 'fs';
 import * as path from 'path';
 
@@ -83,8 +93,30 @@ const MIN_MESSAGE_BUDGET = 2000;
 const OVERFLOW_REDUCTION_RATIO = 0.6;
 const MAX_EMPTY_MAX_TOKEN_RECOVERIES = 1;
 const EMPTY_MAX_TOKENS_MESSAGE = '模型这轮输出达到了 max_tokens 上限，但没有生成可见回复或工具调用。已保留当前上下文；请回复“继续”，我会从刚才的位置继续推进。';
+const REPLAY_ARTIFACT_ONLY_MESSAGE = '模型工具调用回放异常，这轮没有生成可见回复。上下文已保留；你可以直接说“继续”，我会从这里接上。';
 export const PROMPT_BUDGET_TRIM_MESSAGE = '当前上下文超过模型窗口，已裁剪较早的历史内容以继续处理。';
 export const PROMPT_TOOLS_DISABLED_MESSAGE = '当前模型上下文不足以加载全部工具，本轮已先按纯文本继续处理。';
+const MAIN_AGENT_HIDDEN_TOOL_NAMES = new Set(['prompt_mode']);
+const MAX_VISIBLE_TOOL_PRELUDE_CHARS = 64;
+const MAX_VISIBLE_TOOL_PRELUDE_LINES = 2;
+
+const TOOL_PRELUDE_INTERNAL_PATTERNS = [
+  /\bmemory\b/i,
+  /\bobservation\b/i,
+  /\bsynthetic\b/i,
+  /\bdebug\b/i,
+  /\bdbg\b/i,
+  /\bFAIL\b/,
+  /\bfail(?:ed|ing|s)?\b/i,
+  /\bpass(?:ed|ing|es)?\b/i,
+  /\bactual=/i,
+  /\bexpected=/i,
+  /\b\d+\s*\/\s*\d+\b/,
+  /根因|原因|问题|诊断|bug|报错|错误|异常|失败|断言|调试|正则|期望|实际|可能是|应该|测试要求|代码块被切|硬切|贪心/,
+];
+
+const TOOL_PRELUDE_PROGRESS_PATTERN =
+  /^(?:先|我先|开始|准备|正在|继续|建|创建|写|生成|跑|执行|检查|验证|清理|上传|发送|重试|修复|已|完成|稍等|马上|接着)[^：:\n`]{0,48}(?:[。！？.!?]|$)/;
 
 /**
  * 对话运行回调
@@ -124,6 +156,7 @@ export interface PendingUserInput {
   content: string | ContentBlock[];
   deviceGrants?: ScopedDeviceGrant[];
   deviceSelection?: ScopedDeviceSelection;
+  targetRoutes?: TargetRoutes;
   localFileGrants?: ScopedLocalFileGrant[];
 }
 
@@ -143,6 +176,7 @@ function isPendingUserInput(value: string | ContentBlock[] | PendingUserInput): 
 }
 
 export type SyntheticObservationProvider = () => SyntheticObservation[];
+export type RuntimeTransientProvider = () => Message[];
 
 interface ToolExecutionRecord {
   toolCall: ToolCall;
@@ -169,6 +203,10 @@ export interface RunnerOptions {
   pendingUserInputProvider?: PendingUserInputProvider;
   /** Non-blocking runtime observations produced by sidecar branches. */
   syntheticObservationProvider?: SyntheticObservationProvider;
+  /** Non-durable runtime system context produced by sidecar branches. */
+  runtimeTransientProvider?: RuntimeTransientProvider;
+  /** Internal id that ties all messages created by one externally visible user turn together. */
+  episodeId?: string;
 }
 
 /**
@@ -189,6 +227,8 @@ export class ConversationRunner {
   private pendingUserInputProvider?: PendingUserInputProvider;
   private promptTraceLogger: PromptTraceLogger;
   private syntheticObservationProvider?: SyntheticObservationProvider;
+  private runtimeTransientProvider?: RuntimeTransientProvider;
+  private episodeId?: string;
 
   /** 截断字符串用于日志输出，避免日志过大 */
   private static truncateForLog(text: any, maxLen = 200): string {
@@ -212,6 +252,8 @@ export class ConversationRunner {
     this.toolExecutionContext = options?.toolExecutionContext;
     this.pendingUserInputProvider = options?.pendingUserInputProvider;
     this.syntheticObservationProvider = options?.syntheticObservationProvider;
+    this.runtimeTransientProvider = options?.runtimeTransientProvider;
+    this.episodeId = options?.episodeId;
     this.maxTurns = options?.maxTurns;
 
     this.maxPromptTokens = this.resolvePromptBudget(options?.maxContextTokens);
@@ -239,7 +281,8 @@ export class ConversationRunner {
   async run(messages: Message[], callbacks?: RunnerCallbacks): Promise<RunResult> {
     const allTools = this.toolExecutor.getToolDefinitions();
     const supportsToolCalling = (this.aiService as any).isToolCallingSupported?.() !== false;
-    const activeTools = supportsToolCalling ? allTools : [];
+    const providerTools = allTools.filter(tool => !MAIN_AGENT_HIDDEN_TOOL_NAMES.has(tool.name));
+    const activeTools = supportsToolCalling ? providerTools : [];
     if (activeTools.length === 0 && allTools.length > 0) {
       Logger.warning(`[${this.sessionLabel}] 当前模型/中转暂不启用工具调用，已按纯文本模型运行`);
     }
@@ -276,7 +319,9 @@ export class ConversationRunner {
         };
       }
       this.injectSyntheticObservations(messages, turns);
+      const runtimeTransientHints = this.drainRuntimeTransientMessages(turns);
       const requestTools = this.fitToolsToPromptBudget(activeTools);
+      const requestToolNames = new Set(requestTools.map(tool => tool.name));
       if (requestTools.length < activeTools.length && !notifiedToolBudgetDisabled) {
         notifiedToolBudgetDisabled = true;
         if (callbacks?.onThinking) {
@@ -339,6 +384,7 @@ export class ConversationRunner {
         ? buildPerTurnRunnerHint(requestTools)
         : null;
       let requestMessages = this.buildProviderInputMessages(messages, [
+        ...runtimeTransientHints,
         ...(perTurnRunnerHint ? [perTurnRunnerHint] : []),
         ...nextTurnTransientHints,
         ...orchestrationHints,
@@ -356,15 +402,18 @@ export class ConversationRunner {
         requestMessages,
         currentRunToolResultFoldingOptions,
       );
+      const toolResultArtifactStoreOptions = this.resolveToolResultArtifactStoreOptions(turns);
       const readFileFoldingOptions = {
         ...resolveReadFileMessageFoldingOptions(),
         foldCurrentRun: currentRunToolResultFoldingOptions.enabled,
         protectedCurrentRunToolResultIndexes,
+        artifactStore: toolResultArtifactStoreOptions,
       };
       const executeShellFoldingOptions = {
         ...resolveExecuteShellMessageFoldingOptions(),
         foldCurrentRun: currentRunToolResultFoldingOptions.enabled,
         protectedCurrentRunToolResultIndexes,
+        artifactStore: toolResultArtifactStoreOptions,
       };
       const readFileFolding = foldHistoricalReadFileMessages(
         requestMessages,
@@ -373,8 +422,8 @@ export class ConversationRunner {
       requestMessages = readFileFolding.messages;
       if (readFileFolding.stats.folded_count > 0) {
         Logger.info(
-          `[${this.sessionLabel}Turn ${turns}] read_file folding: `
-          + `folded=${readFileFolding.stats.folded_count}, `
+          `[${this.sessionLabel}Turn ${turns}] read_file truncation: `
+          + `truncated=${readFileFolding.stats.folded_count}, `
           + `current=${readFileFolding.stats.folded_current_turn_count}, `
           + `saved≈${readFileFolding.stats.saved_tokens_est} tokens`,
         );
@@ -386,8 +435,8 @@ export class ConversationRunner {
       requestMessages = executeShellFolding.messages;
       if (executeShellFolding.stats.folded_count > 0) {
         Logger.info(
-          `[${this.sessionLabel}Turn ${turns}] execute_shell folding: `
-          + `folded=${executeShellFolding.stats.folded_count}, `
+          `[${this.sessionLabel}Turn ${turns}] execute_shell truncation: `
+          + `truncated=${executeShellFolding.stats.folded_count}, `
           + `current=${executeShellFolding.stats.folded_current_turn_count}, `
           + `saved≈${executeShellFolding.stats.saved_tokens_est} tokens`,
         );
@@ -402,9 +451,9 @@ export class ConversationRunner {
       requestMessages = adaptiveFolding.messages;
       if (adaptiveFolding.stats.folded_count > 0) {
         Logger.info(
-          `[${this.sessionLabel}Turn ${turns}] adaptive tool_result folding: `
+          `[${this.sessionLabel}Turn ${turns}] adaptive tool_result truncation: `
           + `passes=${adaptiveFolding.stats.passes}, `
-          + `folded=${adaptiveFolding.stats.folded_count}, `
+          + `truncated=${adaptiveFolding.stats.folded_count}, `
           + `current=${adaptiveFolding.stats.folded_current_turn_count}, `
           + `saved≈${adaptiveFolding.stats.saved_tokens_est} tokens, `
           + `prompt≈${adaptiveFolding.stats.started_prompt_tokens_est}->${adaptiveFolding.stats.finished_prompt_tokens_est}, `
@@ -483,6 +532,36 @@ export class ConversationRunner {
         Logger.info(`[${this.sessionLabel}Turn ${turns}] AI返回 tokens: ${response.usage.promptTokens}+${response.usage.completionTokens}=${response.usage.totalTokens}`);
       }
 
+      if ((!response.toolCalls || response.toolCalls.length === 0) && response.content) {
+        const restored = restoreProviderReplayToolCalls(
+          response.content,
+          this.buildRestorableReplayToolNameSet(requestTools),
+        );
+        if (restored.toolCalls.length > 0) {
+          const restoredToolCalls = restored.toolCalls
+            .map(toolCall => ({
+              ...toolCall,
+              function: {
+                ...toolCall.function,
+                name: normalizeToolName(toolCall.function.name),
+              },
+            }))
+            .filter(toolCall => this.isRestoredReplayToolCallSafe(toolCall, currentDirectory));
+          if (restoredToolCalls.length > 0) {
+            Logger.warning(
+              `[${this.sessionLabel}Turn ${turns}] 已将模型内部 replay 摘要恢复为工具调用: `
+              + restoredToolCalls.map(toolCall => toolCall.function.name).join(', ')
+            );
+            response = {
+              ...response,
+              content: restored.visibleText || null,
+              toolCalls: restoredToolCalls,
+              providerContent: undefined,
+            };
+          }
+        }
+      }
+
       if (!response.toolCalls || response.toolCalls.length === 0) {
         if (this.isEmptyMaxTokensResponse(response)) {
           Logger.warning(`[${this.sessionLabel}Turn ${turns}] 模型输出达到 max_tokens 且没有可见内容或工具调用`);
@@ -495,10 +574,18 @@ export class ConversationRunner {
           response = { ...response, content: EMPTY_MAX_TOKENS_MESSAGE, toolCalls: [] };
         }
 
-        Logger.info(`[${this.sessionLabel}Turn ${turns}] AI最终回复: ${ConversationRunner.truncateForLog(response.content || '', 300)}`);
+        let visibleContent = stripAssistantTranscriptArtifacts(response.content || '');
+        if ((response.content || '') && visibleContent !== (response.content || '')) {
+          Logger.warning(`[${this.sessionLabel}Turn ${turns}] 已过滤模型返回的内部历史回放占位文本`);
+        }
+        if ((response.content || '') && !visibleContent) {
+          visibleContent = REPLAY_ARTIFACT_ONLY_MESSAGE;
+        }
 
-        if (response.content) {
-          const finalAssistantMessage: Message = { role: 'assistant', content: response.content };
+        Logger.info(`[${this.sessionLabel}Turn ${turns}] AI最终回复: ${ConversationRunner.truncateForLog(visibleContent, 300)}`);
+
+        if (visibleContent) {
+          const finalAssistantMessage: Message = { role: 'assistant', content: visibleContent };
           messages.push(finalAssistantMessage);
           newMessages.push(finalAssistantMessage);
         }
@@ -508,7 +595,7 @@ export class ConversationRunner {
         }
 
         if (this.isMessageSurface()) {
-          let finalText = response.content || '';
+          let finalText = visibleContent;
           finalText = finalText.replace(/^\[已发送信息\]\s*/, '');
           finalText = finalText.replace(/^\[已发送文件\]\s*/, '');
 
@@ -535,7 +622,7 @@ export class ConversationRunner {
           };
         }
 
-        let cleanedResponse = response.content || '';
+        let cleanedResponse = visibleContent;
         cleanedResponse = cleanedResponse.replace(/^\[已发送信息\]\s*/, '');
         cleanedResponse = cleanedResponse.replace(/^\[已发送文件\]\s*/, '');
 
@@ -548,11 +635,18 @@ export class ConversationRunner {
       }
 
       if (response.content) {
-        Logger.info(`[${this.sessionLabel}Turn ${turns}] AI文本: ${ConversationRunner.truncateForLog(response.content, 300)}`);
-        if (callbacks?.onAssistantText) {
-          await callbacks.onAssistantText(response.content);
-        } else if (callbacks?.onThinking) {
-          await callbacks.onThinking(response.content);
+        const visiblePrelude = stripAssistantTranscriptArtifacts(response.content);
+        if (visiblePrelude !== response.content) {
+          Logger.warning(`[${this.sessionLabel}Turn ${turns}] 已过滤工具前文本里的内部历史回放占位文本`);
+        }
+        Logger.info(`[${this.sessionLabel}Turn ${turns}] AI文本: ${ConversationRunner.truncateForLog(visiblePrelude, 300)}`);
+        const shouldSurfacePrelude = this.shouldSurfaceToolPrelude(visiblePrelude);
+        if (callbacks?.onAssistantText && shouldSurfacePrelude) {
+          await callbacks.onAssistantText(visiblePrelude);
+        } else if (!callbacks?.onAssistantText && callbacks?.onThinking && shouldSurfacePrelude) {
+          await callbacks.onThinking(visiblePrelude);
+        } else {
+          Logger.info(`[${this.sessionLabel}Turn ${turns}] 工具前文本已作为内部进度保留，未发送给用户`);
         }
       }
       const toolNames = response.toolCalls.map(tc => tc.function.name).join(', ');
@@ -560,7 +654,7 @@ export class ConversationRunner {
 
       const assistantMsg: Message = {
         role: 'assistant',
-        content: response.content,
+        content: stripAssistantTranscriptArtifacts(response.content || ''),
         tool_calls: response.toolCalls,
         providerContent: response.providerContent,
       };
@@ -576,16 +670,31 @@ export class ConversationRunner {
         const toolUseId = toolCall.id;
         const toolInput = JSON.parse(toolCall.function.arguments);
         const transcriptMode = this.getToolTranscriptMode(toolName, toolDefinitions);
-        callbacks?.onToolStart?.(toolName, toolUseId, toolInput);
-        Logger.info(`[${this.sessionLabel}Turn ${turns}] 执行工具: ${toolName} | 参数: ${ConversationRunner.truncateForLog(toolCall.function.arguments, 500)}`);
-        const activeToolNames = allTools.map(tool => tool.name);
+        const normalizedToolName = normalizeToolName(toolName);
+        const toolWasExposed = requestToolNames.has(normalizedToolName);
         const toolStart = Date.now();
-        const result = await this.executeToolWithRetry(
-          toolCall,
-          messages,
-          this.toolExecutionContext || {},
-          turns,
-        );
+        let result: ToolResult;
+        if (!toolWasExposed) {
+          Logger.warning(`[${this.sessionLabel}Turn ${turns}] 模型调用了当前未暴露的工具: ${toolName}`);
+          result = {
+            tool_call_id: toolUseId,
+            role: 'tool',
+            name: normalizedToolName,
+            content: `错误：工具 "${toolName}" 当前不可用。`,
+            ok: false,
+            errorCode: 'TOOL_NOT_FOUND',
+            retryable: false,
+          };
+        } else {
+          callbacks?.onToolStart?.(toolName, toolUseId, toolInput);
+          Logger.info(`[${this.sessionLabel}Turn ${turns}] 执行工具: ${toolName} | 参数: ${ConversationRunner.truncateForLog(toolCall.function.arguments, 500)}`);
+          result = await this.executeToolWithRetry(
+            toolCall,
+            messages,
+            this.toolExecutionContext || {},
+            turns,
+          );
+        }
         executedToolCalls++;
         if (toolName === PLAN_TOOL_NAME) {
           hasUpdatedPlan = true;
@@ -598,7 +707,9 @@ export class ConversationRunner {
         Metrics.recordToolCall(toolName, toolDuration);
         this.promptTraceLogger.recordToolResult(turns, toolCall, result, toolDuration);
         Logger.info(`[${this.sessionLabel}Turn ${turns}] 工具完成: ${toolName} | 耗时: ${toolDuration}ms | 结果: ${ConversationRunner.truncateForLog(result.content, 300)}`);
-        callbacks?.onToolEnd?.(toolName, toolUseId, contentToString(result.content));
+        if (toolWasExposed) {
+          callbacks?.onToolEnd?.(toolName, toolUseId, contentToString(result.content));
+        }
 
         if (
           (transcriptMode === 'outbound_message' || transcriptMode === 'outbound_file')
@@ -608,9 +719,11 @@ export class ConversationRunner {
           hasDeliveredMessageOutThisRun = true;
         }
 
-        const toolContent = result.content;
+        const toolContent = prependToolTargetContext(result.content, result.targetContext);
 
-        this.handleToolDisplay(toolCall, contentToString(toolContent), callbacks);
+        if (toolWasExposed) {
+          this.handleToolDisplay(toolCall, contentToString(result.content), callbacks);
+        }
         executionRecords.push({
           toolCall,
           toolName,
@@ -703,6 +816,13 @@ export class ConversationRunner {
       };
       shouldRefreshRuntimeContext = true;
     }
+    if (isPendingUserInput(pending) && pending.targetRoutes) {
+      this.toolExecutionContext = {
+        ...(this.toolExecutionContext || {}),
+        targetRoutes: pending.targetRoutes,
+      };
+      shouldRefreshRuntimeContext = true;
+    }
     if (isPendingUserInput(pending) && pending.localFileGrants?.length) {
       this.toolExecutionContext = {
         ...(this.toolExecutionContext || {}),
@@ -717,7 +837,15 @@ export class ConversationRunner {
       this.refreshRuntimeContextForPendingInput(messages);
     }
 
-    const userMessage: Message = { role: 'user', content };
+    messages.push(buildPendingUserInputBoundaryMessage());
+    const userMessage: Message = {
+      role: 'user',
+      content,
+      ...(this.episodeId ? {
+        __episodeId: this.episodeId,
+        __episodeInputKind: 'pending' as const,
+      } : {}),
+    };
     messages.push(userMessage);
     newMessages.push(userMessage);
 
@@ -744,6 +872,7 @@ export class ConversationRunner {
       localDeviceGrant: this.toolExecutionContext?.localDeviceGrant,
       deviceGrants: this.toolExecutionContext?.deviceGrants,
       deviceSelection: this.toolExecutionContext?.deviceSelection,
+      targetRoutes: this.toolExecutionContext?.targetRoutes,
       localFileGrants: this.toolExecutionContext?.localFileGrants,
     });
     if (!runtimeContext) return;
@@ -967,11 +1096,13 @@ export class ConversationRunner {
         return true;
       }
       return !message.content.startsWith(TRANSIENT_RUNNER_HINT_PREFIX)
+        && !message.content.startsWith(TRANSIENT_ACTIVE_PROMPT_MODE_PREFIX)
         && !message.content.startsWith(TRANSIENT_CURRENT_DIRECTORY_PREFIX);
     });
 
+    const repairedBase = this.repairToolExchangeMessages(stripAssistantArtifactsFromMessages(sanitizedBase));
     const collapsed: Message[] = [];
-    for (const message of sanitizedBase) {
+    for (const message of repairedBase) {
       const previous = collapsed[collapsed.length - 1];
       if (
         previous
@@ -999,6 +1130,71 @@ export class ConversationRunner {
         ...transientHints,
       ],
     );
+  }
+
+  private buildRestorableReplayToolNameSet(tools: ToolDefinition[]): Set<string> {
+    const allowed = new Set<string>();
+    for (const tool of tools) {
+      if (tool.transcriptMode !== 'outbound_file' || normalizeToolName(tool.name) !== 'send_file') {
+        continue;
+      }
+      allowed.add(tool.name);
+      allowed.add(normalizeToolName(tool.name));
+    }
+    for (const [alias, normalized] of Object.entries(TOOL_NAME_ALIASES)) {
+      if (allowed.has(normalized)) {
+        allowed.add(alias);
+      }
+    }
+    return allowed;
+  }
+
+  private isRestoredReplayToolCallSafe(toolCall: ToolCall, currentDirectory?: string): boolean {
+    const toolName = normalizeToolName(toolCall.function.name);
+    if (toolName !== 'send_file') {
+      return false;
+    }
+    return this.isRestoredSendFilePathInsideCurrentDirectory(
+      toolCall.function.arguments,
+      currentDirectory || this.toolExecutionContext?.workingDirectory,
+    );
+  }
+
+  private isRestoredSendFilePathInsideCurrentDirectory(argumentsJson: string, currentDirectory?: string): boolean {
+    if (!currentDirectory) return false;
+    let args: unknown;
+    try {
+      args = JSON.parse(argumentsJson);
+    } catch {
+      return false;
+    }
+    if (!args || typeof args !== 'object' || Array.isArray(args)) return false;
+    const filePath = (args as Record<string, unknown>).file_path;
+    if (typeof filePath !== 'string' || !filePath.trim()) return false;
+
+    if (this.isWindowsPathLike(currentDirectory) || this.isWindowsPathLike(filePath)) {
+      if (!this.isWindowsPathLike(currentDirectory)) {
+        return false;
+      }
+      const base = path.win32.resolve(currentDirectory);
+      const resolved = path.win32.resolve(base, filePath);
+      return this.isPathInside(base, resolved, path.win32.sep, true);
+    }
+
+    const base = path.resolve(currentDirectory);
+    const resolved = path.resolve(base, filePath);
+    return this.isPathInside(base, resolved, path.sep, process.platform === 'win32');
+  }
+
+  private isWindowsPathLike(value: string): boolean {
+    return /^[a-zA-Z]:[\\/]/.test(value) || /^[\\/]{2}[^\\/]/.test(value);
+  }
+
+  private isPathInside(base: string, resolved: string, separator: string, caseInsensitive: boolean): boolean {
+    const normalizedBase = caseInsensitive ? base.toLowerCase() : base;
+    const normalizedResolved = caseInsensitive ? resolved.toLowerCase() : resolved;
+    return normalizedResolved === normalizedBase
+      || normalizedResolved.startsWith(normalizedBase + separator);
   }
 
   private insertProviderTransientHints(messages: Message[], hints: Message[]): Message[] {
@@ -1049,6 +1245,16 @@ export class ConversationRunner {
       && message.content.startsWith(TRANSIENT_RUNNER_HINT_PREFIX);
   }
 
+  private drainRuntimeTransientMessages(turn: number): Message[] {
+    if (!this.runtimeTransientProvider) return [];
+    try {
+      return this.runtimeTransientProvider();
+    } catch (error: any) {
+      Logger.warning(`[${this.sessionLabel}Turn ${turn}] runtime transient drain failed: ${error.message}`);
+      return [];
+    }
+  }
+
   private isCurrentDirectoryHint(message: Message): boolean {
     return typeof message.content === 'string'
       && message.content.startsWith(TRANSIENT_CURRENT_DIRECTORY_PREFIX);
@@ -1063,7 +1269,6 @@ export class ConversationRunner {
     const modelConfig = (this.aiService as any).getConfig?.();
     return buildTransientEnvironmentHint({
       currentDirectory,
-      surface: this.toolExecutionContext?.surface,
       provider: modelConfig?.provider,
       model: modelConfig?.model,
     });
@@ -1145,6 +1350,21 @@ export class ConversationRunner {
     }
 
     return null;
+  }
+
+  private shouldSurfaceToolPrelude(content: string): boolean {
+    const text = content.trim();
+    if (!text) return false;
+    if (text.length > MAX_VISIBLE_TOOL_PRELUDE_CHARS) return false;
+
+    const lines = text.split(/\r?\n/).map(line => line.trim()).filter(Boolean);
+    if (lines.length > MAX_VISIBLE_TOOL_PRELUDE_LINES) return false;
+    if (lines.some(line => line.length > MAX_VISIBLE_TOOL_PRELUDE_CHARS)) return false;
+    if (text.includes('```')) return false;
+    if (/^\s*#{1,6}\s/m.test(text) || /^\s*\|.+\|\s*$/m.test(text)) return false;
+    if (TOOL_PRELUDE_INTERNAL_PATTERNS.some(pattern => pattern.test(text))) return false;
+
+    return TOOL_PRELUDE_PROGRESS_PATTERN.test(text);
   }
 
   private buildDuplicateOutboundHint(content: string): Message {
@@ -1335,6 +1555,21 @@ export class ConversationRunner {
       ...options,
       targetPromptTokens: Math.min(options.targetPromptTokens, promptBudget),
     };
+  }
+
+  private resolveToolResultArtifactStoreOptions(turn: number) {
+    const workspaceRoot = this.toolExecutionContext?.workspaceRoot
+      || this.toolExecutionContext?.workingDirectory;
+    const defaultRoot = workspaceRoot
+      ? path.join(workspaceRoot, '.xiaoba', 'tool-results')
+      : undefined;
+    return resolveToolResultArtifactStoreOptions(process.env, {
+      enabled: Boolean(defaultRoot),
+      rootDirectory: defaultRoot,
+      sessionId: this.toolExecutionContext?.sessionId
+        || this.toolExecutionContext?.executionScope?.sessionKey,
+      turn,
+    });
   }
 
   private fitToolsToPromptBudget(tools: ToolDefinition[]): ToolDefinition[] {

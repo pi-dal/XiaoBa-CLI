@@ -42,7 +42,7 @@ describe('prompt modes', () => {
     }
   });
 
-  test('injects prompt mode list as injected transient context, not a guessed mode', async () => {
+  test('does not inject selectable prompt modes into the main agent context', async () => {
     const builder = new TurnContextBuilder();
     const durableMessages: Message[] = [
       { role: 'system', content: 'base system' },
@@ -59,25 +59,26 @@ describe('prompt modes', () => {
       } as any,
     });
 
-    const modeList = result.messages.find(message => (
-      message.role === 'user'
-      && message.__injected
-      && typeof message.content === 'string'
-      && message.content.startsWith(TRANSIENT_PROMPT_MODES_LIST_PREFIX)
-    ));
-
-    assert.ok(modeList);
-    assert.match(String(modeList.content), /Available prompt modes/);
-    assert.match(String(modeList.content), /coding-agent: 工程协作模式/);
-    assert.match(String(modeList.content), /call the prompt_mode tool/);
-    assert.doesNotMatch(String(modeList.content), /Matched aliases:/);
-    assert.doesNotMatch(String(modeList.content), /Candidate mode:/);
-
-    const durable = builder.removeTransientMessages(result.messages);
-    assert.equal(durable.some(message => (
+    assert.equal(result.messages.some(message => (
       typeof message.content === 'string'
       && message.content.startsWith(TRANSIENT_PROMPT_MODES_LIST_PREFIX)
     )), false);
+  });
+
+  test('loads built-in plain-chat mode definition and prompt', () => {
+    clearPromptModeRegistryCache();
+
+    const definitions = listPromptModeDefinitions();
+    const plainChat = definitions.find(mode => mode.id === 'plain-chat');
+
+    assert.ok(plainChat);
+    assert.equal(plainChat.title, '普通对话模式');
+    assert.match(plainChat.description, /角色扮演/);
+
+    const prompt = loadPromptModePrompt(path.join(process.cwd(), 'prompts'), 'plain-chat') || '';
+    assert.match(prompt, /\[mode:plain-chat\]/);
+    assert.match(prompt, /普通对话模式/);
+    assert.match(prompt, /不反复强调“我是 AI”/);
   });
 
   test('injects previously active prompt mode as facts, not an automatic decision', async () => {
@@ -127,11 +128,7 @@ describe('prompt modes', () => {
       && message.content.startsWith(TRANSIENT_PROMPT_MODES_LIST_PREFIX)
     ));
 
-    assert.ok(modeList);
-    assert.match(String(modeList.content), /Previously active prompt mode: coding-agent/);
-    assert.match(String(modeList.content), /last loaded 1 user turn ago/);
-    assert.match(String(modeList.content), /Use the previous mode only if/);
-    assert.match(String(modeList.content), /If the user changed task, ignore it/);
+    assert.equal(modeList, undefined);
   });
 
   test('fixed prompt mode suppresses selectable mode list', async () => {
@@ -165,6 +162,57 @@ describe('prompt modes', () => {
     assert.match(String(fixedMessage.content), /Fixed prompt mode active: coding-agent/);
     assert.match(String(fixedMessage.content), /already part of the system prompt/);
     assert.equal(result.messages.some(message => (
+      message.role === 'user'
+      && message.__injected
+      && typeof message.content === 'string'
+      && message.content.startsWith(TRANSIENT_PROMPT_MODES_LIST_PREFIX)
+    )), false);
+  });
+
+  test('prompt mode routing suppresses selectable mode list but keeps fixed mode status', async () => {
+    const builder = new TurnContextBuilder();
+    const routed = await builder.build({
+      sessionKey: 'cli',
+      durableMessages: [
+        { role: 'system', content: 'base system' },
+        { role: 'user', content: 'debug this build' },
+      ],
+      runtimeFeedback: [],
+      skillRuntime: {
+        reloadSkills: async () => {},
+        buildSkillsListMessage: () => undefined,
+      } as any,
+      promptModeRoutingEnabled: true,
+    });
+
+    assert.equal(routed.messages.some(message => (
+      message.role === 'user'
+      && message.__injected
+      && typeof message.content === 'string'
+      && message.content.startsWith(TRANSIENT_PROMPT_MODES_LIST_PREFIX)
+    )), false);
+
+    const fixed = await builder.build({
+      sessionKey: 'cli',
+      durableMessages: [
+        { role: 'system', content: 'base system\n[mode:coding-agent]\nfixed coding instructions' },
+        { role: 'user', content: 'debug this build' },
+      ],
+      runtimeFeedback: [],
+      skillRuntime: {
+        reloadSkills: async () => {},
+        buildSkillsListMessage: () => undefined,
+      } as any,
+      promptModeRoutingEnabled: true,
+    });
+
+    assert.equal(fixed.messages.some(message => (
+      message.role === 'user'
+      && message.__injected
+      && typeof message.content === 'string'
+      && message.content.startsWith(TRANSIENT_FIXED_PROMPT_MODE_PREFIX)
+    )), true);
+    assert.equal(fixed.messages.some(message => (
       message.role === 'user'
       && message.__injected
       && typeof message.content === 'string'

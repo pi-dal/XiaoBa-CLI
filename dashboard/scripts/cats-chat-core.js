@@ -216,6 +216,71 @@ function buildCatsChatStage(){
   };
 }
 
+function catsAutoStartReason(stage){
+  if(!isCatsLoggedIn())return '';
+  const service=catsState.service||{};
+  const bodyStatus=catsState.bodyStatus||{};
+  if(bodyStatus.state==='conflict'||bodyStatus.state==='auth_error')return '';
+  if(!catsState.bodyConfigured || !catsState.botUid || !catsState.configured)return 'binding';
+  if(service.status!=='running')return 'connector';
+  if(stage?.key==='needs-topic' || !catsState.topicId)return 'topic';
+  return '';
+}
+
+function catsAutoStartReadinessSafe(reason){
+  if(!reason || !appReadinessLoaded)return false;
+  const modelSection=getReadinessSection('model');
+  if(modelSection?.status==='blocked')return false;
+  const catscoSection=getReadinessSection('catsco');
+  const allowedCatscoBlockers=new Set(['catsco.binding','catsco.topic','catsco.connector']);
+  return !(catscoSection?.checks||[]).some(check=>
+    check.status==='fail' &&
+    check.severity==='blocker' &&
+    !allowedCatscoBlockers.has(check.id)
+  );
+}
+
+function catsAutoStartKey(reason, stage){
+  const userUid=String(catsState.user?.uid||'').trim();
+  const botUid=String(catsState.botUid||catsState.bot?.uid||'auto').trim()||'auto';
+  const serviceStatus=String(catsState.service?.status||'missing');
+  return [
+    userUid,
+    botUid,
+    reason,
+    stage?.key||'',
+    serviceStatus,
+    activeStartupSource(),
+    relayModelIdForSetup()||'',
+  ].join('|');
+}
+
+function maybeAutoStartCats(stage){
+  if(getDashboardActivePage()!=='chat')return;
+  if(catsAutoStartInFlight || relayActionBusy() || catsStatusMutationInFlight)return;
+  const reason=catsAutoStartReason(stage);
+  if(!catsAutoStartReadinessSafe(reason))return;
+  const key=catsAutoStartKey(reason, stage);
+  const now=Date.now();
+  if(key && catsAutoStartAttemptKey===key && now-catsAutoStartAttemptAt<60000)return;
+  catsAutoStartAttemptKey=key;
+  catsAutoStartAttemptAt=now;
+  setCatsAutoStartBusy(true);
+  const message=reason==='binding'
+    ? '正在自动选择机器人并启动 CatsCompany connector...'
+    : '正在自动启动 CatsCompany connector...';
+  setCatsAction(message);
+  setTimeout(async()=>{
+    try{
+      await setupCatsBot({forceLegacySetup:true, automatic:true});
+    }catch(e){
+      setCatsAction('自动启动失败：'+formatDashboardApiError(e,'/api/cats/setup'), true);
+    }finally{
+      setCatsAutoStartBusy(false);
+    }
+  },0);
+}
+
 function renderCatsChecklist(stage){
   const service=catsState.service||{};
   const user=catsState.user||{};
@@ -436,6 +501,7 @@ function renderCatsStatus(){
   renderCatsChecklist(stage);
   updateCatsChatGate(stage);
   updateCatsLayoutState(stage);
+  maybeAutoStartCats(stage);
 }
 
 function renderBotSelectorListState(payload) {
@@ -658,6 +724,7 @@ async function setupCatsBot(options={}){
   setCatsStatusMutationBusy(true);
   invalidateCatsStatusRequests();
   let retrying=false;
+  const automatic=options.automatic===true;
   if(!(dashboardSettingsSnapshot.fields||[]).length){
     await fetchDashboardSettings();
   }
@@ -689,6 +756,10 @@ async function setupCatsBot(options={}){
     }
   }catch(e){
     if(e.status===409 && e.action==='rotate_required'){
+      if(automatic){
+        setCatsAction('自动启动需要重新生成 CatsCo 中转 Key。请点击“检查并启动”确认后继续。', true);
+        return;
+      }
       const ok=confirm('你的 CatsCo 中转 Key 已存在，但当前无法读取明文。要重新生成并写入 CatsCo 桌面端吗？旧 Key 会立即失效。');
       if(ok){
         retrying=true;

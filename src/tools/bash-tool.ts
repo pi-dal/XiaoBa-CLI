@@ -8,8 +8,7 @@ import { Tool, ToolDefinition, ToolExecutionContext, ToolExecutionResult } from 
 import { Logger } from '../utils/logger';
 import { resolveRuntimeEnvironment } from '../utils/runtime-environment';
 import { isToolAllowed, isBashCommandAllowed } from '../utils/safety';
-import { resolveToolGatewayAccess } from './tool-gateway';
-import { executeRemoteDeviceRpcTool } from './device-rpc-tool';
+import { executeRouteIfRemote, resolveExecutionRoute, targetParameterDescription } from './execution-router';
 
 const execAsync = promisify(exec);
 const CWD_MARKER_PREFIX = '__XIAOBA_CWD_MARKER__';
@@ -32,7 +31,7 @@ export class ShellTool implements Tool {
     name: 'execute_shell',
     description: [
       '执行一条非交互式系统命令。',
-      '命令从当前目录启动；每次调用都是新的 shell 进程，只有最终当前目录会保留到后续工具调用。',
+      '命令从当前目录或显式 cwd 启动；每次调用都是新的 shell 进程，只有最终当前目录会保留到后续工具调用。',
       '环境变量、alias、函数和已激活虚拟环境不会自动跨调用保留；需要时在同一条 command 中显式设置。',
       '在 CatsCo/远程用户设备场景中，不要用它做普通文件查看或创建；查看文件列表用 glob，创建/覆盖文本文件用 write_file，编辑文件用 edit_file。',
     ].join('\n'),
@@ -51,22 +50,38 @@ export class ShellTool implements Tool {
           type: 'number',
           description: '超时时间，单位毫秒。默认 30000。',
         },
+        cwd: {
+          type: 'string',
+          description: '可选。命令启动目录。支持绝对路径或相对当前目录的路径；需要在桌面/下载等目录运行命令时，先用 resolve_common_directory 解析，再把返回的 path 传给 cwd。',
+        },
         confirm_dangerous: {
           type: 'boolean',
           description: 'Set true only after the user explicitly requested or confirmed a risky destructive command such as recursive deletion, git reset --hard, git clean, or force push.',
           default: false,
         },
+        target: targetParameterDescription(),
       },
       required: ['command'],
     },
   };
 
   async execute(args: any, context: ToolExecutionContext): Promise<ToolExecutionResult> {
-    const { command, description, timeout = 30000, confirm_dangerous = false } = args;
+    const { command, description, timeout = 30000, confirm_dangerous = false, cwd } = args;
 
     if (context.abortSignal?.aborted) {
       return { ok: false, errorCode: 'EXECUTION_TIMEOUT', message: `命令已取消，未开始执行:\n$ ${command}` };
     }
+
+    const route = resolveExecutionRoute(context, {
+      toolName: this.definition.name,
+      operation: 'execute_shell',
+      target: args.target,
+    });
+    if (!route.ok) {
+      return { ok: false, errorCode: route.errorCode, message: route.message };
+    }
+    const remoteResult = await executeRouteIfRemote(context, route, 'execute_shell', 'execute_shell', args);
+    if (remoteResult) return remoteResult;
 
     const toolPermission = isToolAllowed(this.definition.name);
     if (!toolPermission.allowed) {
@@ -74,27 +89,23 @@ export class ShellTool implements Tool {
     }
 
     const commandPermission = isBashCommandAllowed(command, {
-      confirmed: confirm_dangerous === true,
+      confirmed: context.deviceRpcReceiver || confirm_dangerous === true,
+      env: context.deviceRpcReceiver
+        ? { ...process.env, GAUZ_BASH_ALLOW_DANGEROUS: 'true' }
+        : process.env,
     });
     if (!commandPermission.allowed) {
       return { ok: false, errorCode: 'PERMISSION_DENIED', message: `Execution blocked: ${commandPermission.reason}` };
     }
 
-    const gateway = resolveToolGatewayAccess(context, {
-      toolName: this.definition.name,
-      operation: 'execute_shell',
-    });
-    if (!gateway.ok) {
-      return { ok: false, errorCode: gateway.errorCode, message: gateway.message };
-    }
-    const remoteResult = await executeRemoteDeviceRpcTool(context, gateway, 'execute_shell', 'execute_shell', args);
-    if (remoteResult) return remoteResult;
-
     if (description) {
       Logger.info(`Executing command: ${description}`);
     }
+    const executionDirectory = this.resolveExecutionDirectory(cwd, context);
+    if (!executionDirectory.ok) return executionDirectory;
+
     Logger.info(`$ ${command}`);
-    Logger.info(`Current directory: ${context.workingDirectory}`);
+    Logger.info(`Current directory: ${executionDirectory.directory}`);
 
     const startTime = Date.now();
     const runtimeEnvironment = resolveRuntimeEnvironment({
@@ -106,7 +117,7 @@ export class ShellTool implements Tool {
     try {
       const { stdout, stderr } = await this.executeWrappedCommand(
         wrapped,
-        context.workingDirectory,
+        executionDirectory.directory,
         runtimeEnvironment.env,
         timeout,
         context.abortSignal,
@@ -114,8 +125,9 @@ export class ShellTool implements Tool {
 
       const parsedStdout = this.extractDirectoryProbe(stdout || '', wrapped.marker);
       const parsedStderr = this.extractDirectoryProbe(stderr || '', wrapped.marker);
+      const finalDirectory = this.readDirectoryProbe(wrapped) || parsedStdout.directory || parsedStderr.directory;
       this.updateCurrentDirectory(
-        this.readDirectoryProbe(wrapped) || parsedStdout.directory || parsedStderr.directory,
+        finalDirectory,
         context,
       );
 
@@ -143,14 +155,26 @@ export class ShellTool implements Tool {
 
       return {
         ok: true,
-        content: `Command succeeded:\n$ ${command}\n\nElapsed: ${executionTime}ms\nOutput lines: ${outputLines}\n\n${output}`,
+        content: [
+          'Command succeeded:',
+          `$ ${command}`,
+          '',
+          `Working directory: ${executionDirectory.directory}`,
+          finalDirectory ? `Final cwd: ${finalDirectory}` : '',
+          `Shell: ${this.resolveShellDisplayName()}`,
+          `Elapsed: ${executionTime}ms`,
+          `Output lines: ${outputLines}`,
+          '',
+          output,
+        ].filter(line => line !== '').join('\n'),
       };
     } catch (error: any) {
       const executionTime = Date.now() - startTime;
       const parsedStdout = this.extractDirectoryProbe(error.stdout || '', wrapped.marker);
       const parsedStderr = this.extractDirectoryProbe(error.stderr || '', wrapped.marker);
+      const finalDirectory = this.readDirectoryProbe(wrapped) || parsedStdout.directory || parsedStderr.directory;
       this.updateCurrentDirectory(
-        this.readDirectoryProbe(wrapped) || parsedStdout.directory || parsedStderr.directory,
+        finalDirectory,
         context,
       );
       if (context.abortSignal?.aborted || /aborted|abort/i.test(String(error.message || ''))) {
@@ -158,7 +182,15 @@ export class ShellTool implements Tool {
         return {
           ok: false,
           errorCode: 'EXECUTION_TIMEOUT',
-          message: `命令已取消:\n$ ${command}\n\n执行时间: ${executionTime}ms`,
+          message: [
+            '命令已取消:',
+            `$ ${command}`,
+            '',
+            `Working directory: ${executionDirectory.directory}`,
+            finalDirectory ? `Final cwd: ${finalDirectory}` : '',
+            `Shell: ${this.resolveShellDisplayName()}`,
+            `执行时间: ${executionTime}ms`,
+          ].filter(line => line !== '').join('\n'),
         };
       }
       const errorOutput = [
@@ -173,7 +205,17 @@ export class ShellTool implements Tool {
       return {
         ok: false,
         errorCode: 'TOOL_EXECUTION_ERROR',
-        message: `Command failed:\n$ ${command}\n\nElapsed: ${executionTime}ms\nError:\n${errorOutput}`,
+        message: [
+          'Command failed:',
+          `$ ${command}`,
+          '',
+          `Working directory: ${executionDirectory.directory}`,
+          finalDirectory ? `Final cwd: ${finalDirectory}` : '',
+          `Shell: ${this.resolveShellDisplayName()}`,
+          `Elapsed: ${executionTime}ms`,
+          'Error:',
+          errorOutput,
+        ].filter(line => line !== '').join('\n'),
       };
     } finally {
       this.cleanupWrappedCommand(wrapped);
@@ -552,6 +594,52 @@ export class ShellTool implements Tool {
       .filter(line => !line.startsWith(CWD_MARKER_PREFIX))
       .join('\n')
       .replace(/\n+$/, '');
+  }
+
+  private resolveExecutionDirectory(
+    cwd: unknown,
+    context: ToolExecutionContext,
+  ): { ok: true; directory: string } | { ok: false; errorCode: 'INVALID_TOOL_ARGUMENTS'; message: string } {
+    if (cwd === undefined || cwd === null || cwd === '') {
+      return { ok: true, directory: context.workingDirectory };
+    }
+    if (typeof cwd !== 'string') {
+      return {
+        ok: false,
+        errorCode: 'INVALID_TOOL_ARGUMENTS',
+        message: 'execute_shell.cwd 必须是字符串路径。',
+      };
+    }
+    const directory = path.isAbsolute(cwd)
+      ? path.resolve(cwd)
+      : path.resolve(context.workingDirectory, cwd);
+    try {
+      if (!fs.existsSync(directory)) {
+        return {
+          ok: false,
+          errorCode: 'INVALID_TOOL_ARGUMENTS',
+          message: `execute_shell.cwd 不存在: ${directory}`,
+        };
+      }
+      if (!fs.statSync(directory).isDirectory()) {
+        return {
+          ok: false,
+          errorCode: 'INVALID_TOOL_ARGUMENTS',
+          message: `execute_shell.cwd 不是目录: ${directory}`,
+        };
+      }
+    } catch (error: any) {
+      return {
+        ok: false,
+        errorCode: 'INVALID_TOOL_ARGUMENTS',
+        message: `execute_shell.cwd 无法访问: ${error?.message || error}`,
+      };
+    }
+    return { ok: true, directory };
+  }
+
+  private resolveShellDisplayName(): string {
+    return process.platform === 'win32' ? 'powershell' : 'sh';
   }
 
   private formatExecutionError(error: any): string {

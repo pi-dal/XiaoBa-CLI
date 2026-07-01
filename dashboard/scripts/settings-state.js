@@ -14,6 +14,9 @@ let relayModelConfigLoading=false;
 let relayModelConfigRequestSeq=0;
 let relayModelApplyInFlight=false;
 let catsSetupInFlight=false;
+let catsAutoStartInFlight=false;
+let catsAutoStartAttemptKey='';
+let catsAutoStartAttemptAt=0;
 const CUSTOM_MODEL_AUTO_SAVE_DELAY=900;
 const RELAY_FALLBACK_MODELS=[
   {id:'minimax-m2.7',label:'MiniMax M2.7',model:'MiniMax-M2.7',provider:'anthropic',base_url:'https://relay.catsco.cc/anthropic',quota_class:'standard',context_window_tokens:204800,context_label:'204.8K',default:true},

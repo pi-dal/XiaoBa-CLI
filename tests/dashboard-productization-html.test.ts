@@ -182,11 +182,24 @@ test('CatsCo Chat readiness, setup, and composer are split between React UI and 
   assert.match(scriptFiles.basePet, /let catsStatusGeneration = 0/);
   assert.match(scriptFiles.basePet, /let catsStatusMutationInFlight = false/);
   assert.match(scriptFiles.settingsState, /let catsSetupInFlight=false/);
+  assert.match(scriptFiles.settingsState, /let catsAutoStartInFlight=false/);
+  assert.match(scriptFiles.settingsState, /let catsAutoStartAttemptKey=''/);
   assert.match(scriptFiles.settingsState, /let relayModelConfigRequestSeq=0/);
   assert.match(scriptFiles.catsChat, /function invalidateCatsStatusRequests\(\)/);
   assert.match(scriptFiles.modelSettings, /function invalidateRelayModelConfigRequests\(\)/);
+  assert.match(scriptFiles.modelSettings, /return relayModelApplyInFlight \|\| catsSetupInFlight \|\| catsAutoStartInFlight/);
+  assert.match(scriptFiles.modelSettings, /function setCatsAutoStartBusy\(busy\)/);
+  assert.match(scriptFiles.catsChat, /function maybeAutoStartCats\(stage\)/);
+  assert.match(scriptFiles.catsChat, /function catsAutoStartReason\(stage\)/);
+  assert.match(scriptFiles.catsChat, /function catsAutoStartReadinessSafe\(reason\)/);
+  assert.match(scriptFiles.catsChat, /setupCatsBot\(\{forceLegacySetup:true, automatic:true\}\)/);
+  assert.match(scriptFiles.catsChat, /maybeAutoStartCats\(stage\)/);
   assert.match(scriptFiles.catsChat, /async function setupCatsBot\(options=\{\}\)/);
   assert.match(scriptFiles.catsChat, /async function bindCatsBot\(botUid, botName, button, options\)/);
+
+  const setupBlock = scriptFiles.catsChat.match(/async function setupCatsBot\(options=\{\}\)\{[\s\S]*?async function resetCatsAuth/)?.[0] || '';
+  assert.match(setupBlock, /const automatic=options\.automatic===true/);
+  assert.match(setupBlock, /if\(automatic\)\{\s*setCatsAction\(/);
 });
 
 test('CatsCo Chat messages preserve history, runtime plans, tool metadata, and attachments', () => {
