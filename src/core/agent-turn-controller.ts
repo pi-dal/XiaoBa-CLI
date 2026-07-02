@@ -579,12 +579,10 @@ export class AgentTurnController {
     branchAgentsEnabled: boolean,
     fixedMode?: FixedPromptModeState,
   ): boolean {
-    if (fixedMode) return false;
-    if (!branchAgentsEnabled) return false;
-    if (process.env.XIAOBA_PROMPT_MODE_ROUTER_ENABLED !== 'true') return false;
-    if (!(this.options.services.aiService instanceof AIService)) return false;
-    if (listPromptModeDefinitions().length === 0) return false;
-    return true;
+    void branchAgentsEnabled;
+    void fixedMode;
+    // Keep the prompt-mode router sidecar disabled while restoring the #154 branch lifecycle.
+    return false;
   }
 
   private withMemoryBranchObservationMetadata(
