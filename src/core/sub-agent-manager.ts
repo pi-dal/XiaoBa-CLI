@@ -39,6 +39,8 @@ export interface SpawnSubAgentRequest {
   agentType?: SubAgentType;
   toolScope?: SubAgentToolScope;
   subAgentPrompt?: string;
+  allowParentQuestions?: boolean;
+  delegatedToolContext?: SubAgentSpawnOptions['delegatedToolContext'];
   allowedTools?: readonly string[];
   maxTurns?: number;
   taskDescription: string;
@@ -130,9 +132,12 @@ export class SubAgentManager {
     skillManager: SkillManager,
   ): Promise<SubAgentInfo | { error: string }> {
     const skillName = request.skillName?.trim();
-    const agentType = request.agentType || (skillName ? 'skill' : 'worker');
+    const requestedAgentType = request.agentType;
+    const displayAgentType = requestedAgentType || (skillName ? 'skill' : 'worker');
     const toolScope = request.toolScope;
     const subAgentPrompt = request.subAgentPrompt?.trim();
+    const allowParentQuestions = request.allowParentQuestions;
+    const delegatedToolContext = request.delegatedToolContext;
     const allowedTools = request.allowedTools;
     const maxTurns = request.maxTurns;
     const taskDescription = request.taskDescription.trim();
@@ -156,10 +161,12 @@ export class SubAgentManager {
 
     const options: SubAgentSpawnOptions = {
       displayName,
-      agentType,
+      agentType: requestedAgentType,
       toolScope,
       skillName,
       subAgentPrompt,
+      allowParentQuestions,
+      delegatedToolContext,
       allowedTools,
       maxTurns,
       taskDescription,
@@ -178,8 +185,8 @@ export class SubAgentManager {
     const session = new SubAgentSession(id, aiService, skillManager, options);
     this.subAgents.set(id, session);
     this.parentMap.set(id, parentSessionKey);
-    const spawnedEvent = this.recordEvent(parentSessionKey, id, 'agent_spawned', `派遣 ${displayName} (${agentType}) 执行：${taskDescription}`, {
-      agentType,
+    const spawnedEvent = this.recordEvent(parentSessionKey, id, 'agent_spawned', `派遣 ${displayName} (${session.agentType}) 执行：${taskDescription}`, {
+      agentType: session.agentType,
       skillName,
       toolScope: session.toolScope,
       allowedTools: session.allowedTools,
@@ -200,7 +207,7 @@ export class SubAgentManager {
         void this.finalizeSession(parentSessionKey, id, session, platform, taskDescription);
       });
 
-    Logger.info(`[SubAgentManager] 派遣 ${id} 执行 "${skillName || agentType}" (父会话: ${parentSessionKey})`);
+    Logger.info(`[SubAgentManager] 派遣 ${id} 执行 "${skillName || displayAgentType}" (父会话: ${parentSessionKey})`);
     return this.decorateInfo(parentSessionKey, session.getInfo());
   }
 

@@ -446,9 +446,62 @@ describe('subagent runtime events', () => {
     }
   });
 
-  test('CatsCo device-scoped spawn_subagent defaults to ask_parent only', async () => {
+  test('spawn_subagent accepts a unified prompt without agent_type', async () => {
+    const originalGetInstance = SubAgentManager.getInstance;
+    let capturedRequest: any;
+
+    (SubAgentManager as any).getInstance = () => ({
+      spawn(
+        _parentSessionKey: string,
+        request: any,
+      ) {
+        capturedRequest = request;
+        return {
+          id: 'sub-unified',
+          agentType: 'worker',
+          skillName: 'worker',
+          toolScope: 'test_only',
+          allowedTools: request.allowedTools,
+          taskDescription: request.taskDescription,
+          status: 'running',
+          createdAt: Date.now(),
+          progressLog: [],
+          outputFiles: [],
+        };
+      },
+    });
+
+    try {
+      const result = await new SpawnSubagentTool().execute({
+        allowed_tools: ['grep', 'execute_shell'],
+        max_turns: 4,
+        subagent_prompt: '只检查测试失败原因，不修改文件。',
+        task: '检查测试失败',
+        context: '运行指定测试并总结失败原因。',
+      }, {
+        workingDirectory: process.cwd(),
+        conversationHistory: [],
+        sessionId: 'cc_user:test',
+        runtimeServices: {
+          aiService: {} as any,
+          skillManager: {} as any,
+        },
+      });
+
+      assert.equal(result.ok, true);
+      assert.equal(capturedRequest.agentType, undefined);
+      assert.equal(capturedRequest.allowParentQuestions, false);
+      assert.deepEqual(capturedRequest.allowedTools, ['grep', 'execute_shell']);
+      assert.equal(capturedRequest.subAgentPrompt, '只检查测试失败原因，不修改文件。');
+    } finally {
+      (SubAgentManager as any).getInstance = originalGetInstance;
+    }
+  });
+
+  test('CatsCo device-scoped spawn_subagent does not add a channel-specific tool whitelist', async () => {
     const originalGetInstance = SubAgentManager.getInstance;
     let capturedAllowedTools: unknown;
+    let capturedDelegatedContext: any;
 
     (SubAgentManager as any).getInstance = () => ({
       spawn(
@@ -456,6 +509,7 @@ describe('subagent runtime events', () => {
         request: any,
       ) {
         capturedAllowedTools = request.allowedTools;
+        capturedDelegatedContext = request.delegatedToolContext;
         return {
           id: 'sub-catsco-isolated',
           agentType: request.agentType,
@@ -505,51 +559,151 @@ describe('subagent runtime events', () => {
       });
 
       assert.equal(result.ok, true);
-      assert.deepEqual(capturedAllowedTools, ['ask_parent']);
+      assert.equal(capturedAllowedTools, undefined);
+      assert.equal(capturedDelegatedContext.surface, 'catscompany');
+      assert.equal(capturedDelegatedContext.executionScope?.sessionKey, 'session:v2:catscompany:p2p:p2p_7_43:agent:usr43');
+      assert.equal(capturedDelegatedContext.localDeviceGrant?.bodyId, 'body-main');
     } finally {
       (SubAgentManager as any).getInstance = originalGetInstance;
     }
   });
 
-  test('CatsCo device-scoped spawn_subagent rejects local file tool delegation', async () => {
-    const result = await new SpawnSubagentTool().execute({
-      agent_type: 'explorer',
-      allowed_tools: ['read_file', 'ask_parent'],
-      task: '读取本机文件',
-      context: '请读取用户设备文件',
-    }, {
-      workingDirectory: process.cwd(),
-      conversationHistory: [],
-      sessionId: 'session:v2:catscompany:p2p:p2p_7_43:agent:usr43',
-      surface: 'catscompany',
-      executionScope: {
-        source: 'catscompany',
-        sessionKey: 'session:v2:catscompany:p2p:p2p_7_43:agent:usr43',
-        topicId: 'p2p_7_43',
-        topicType: 'p2p',
-        actorUserId: 'usr7',
-        agentId: 'usr43',
-        agentBodyId: 'body-main',
-        identityTrust: 'server_canonical',
-        isTrusted: true,
-      },
-      localDeviceGrant: {
-        kind: 'catscompany_body',
-        source: 'catscompany',
-        bodyId: 'body-main',
-        createdAt: Date.now(),
-      },
-      runtimeServices: {
-        aiService: {} as any,
-        skillManager: {} as any,
+  test('CatsCo device-scoped spawn_subagent can explicitly allow ask_parent', async () => {
+    const originalGetInstance = SubAgentManager.getInstance;
+    let capturedAllowedTools: unknown;
+    let capturedAllowParentQuestions: unknown;
+
+    (SubAgentManager as any).getInstance = () => ({
+      spawn(
+        _parentSessionKey: string,
+        request: any,
+      ) {
+        capturedAllowedTools = request.allowedTools;
+        capturedAllowParentQuestions = request.allowParentQuestions;
+        return {
+          id: 'sub-catsco-ask-parent',
+          agentType: request.agentType,
+          skillName: request.agentType,
+          toolScope: 'read_only',
+          allowedTools: request.allowedTools,
+          taskDescription: request.taskDescription,
+          status: 'running',
+          createdAt: Date.now(),
+          progressLog: [],
+          outputFiles: [],
+        };
       },
     });
 
-    assert.equal(result.ok, false);
-    if (!result.ok) {
-      assert.equal(result.errorCode, 'PERMISSION_DENIED');
-      assert.match(result.message, /不会传递给子智能体/);
-      assert.match(result.message, /read_file/);
+    try {
+      const result = await new SpawnSubagentTool().execute({
+        agent_type: 'explorer',
+        allow_parent_questions: true,
+        task: '审查当前问题',
+        context: '只看主会话提供的信息，不操作本机文件',
+      }, {
+        workingDirectory: process.cwd(),
+        conversationHistory: [],
+        sessionId: 'session:v2:catscompany:p2p:p2p_7_43:agent:usr43',
+        surface: 'catscompany',
+        executionScope: {
+          source: 'catscompany',
+          sessionKey: 'session:v2:catscompany:p2p:p2p_7_43:agent:usr43',
+          topicId: 'p2p_7_43',
+          topicType: 'p2p',
+          actorUserId: 'usr7',
+          agentId: 'usr43',
+          agentBodyId: 'body-main',
+          identityTrust: 'server_canonical',
+          isTrusted: true,
+        },
+        localDeviceGrant: {
+          kind: 'catscompany_body',
+          source: 'catscompany',
+          bodyId: 'body-main',
+          createdAt: Date.now(),
+        },
+        runtimeServices: {
+          aiService: {} as any,
+          skillManager: {} as any,
+        },
+      });
+
+      assert.equal(result.ok, true);
+      assert.equal(capturedAllowParentQuestions, true);
+      assert.equal(capturedAllowedTools, undefined);
+    } finally {
+      (SubAgentManager as any).getInstance = originalGetInstance;
+    }
+  });
+
+  test('CatsCo device-scoped spawn_subagent accepts the requested safe tool subset', async () => {
+    const originalGetInstance = SubAgentManager.getInstance;
+    let capturedAllowedTools: unknown;
+    let capturedDelegatedContext: any;
+
+    (SubAgentManager as any).getInstance = () => ({
+      spawn(
+        _parentSessionKey: string,
+        request: any,
+      ) {
+        capturedAllowedTools = request.allowedTools;
+        capturedDelegatedContext = request.delegatedToolContext;
+        return {
+          id: 'sub-catsco-tools',
+          agentType: request.agentType,
+          skillName: request.agentType,
+          toolScope: 'read_only',
+          allowedTools: request.allowedTools,
+          taskDescription: request.taskDescription,
+          status: 'running',
+          createdAt: Date.now(),
+          progressLog: [],
+          outputFiles: [],
+        };
+      },
+    });
+
+    try {
+      const result = await new SpawnSubagentTool().execute({
+        agent_type: 'explorer',
+        allowed_tools: ['read_file', 'grep', 'ask_parent'],
+        task: '读取本机文件',
+        context: '请读取用户设备文件',
+      }, {
+        workingDirectory: process.cwd(),
+        conversationHistory: [],
+        sessionId: 'session:v2:catscompany:p2p:p2p_7_43:agent:usr43',
+        surface: 'catscompany',
+        executionScope: {
+          source: 'catscompany',
+          sessionKey: 'session:v2:catscompany:p2p:p2p_7_43:agent:usr43',
+          topicId: 'p2p_7_43',
+          topicType: 'p2p',
+          actorUserId: 'usr7',
+          agentId: 'usr43',
+          agentBodyId: 'body-main',
+          identityTrust: 'server_canonical',
+          isTrusted: true,
+        },
+        localDeviceGrant: {
+          kind: 'catscompany_body',
+          source: 'catscompany',
+          bodyId: 'body-main',
+          createdAt: Date.now(),
+        },
+        runtimeServices: {
+          aiService: {} as any,
+          skillManager: {} as any,
+        },
+      });
+
+      assert.equal(result.ok, true);
+      assert.deepEqual(capturedAllowedTools, ['read_file', 'grep', 'ask_parent']);
+      assert.equal(capturedDelegatedContext.executionScope?.source, 'catscompany');
+      assert.equal(capturedDelegatedContext.localDeviceGrant?.bodyId, 'body-main');
+    } finally {
+      (SubAgentManager as any).getInstance = originalGetInstance;
     }
   });
 
@@ -576,6 +730,33 @@ describe('subagent runtime events', () => {
   });
 
   test('explicit allowed tools cannot exceed the selected tool scope', () => {
+    const defaultSession = new SubAgentSession(
+      'sub-scope-default',
+      {} as any,
+      { getSkill: () => undefined } as any,
+      {
+        taskDescription: 'scope check',
+        userMessage: 'scope check',
+        workingDirectory: process.cwd(),
+      },
+    );
+
+    assert.deepStrictEqual(defaultSession.allowedTools, ['read_file', 'glob', 'grep']);
+
+    const parentQuestionSession = new SubAgentSession(
+      'sub-scope-parent-question',
+      {} as any,
+      { getSkill: () => undefined } as any,
+      {
+        allowParentQuestions: true,
+        taskDescription: 'scope check',
+        userMessage: 'scope check',
+        workingDirectory: process.cwd(),
+      },
+    );
+
+    assert.deepStrictEqual(parentQuestionSession.allowedTools, ['read_file', 'glob', 'grep', 'ask_parent']);
+
     const readOnlySession = new SubAgentSession(
       'sub-scope-readonly',
       {} as any,
@@ -1113,6 +1294,65 @@ describe('subagent runtime events', () => {
       await unbounded.run();
 
       assert.deepEqual(observedMaxTurns, [7, undefined]);
+    } finally {
+      ConversationRunner.prototype.run = originalRun;
+    }
+  });
+
+  test('subagent runner inherits delegated tool authorization context', async () => {
+    let observedContext: any;
+    const originalRun = ConversationRunner.prototype.run;
+    (ConversationRunner.prototype as any).run = async function runMock() {
+      observedContext = (this as any).toolExecutionContext;
+      return {
+        response: 'done',
+        finalResponseVisible: true,
+        messages: [],
+        newMessages: [],
+      };
+    };
+
+    const executionScope = {
+      source: 'catscompany',
+      sessionKey: 'session:v2:catscompany:p2p:p2p_7_43:agent:usr43',
+      topicId: 'p2p_7_43',
+      topicType: 'p2p',
+      actorUserId: 'usr7',
+      agentId: 'usr43',
+      agentBodyId: 'body-main',
+      identityTrust: 'server_canonical',
+      isTrusted: true,
+    };
+    const localDeviceGrant = {
+      kind: 'catscompany_body',
+      source: 'catscompany',
+      bodyId: 'body-main',
+      createdAt: Date.now(),
+    };
+
+    try {
+      const session = new SubAgentSession('sub-delegated-context', {} as any, {} as any, {
+        taskDescription: 'delegated context',
+        userMessage: 'delegated context',
+        workingDirectory: process.cwd(),
+        delegatedToolContext: {
+          surface: 'catscompany',
+          executionScope: executionScope as any,
+          localDeviceGrant: localDeviceGrant as any,
+          deviceGrants: [{ operations: ['read_file'] } as any],
+          localFileGrants: [{ filePath: 'C:\\tmp\\a.txt' } as any],
+        },
+      });
+      await session.run();
+
+      assert.equal(observedContext.sessionId, 'subagent:sub-delegated-context');
+      assert.equal(observedContext.surface, 'catscompany');
+      assert.equal(observedContext.permissionProfile, 'strict');
+      assert.strictEqual(observedContext.executionScope, executionScope);
+      assert.strictEqual(observedContext.localDeviceGrant, localDeviceGrant);
+      assert.equal(observedContext.deviceGrants.length, 1);
+      assert.equal(observedContext.localFileGrants.length, 1);
+      assert.equal(typeof observedContext.requestParentInput, 'function');
     } finally {
       ConversationRunner.prototype.run = originalRun;
     }

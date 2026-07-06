@@ -5,9 +5,6 @@ import { AIService } from '../utils/ai-service';
 import { SkillManager } from '../skills/skill-manager';
 import { Logger } from '../utils/logger';
 import { styles } from '../theme/colors';
-import { isCatsCoToolGatewayContext } from './tool-gateway';
-
-const CATSCO_SUBAGENT_ALLOWED_TOOLS = ['ask_parent'] as const;
 
 /**
  * spawn_subagent - 派遣子智能体后台执行隔离任务
@@ -22,7 +19,8 @@ export class SpawnSubagentTool implements Tool {
     description: [
       '启动一个后台子智能体执行独立任务；调用成功后立即返回，不等待完成。',
       '子智能体只看到传入的 context/user_message，完成后以后台结果回流到当前主会话，不会直接回复用户。',
-      '适合可并行的探索、审查、测试或边界清晰的小块实现；当前主线必须由主 agent 继续推进。',
+      '适合可并行的探索、审查、测试或边界清晰的小块实现；具体分工由 subagent_prompt/context 描述，当前主线必须由主 agent 继续推进。',
+      'allowed_tools 是主 agent 从安全工具集合里挑出的子集；默认不会给 ask_parent，除非显式开启。',
       '只有本工具返回的展示名和 ID 才是真实子智能体引用，不要编造子智能体或 sub-... ID。',
     ].join('\n'),
     parameters: {
@@ -35,12 +33,12 @@ export class SpawnSubagentTool implements Tool {
         agent_type: {
           type: 'string',
           enum: ['explorer', 'reviewer', 'worker', 'tester'],
-          description: '可选。内置子 agent 类型。explorer/reviewer 默认只读，tester 可执行测试命令，worker 可在工作区写文件。',
+          description: '可选，兼容旧调用。仅作为任务 hint 和默认工具范围参考；具体角色请写入 subagent_prompt/context。',
         },
         tool_scope: {
           type: 'string',
           enum: ['read_only', 'workspace_write', 'test_only'],
-          description: '可选。覆盖子智能体工具权限范围。默认由 agent_type 决定。',
+          description: '可选。子智能体工具权限上限；allowed_tools 不能超过这个范围。未指定时会根据 agent_type 或显式 allowed_tools 推断。',
         },
         allowed_tools: {
           type: 'array',
@@ -48,7 +46,11 @@ export class SpawnSubagentTool implements Tool {
             type: 'string',
             enum: [...SAFE_SUB_AGENT_TOOL_NAMES],
           },
-          description: '可选。显式指定子智能体可用工具白名单。只能从枚举值中选择。',
+          description: '可选。显式指定子智能体可用工具白名单。只能从枚举值中选择；不包含 spawn_subagent，子智能体不能再派生子智能体。',
+        },
+        allow_parent_questions: {
+          type: 'boolean',
+          description: '可选。为 true 时默认工具集合会额外包含 ask_parent；不传时默认不允许子智能体挂起询问主 agent。若 allowed_tools 显式包含 ask_parent，也视为显式允许。',
         },
         max_turns: {
           type: 'number',
@@ -85,6 +87,7 @@ export class SpawnSubagentTool implements Tool {
     const toolScope = normalizeToolScope(args?.tool_scope);
     const subAgentPrompt = normalizeString(args?.subagent_prompt);
     const allowedToolsResult = normalizeAllowedTools(args?.allowed_tools);
+    const allowParentQuestionsResult = normalizeOptionalBoolean(args?.allow_parent_questions);
     const maxTurnsResult = normalizeMaxTurns(args?.max_turns);
     const taskDescription = normalizeString(args?.task_description) || normalizeString(args?.task);
     const userMessage = normalizeString(args?.user_message) || normalizeString(args?.context) || taskDescription;
@@ -92,20 +95,16 @@ export class SpawnSubagentTool implements Tool {
     if (!taskDescription || !userMessage) {
       return { ok: false, errorCode: 'INVALID_TOOL_ARGUMENTS', message: '错误：task/task_description 和 context/user_message 为必填参数' };
     }
-    if (!skillName && !agentType) {
-      return { ok: false, errorCode: 'INVALID_TOOL_ARGUMENTS', message: '错误：请提供 agent_type，或在确实需要现有 skill 流程时提供 skill_name' };
-    }
     if (!allowedToolsResult.ok) {
       return { ok: false, errorCode: 'INVALID_TOOL_ARGUMENTS', message: allowedToolsResult.message };
+    }
+    if (!allowParentQuestionsResult.ok) {
+      return { ok: false, errorCode: 'INVALID_TOOL_ARGUMENTS', message: allowParentQuestionsResult.message };
     }
     if (!maxTurnsResult.ok) {
       return { ok: false, errorCode: 'INVALID_TOOL_ARGUMENTS', message: maxTurnsResult.message };
     }
-    const catsCoSubAgentTools = resolveCatsCoSubAgentAllowedTools(context, allowedToolsResult.value);
-    if (!catsCoSubAgentTools.ok) {
-      return { ok: false, errorCode: 'PERMISSION_DENIED', message: catsCoSubAgentTools.message };
-    }
-
+    const allowParentQuestions = allowParentQuestionsResult.value ?? toolsIncludeAskParent(allowedToolsResult.value);
     const manager = SubAgentManager.getInstance();
     const sessionKey = context.sessionId || 'unknown';
 
@@ -118,7 +117,9 @@ export class SpawnSubagentTool implements Tool {
         agentType,
         toolScope,
         subAgentPrompt,
-        allowedTools: catsCoSubAgentTools.value,
+        allowParentQuestions,
+        delegatedToolContext: buildDelegatedSubAgentToolContext(context),
+        allowedTools: allowedToolsResult.value,
         maxTurns: maxTurnsResult.value,
         taskDescription,
         userMessage,
@@ -138,8 +139,8 @@ export class SpawnSubagentTool implements Tool {
     }
     console.log(styles.text(`   ID: ${result.id}`));
     const displayAgentType = result.agentType || agentType || (skillName ? 'skill' : 'worker');
-    const displayToolScope = result.toolScope || toolScope || defaultToolScopeFor(displayAgentType);
-    const effectiveAllowedTools = result.allowedTools ?? catsCoSubAgentTools.value;
+    const displayToolScope = result.toolScope || toolScope || defaultToolScopeFor(displayAgentType, allowedToolsResult.value);
+    const effectiveAllowedTools = result.allowedTools ?? allowedToolsResult.value;
 
     console.log(styles.text(`   Type: ${displayAgentType}`));
     console.log(styles.text(`   Scope: ${displayToolScope}\n`));
@@ -150,6 +151,7 @@ export class SpawnSubagentTool implements Tool {
       `类型: ${displayAgentType}`,
       `工具范围: ${displayToolScope}`,
       effectiveAllowedTools ? `工具: ${effectiveAllowedTools.length > 0 ? effectiveAllowedTools.join(', ') : '无'}` : '',
+      allowParentQuestions ? '允许询问主 agent: 是' : '允许询问主 agent: 否',
       maxTurnsResult.value ? `轮次预算: ${maxTurnsResult.value}` : '轮次预算: 未设置',
       skillName ? `Skill: ${skillName}` : '',
       `状态: running`,
@@ -158,33 +160,21 @@ export class SpawnSubagentTool implements Tool {
   }
 }
 
-function resolveCatsCoSubAgentAllowedTools(
-  context: ToolExecutionContext,
-  requestedTools?: string[],
-): { ok: true; value?: string[] } | { ok: false; message: string } {
-  const hasCatsCoDeviceContext = isCatsCoToolGatewayContext(context)
-    && Boolean(context.executionScope || context.deviceGrants?.length || context.localFileGrants?.length || context.localDeviceGrant);
-  if (!hasCatsCoDeviceContext) {
-    return { ok: true, value: requestedTools };
+function normalizeOptionalBoolean(value: unknown): { ok: true; value?: boolean } | { ok: false; message: string } {
+  if (value === undefined || value === null || value === '') {
+    return { ok: true, value: undefined };
   }
-
-  if (!requestedTools) {
-    return { ok: true, value: [...CATSCO_SUBAGENT_ALLOWED_TOOLS] };
+  if (typeof value === 'boolean') {
+    return { ok: true, value };
   }
-
-  const deniedTools = requestedTools.filter(tool => !CATSCO_SUBAGENT_ALLOWED_TOOLS.includes(tool as any));
-  if (deniedTools.length > 0) {
-    return {
-      ok: false,
-      message: [
-        'CatsCo 用户设备授权不会传递给子智能体，已阻止子智能体使用本地文件或命令工具。',
-        `被拒绝的工具: ${deniedTools.join(', ')}`,
-        '请在主会话当前 turn 中直接使用已授权工具，或让子智能体通过 ask_parent 请求主会话继续处理。',
-      ].join('\n'),
-    };
+  const text = String(value).trim().toLowerCase();
+  if (['1', 'true', 'yes', 'on'].includes(text)) {
+    return { ok: true, value: true };
   }
-
-  return { ok: true, value: requestedTools };
+  if (['0', 'false', 'no', 'off'].includes(text)) {
+    return { ok: true, value: false };
+  }
+  return { ok: false, message: '错误：allow_parent_questions 必须是 boolean' };
 }
 
 function normalizeMaxTurns(value: unknown): { ok: true; value?: number } | { ok: false; message: string } {
@@ -239,6 +229,28 @@ function normalizeAllowedTools(value: unknown): { ok: true; value?: string[] } |
   return { ok: true, value: normalized };
 }
 
+function toolsIncludeAskParent(tools?: readonly string[]): boolean {
+  return Boolean(tools?.some(tool => String(tool || '').trim() === 'ask_parent'));
+}
+
+function buildDelegatedSubAgentToolContext(context: ToolExecutionContext): Partial<ToolExecutionContext> {
+  return {
+    workspaceRoot: context.workspaceRoot,
+    surface: context.surface,
+    executionScope: context.executionScope,
+    localDeviceGrant: context.localDeviceGrant,
+    deviceGrants: context.deviceGrants,
+    deviceSelection: context.deviceSelection,
+    deviceRpc: context.deviceRpc,
+    deviceRpcReceiver: context.deviceRpcReceiver,
+    thinToolRpc: context.thinToolRpc,
+    targetRoutes: context.targetRoutes,
+    executionContext: context.executionContext,
+    localFileGrants: context.localFileGrants,
+    getCurrentDirectory: context.getCurrentDirectory,
+  };
+}
+
 async function resolveSubAgentServices(
   context: ToolExecutionContext,
   needsSkills: boolean,
@@ -256,7 +268,13 @@ async function resolveSubAgentServices(
   return { aiService, skillManager };
 }
 
-function defaultToolScopeFor(agentType: string): 'read_only' | 'workspace_write' | 'test_only' {
+function defaultToolScopeFor(agentType: string, requestedTools?: readonly string[]): 'read_only' | 'workspace_write' | 'test_only' {
+  if (requestedTools?.some(tool => tool === 'write_file' || tool === 'edit_file')) {
+    return 'workspace_write';
+  }
+  if (requestedTools?.some(tool => tool === 'execute_shell')) {
+    return 'test_only';
+  }
   if (agentType === 'worker' || agentType === 'skill') {
     return 'workspace_write';
   }
