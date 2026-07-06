@@ -1009,11 +1009,13 @@ describe('CatsCo content blocks', () => {
     assert.deepStrictEqual(sentThinking, []);
   });
 
-  test('subagent feedback visible reply is sent back to CatsCompany', async () => {
+  test('subagent completion feedback is handled without sending a visible reply', async () => {
     const { bot, runtimeObservations, replies, sentThinking, session } = createProcessHarness();
     session.handleRuntimeObservation = async (text: string, options: any) => {
       runtimeObservations.push({ text, options });
-      return { visibleToUser: true, text: '已根据子 agent 结果处理完。' };
+      return options.suppressFinalResponse
+        ? { visibleToUser: false, text: '' }
+        : { visibleToUser: true, text: '已根据子 agent 结果处理完。' };
     };
 
     await (bot as any).handleSubAgentFeedback(
@@ -1025,15 +1027,91 @@ describe('CatsCo content blocks', () => {
 
     assert.strictEqual(runtimeObservations.length, 1);
     assert.strictEqual(runtimeObservations[0].options.source, 'subagent_result');
+    assert.strictEqual(runtimeObservations[0].options.suppressFinalResponse, true);
     assert.strictEqual(typeof runtimeObservations[0].options.callbacks?.onThinking, 'function');
     await runtimeObservations[0].options.callbacks.onThinking('子 agent 回流压缩状态');
     assert.deepStrictEqual(
       sentThinking.map(({ topic, text }) => ({ topic, text })),
       [{ topic: 'p2p_38_110', text: '子 agent 回流压缩状态' }],
     );
-    assert.deepStrictEqual(replies, [
-      { topic: 'p2p_38_110', text: '已根据子 agent 结果处理完。' },
-    ]);
+    assert.deepStrictEqual(replies, []);
+  });
+
+  test('consumed subagent completion feedback is dropped before runtime observation', async () => {
+    const { bot, runtimeObservations, replies, sentTyping } = createProcessHarness();
+    const manager = SubAgentManager.getInstance();
+    const sessionKey = 'session:v2:catscompany:p2p:p2p_38_110:agent:usr43';
+    const subAgentId = 'sub-aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+    const observation = `[子agent1 已完成]\nID：${subAgentId}\n结果摘要：审查完成`;
+
+    (manager as any).parentMap.set(subAgentId, sessionKey);
+    (manager as any).resultConsumedByWait.add(subAgentId);
+
+    try {
+      await (bot as any).handleSubAgentFeedback(
+        sessionKey,
+        'p2p_38_110',
+        'usr38',
+        observation,
+      );
+
+      assert.deepStrictEqual(runtimeObservations, []);
+      assert.deepStrictEqual(replies, []);
+      assert.deepStrictEqual(sentTyping, []);
+
+      bot.messageQueue.set(sessionKey, [{
+        userMessage: observation,
+        topic: 'p2p_38_110',
+        senderId: 'usr38',
+        seq: 0,
+        receivedAt: Date.now(),
+        source: 'subagent_feedback',
+      }]);
+
+      await (bot as any).drainMessageQueue(sessionKey);
+
+      assert.deepStrictEqual(runtimeObservations, []);
+      assert.equal(bot.messageQueue.has(sessionKey), false);
+    } finally {
+      (manager as any).parentMap.delete(subAgentId);
+      (manager as any).resultConsumedByWait.delete(subAgentId);
+    }
+  });
+
+  test('unconsumed wait-claimed subagent completion can send a follow-up reply', async () => {
+    const { bot, runtimeObservations, replies, session } = createProcessHarness();
+    const manager = SubAgentManager.getInstance();
+    const sessionKey = 'session:v2:catscompany:p2p:p2p_38_110:agent:usr43';
+    const subAgentId = 'sub-bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+    const observation = `[子agent1 已完成]\nID：${subAgentId}\n结果摘要：超时后完成`;
+
+    session.handleRuntimeObservation = async (text: string, options: any) => {
+      runtimeObservations.push({ text, options });
+      return { visibleToUser: true, text: '后台子任务刚完成，我补充一下结果。' };
+    };
+
+    (manager as any).parentMap.set(subAgentId, sessionKey);
+    (manager as any).resultNotifyOnObservation.add(subAgentId);
+
+    try {
+      await (bot as any).handleSubAgentFeedback(
+        sessionKey,
+        'p2p_38_110',
+        'usr38',
+        observation,
+      );
+
+      assert.strictEqual(runtimeObservations.length, 1);
+      assert.strictEqual(runtimeObservations[0].options.source, 'subagent_result');
+      assert.strictEqual(runtimeObservations[0].options.suppressFinalResponse, false);
+      assert.deepStrictEqual(replies, [
+        { topic: 'p2p_38_110', text: '后台子任务刚完成，我补充一下结果。' },
+      ]);
+      assert.equal((manager as any).resultNotifyOnObservation.has(subAgentId), false);
+    } finally {
+      (manager as any).parentMap.delete(subAgentId);
+      (manager as any).resultNotifyOnObservation.delete(subAgentId);
+    }
   });
 
   test('queued subagent error reply is not sent twice', async () => {
@@ -1058,6 +1136,7 @@ describe('CatsCo content blocks', () => {
 
     assert.strictEqual(runtimeObservations.length, 1);
     assert.strictEqual(runtimeObservations[0].options.source, 'subagent_result');
+    assert.strictEqual(runtimeObservations[0].options.suppressFinalResponse, true);
     assert.strictEqual(typeof runtimeObservations[0].options.callbacks?.onThinking, 'function');
     await runtimeObservations[0].options.callbacks.onThinking('排队子 agent 压缩状态');
     assert.deepStrictEqual(

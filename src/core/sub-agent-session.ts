@@ -55,6 +55,9 @@ export interface SubAgentInfo {
   recentEvents?: SubAgentRuntimeEvent[];
   eventCount?: number;
   lastEventAt?: number;
+  /** 本次 spawn 是否复用了同父会话下仍在运行的同类子任务 */
+  reusedExisting?: boolean;
+  dedupeReason?: string;
 }
 
 export interface SubAgentSpawnOptions {
@@ -92,7 +95,8 @@ export interface SubAgentSpawnOptions {
  * 不直接和用户通信：
  * - 运行过程通过 event 通道给 UI/日志/状态 observation；
  * - ask_parent 通过 notifyParent 向主 agent 提问；
- * - 最终 result observation 由 SubAgentManager.finalizeSession() 回流父会话。
+ * - 最终 result observation 由 SubAgentManager.finalizeSession() 回流父会话，
+ *   平台层可选择作为内部 observation 处理而不直接外发给用户。
  * 主会话不 await 它，fire-and-forget。
  */
 export class SubAgentSession {

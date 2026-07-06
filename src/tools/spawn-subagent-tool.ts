@@ -18,8 +18,9 @@ export class SpawnSubagentTool implements Tool {
     name: 'spawn_subagent',
     description: [
       '启动一个后台子智能体执行独立任务；调用成功后立即返回，不等待完成。',
-      '子智能体只看到传入的 context/user_message，完成后以后台结果回流到当前主会话，不会直接回复用户。',
+      '子智能体只看到传入的 context/user_message，完成结果会作为内部 observation 回到当前主会话，并可用 check_subagent 查询；它不会直接回复用户。',
       '适合可并行的探索、审查、测试或边界清晰的小块实现；具体分工由 subagent_prompt/context 描述，当前主线必须由主 agent 继续推进。',
+      '如果最终回复依赖子智能体结果，主 agent 应使用 wait_subagents 等待并整合结果后再收口；只看状态时用 check_subagent。',
       'allowed_tools 是主 agent 从安全工具集合里挑出的子集；默认不会给 ask_parent，除非显式开启。',
       '只有本工具返回的展示名和 ID 才是真实子智能体引用，不要编造子智能体或 sub-... ID。',
     ].join('\n'),
@@ -133,7 +134,8 @@ export class SpawnSubagentTool implements Tool {
       return { ok: false, errorCode: 'TOOL_EXECUTION_ERROR', message: `派遣失败：${result.error}` };
     }
 
-    console.log('\n' + styles.highlight(`🚀 派遣子智能体: ${taskDescription}`));
+    const reusedExisting = result.reusedExisting === true;
+    console.log('\n' + styles.highlight(`${reusedExisting ? '复用子智能体' : '🚀 派遣子智能体'}: ${taskDescription}`));
     if (result.displayName) {
       console.log(styles.text(`   Name: ${result.displayName}`));
     }
@@ -146,7 +148,9 @@ export class SpawnSubagentTool implements Tool {
     console.log(styles.text(`   Scope: ${displayToolScope}\n`));
 
     return { ok: true, content: [
-      `已派遣 ${result.displayName || '子智能体'} (${result.id})。`,
+      reusedExisting
+        ? `已复用正在运行的 ${result.displayName || '子智能体'} (${result.id})，避免重复派发同类任务。`
+        : `已派遣 ${result.displayName || '子智能体'} (${result.id})。`,
       `任务: ${taskDescription}`,
       `类型: ${displayAgentType}`,
       `工具范围: ${displayToolScope}`,
@@ -155,7 +159,7 @@ export class SpawnSubagentTool implements Tool {
       maxTurnsResult.value ? `轮次预算: ${maxTurnsResult.value}` : '轮次预算: 未设置',
       skillName ? `Skill: ${skillName}` : '',
       `状态: running`,
-      `完成后会以后台结果通知回到主会话；你仍负责主线推进和最终回复。`,
+      `完成结果会作为内部 observation 回到主会话；需要整合时用 wait_subagents，你仍负责主线推进和最终回复。`,
     ].filter(Boolean).join('\n') };
   }
 }

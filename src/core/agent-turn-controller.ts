@@ -63,6 +63,7 @@ export interface RunAgentTurnParams {
   messages: Message[];
   runtimeFeedback: string[];
   runtimeObservationSource?: string;
+  suppressFinalResponse?: boolean;
   callbacks?: AgentTurnCallbacks;
   channel?: ChannelCallbacks;
   sessionRoute?: SessionRoute;
@@ -221,14 +222,19 @@ export class AgentTurnController {
       runtimeObservationSource: params.runtimeObservationSource,
     });
 
-    if (result.finalResponseVisible) {
+    const finalResponseVisible = result.finalResponseVisible && params.suppressFinalResponse !== true;
+    if (result.finalResponseVisible && params.suppressFinalResponse === true) {
+      Logger.info(`[${this.options.sessionKey}] runtime observation final response suppressed: ${params.runtimeObservationSource || 'unknown'}`);
+    }
+
+    if (finalResponseVisible) {
       this.recordPetTurnCompletion('message_completed');
       this.recordPetTurnCompletion('task_completed');
     }
 
     return {
-      text: result.finalResponseVisible ? (result.response || '[无回复]') : '',
-      visibleToUser: result.finalResponseVisible,
+      text: finalResponseVisible ? (result.response || '[无回复]') : '',
+      visibleToUser: finalResponseVisible,
       newMessages: result.newMessages,
       messages: nextMessages,
     };

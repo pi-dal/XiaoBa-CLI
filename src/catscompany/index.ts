@@ -12,6 +12,7 @@ import { MessageSessionManager } from '../core/message-session-manager';
 import { AgentServices, BUSY_MESSAGE, RuntimeFeedbackInput, SessionCallbacks } from '../core/agent-session';
 import { Logger } from '../utils/logger';
 import { SubAgentManager } from '../core/sub-agent-manager';
+import { shouldSuppressSubAgentObservationReply } from '../core/sub-agent-observation';
 import type { SubAgentInfo } from '../core/sub-agent-session';
 import { ChannelCallbacks, DeviceRpcTransport, TargetRoutes, ThinToolRpcTransport, ToolErrorCode, ToolExecutionConfirmationRequest, ToolExecutionConfirmationResult, ToolExecutionContext, ToolExecutionResult } from '../types/tool';
 import { ContentBlock } from '../types';
@@ -1374,6 +1375,13 @@ export class CatsCompanyBot {
     text: string,
     executionScope?: ParsedCatsMessage['executionScope'],
   ): Promise<void> {
+    const subAgentManager = SubAgentManager.getInstance();
+    const resultObservationHandling = subAgentManager.getResultObservationHandlingForParent(sessionKey, text);
+    if (resultObservationHandling === 'drop') {
+      Logger.info(`[${sessionKey}] 子智能体完成 observation 已由 wait_subagents 消费，跳过回流处理`);
+      return;
+    }
+
     const session = this.sessionManager.getOrCreate(sessionKey);
 
     if (session.isBusy()) {
@@ -1390,7 +1398,9 @@ export class CatsCompanyBot {
       channelSource: executionScope?.channelSource,
     });
 
-    const stopTypingHeartbeat = this.startTypingHeartbeat(topic);
+    const suppressFinalResponse = resultObservationHandling !== 'notify'
+      && shouldSuppressSubAgentObservationReply(text);
+    const stopTypingHeartbeat = suppressFinalResponse ? () => undefined : this.startTypingHeartbeat(topic);
     let typingHeartbeatStopped = false;
     const stopTypingHeartbeatOnce = () => {
       if (typingHeartbeatStopped) return;
@@ -1407,6 +1417,7 @@ export class CatsCompanyBot {
           channelSource: executionScope?.channelSource,
         }),
         source: 'subagent_result',
+        suppressFinalResponse,
         executionScope,
         localDeviceGrant: this.localDeviceGrant,
         deviceRpc: this.buildDeviceRpcTransport(),
@@ -1417,6 +1428,7 @@ export class CatsCompanyBot {
         Logger.info(`[${sessionKey}] 主会话竞态忙碌，子智能体反馈已入队`);
         return;
       }
+      subAgentManager.markResultObservationHandledForParent(sessionKey, text);
       if (result.text.startsWith('处理消息时出错:')) {
         try {
           await this.sender.reply(topic, result.text);
@@ -1616,6 +1628,16 @@ export class CatsCompanyBot {
       this.messageQueue.delete(sessionKey);
     }
 
+    const subAgentManager = SubAgentManager.getInstance();
+    const queuedResultObservationHandling = msg.source === 'subagent_feedback'
+      ? subAgentManager.getResultObservationHandlingForParent(sessionKey, msg.userMessage as string)
+      : 'silent';
+    if (queuedResultObservationHandling === 'drop') {
+      Logger.info(`[${sessionKey}] 队列中的子智能体完成 observation 已由 wait_subagents 消费，跳过回流处理`);
+      await this.drainMessageQueue(sessionKey);
+      return;
+    }
+
     const session = this.sessionManager.getOrCreate(sessionKey);
     this.registerSubAgentPlatformCallbacks(sessionKey, msg.topic, msg.senderId, msg.executionScope);
     const channel = this.buildChannel(msg.topic, {
@@ -1624,7 +1646,10 @@ export class CatsCompanyBot {
       channelSource: msg.executionScope?.channelSource,
     });
 
-    const stopTypingHeartbeat = this.startTypingHeartbeat(msg.topic);
+    const suppressSubAgentFinalResponse = msg.source === 'subagent_feedback'
+      && queuedResultObservationHandling !== 'notify'
+      && shouldSuppressSubAgentObservationReply(msg.userMessage as string);
+    const stopTypingHeartbeat = suppressSubAgentFinalResponse ? () => undefined : this.startTypingHeartbeat(msg.topic);
 
     try {
       const result = msg.source === 'subagent_feedback'
@@ -1636,6 +1661,7 @@ export class CatsCompanyBot {
             channelSource: msg.executionScope?.channelSource,
           }),
           source: 'subagent_result',
+          suppressFinalResponse: suppressSubAgentFinalResponse,
           executionScope: msg.executionScope,
           localDeviceGrant: this.localDeviceGrant,
           deviceSelection: msg.deviceSelection,
@@ -1673,6 +1699,9 @@ export class CatsCompanyBot {
         } catch (err: any) {
           Logger.warning(`队列消息回复发送失败: ${err.message}`);
         }
+      }
+      if (result.text !== BUSY_MESSAGE && msg.source === 'subagent_feedback') {
+        subAgentManager.markResultObservationHandledForParent(sessionKey, msg.userMessage as string);
       }
     } finally {
       stopTypingHeartbeat();

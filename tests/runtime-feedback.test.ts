@@ -126,9 +126,11 @@ describe('runtime feedback', () => {
 
     const result = await session.handleRuntimeObservation('[子智能体完成]\n结果：ok', {
       source: 'subagent_result',
+      suppressFinalResponse: true,
     });
 
-    assert.equal(result.text, '已整合子任务结果');
+    assert.equal(result.text, '');
+    assert.equal(result.visibleToUser, false);
     const capturedRuntimeMessage = capturedMessages.find(message => message.content === '[子智能体完成]\n结果：ok');
     assert.equal(capturedRuntimeMessage?.role, 'user');
 

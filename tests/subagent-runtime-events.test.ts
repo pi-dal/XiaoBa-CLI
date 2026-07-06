@@ -9,6 +9,7 @@ import { SubAgentManager } from '../src/core/sub-agent-manager';
 import { SubAgentSession } from '../src/core/sub-agent-session';
 import { TurnContextBuilder } from '../src/core/turn-context-builder';
 import { SpawnSubagentTool } from '../src/tools/spawn-subagent-tool';
+import { WaitSubagentsTool } from '../src/tools/wait-subagents-tool';
 
 describe('subagent runtime events', () => {
   test('event store keeps bounded per-parent event streams with per-agent sequence numbers', () => {
@@ -1168,6 +1169,231 @@ describe('subagent runtime events', () => {
       assert.equal(spawnEventDelivered, true);
     } finally {
       SubAgentSession.prototype.run = originalRun;
+      manager.unregisterPlatformCallbacks(parentSessionKey);
+    }
+  });
+
+  test('manager reuses an active subagent for duplicate task descriptions', async () => {
+    const manager = SubAgentManager.getInstance();
+    const parentSessionKey = `test-parent:${Date.now()}:dedupe-active`;
+    let finishRun: (() => void) | undefined;
+
+    manager.registerPlatformCallbacks(parentSessionKey, {
+      injectMessage: async () => undefined,
+      onSubAgentEvent: async () => undefined,
+    });
+
+    const originalRun = SubAgentSession.prototype.run;
+    (SubAgentSession.prototype as any).run = async function runMock() {
+      await new Promise<void>(resolve => {
+        finishRun = resolve;
+      });
+      this.status = 'stopped';
+      this.completedAt = Date.now();
+    };
+
+    try {
+      const first = await manager.spawn(
+        parentSessionKey,
+        {
+          agentType: 'worker',
+          taskDescription: '制作待办清单HTML页面',
+          userMessage: 'write todo page',
+        },
+        process.cwd(),
+        {} as any,
+        { getSkill: () => undefined } as any,
+      );
+      assert.ok(!('error' in first));
+
+      const second = await manager.spawn(
+        parentSessionKey,
+        {
+          agentType: 'worker',
+          taskDescription: '待办清单工具页',
+          userMessage: 'write another todo page',
+        },
+        process.cwd(),
+        {} as any,
+        { getSkill: () => undefined } as any,
+      );
+      assert.ok(!('error' in second));
+      assert.equal(second.id, first.id);
+      assert.equal(second.reusedExisting, true);
+      assert.equal(manager.listByParent(parentSessionKey).filter(info => info.status === 'running').length, 1);
+    } finally {
+      if (finishRun) finishRun();
+      SubAgentSession.prototype.run = originalRun;
+      for (const info of manager.listByParent(parentSessionKey)) {
+        (manager as any).subAgents.delete(info.id);
+        (manager as any).completedSubAgents.delete(info.id);
+        (manager as any).parentMap.delete(info.id);
+        (manager as any).displayNameByAgent.delete(info.id);
+      }
+      manager.unregisterPlatformCallbacks(parentSessionKey);
+    }
+  });
+
+  test('wait_subagents waits for active subagent completion and returns summaries', async () => {
+    const manager = SubAgentManager.getInstance();
+    const parentSessionKey = `test-parent:${Date.now()}:wait-tool`;
+    let finishRun: (() => void) | undefined;
+    let closed = false;
+    const injectedMessages: string[] = [];
+
+    manager.registerPlatformCallbacks(parentSessionKey, {
+      injectMessage: async (text: string) => {
+        injectedMessages.push(text);
+      },
+      onSubAgentEvent: async () => undefined,
+    });
+
+    const originalRun = SubAgentSession.prototype.run;
+    const originalClose = SubAgentSession.prototype.close;
+    (SubAgentSession.prototype as any).run = async function runMock() {
+      await new Promise<void>(resolve => {
+        finishRun = resolve;
+      });
+      this.status = 'completed';
+      this.completedAt = Date.now();
+      this.resultSummary = 'waited result';
+    };
+    (SubAgentSession.prototype as any).close = async function closeMock() {
+      closed = true;
+    };
+
+    try {
+      const spawned = await manager.spawn(
+        parentSessionKey,
+        {
+          agentType: 'worker',
+          taskDescription: 'waitable task',
+          userMessage: 'waitable task',
+        },
+        process.cwd(),
+        {} as any,
+        { getSkill: () => undefined } as any,
+      );
+      assert.ok(!('error' in spawned));
+      setTimeout(() => finishRun?.(), 20);
+
+      const result = await new WaitSubagentsTool().execute({
+        subagent_ids: [spawned.displayName],
+        timeout_ms: 1000,
+      }, {
+        workingDirectory: process.cwd(),
+        conversationHistory: [],
+        sessionId: parentSessionKey,
+      });
+
+      assert.equal(result.ok, true);
+      const content = result.ok ? result.content : result.message;
+      assert.match(content, /等待完成/);
+      assert.match(content, /waited result/);
+      assert.match(content, /waitable task/);
+      await waitFor(() => closed);
+      assert.deepStrictEqual(injectedMessages, []);
+    } finally {
+      if (finishRun) finishRun();
+      SubAgentSession.prototype.run = originalRun;
+      SubAgentSession.prototype.close = originalClose;
+      for (const info of manager.listByParent(parentSessionKey)) {
+        (manager as any).subAgents.delete(info.id);
+        (manager as any).completedSubAgents.delete(info.id);
+        (manager as any).parentMap.delete(info.id);
+        (manager as any).displayNameByAgent.delete(info.id);
+        (manager as any).resultConsumedByWait.delete(info.id);
+        (manager as any).resultWaitClaimCount.delete(info.id);
+        (manager as any).pendingResultObservations.delete(info.id);
+      }
+      manager.unregisterPlatformCallbacks(parentSessionKey);
+    }
+  });
+
+  test('wait_subagents timeout does not consume completed subagent results', async () => {
+    const manager = SubAgentManager.getInstance();
+    const parentSessionKey = `test-parent:${Date.now()}:wait-timeout`;
+    let finishSlow: (() => void) | undefined;
+    const injectedMessages: string[] = [];
+
+    manager.registerPlatformCallbacks(parentSessionKey, {
+      injectMessage: async (text: string) => {
+        injectedMessages.push(text);
+      },
+      onSubAgentEvent: async () => undefined,
+    });
+
+    const originalRun = SubAgentSession.prototype.run;
+    const originalClose = SubAgentSession.prototype.close;
+    (SubAgentSession.prototype as any).run = async function runMock() {
+      if (this.taskDescription === 'fast task') {
+        await new Promise(resolve => setTimeout(resolve, 10));
+        this.status = 'completed';
+        this.completedAt = Date.now();
+        this.resultSummary = 'fast result';
+        return;
+      }
+
+      await new Promise<void>(resolve => {
+        finishSlow = resolve;
+      });
+      this.status = 'completed';
+      this.completedAt = Date.now();
+      this.resultSummary = 'slow result';
+    };
+    (SubAgentSession.prototype as any).close = async function closeMock() {};
+
+    try {
+      const fast = await manager.spawn(
+        parentSessionKey,
+        {
+          agentType: 'worker',
+          taskDescription: 'fast task',
+          userMessage: 'fast task',
+        },
+        process.cwd(),
+        {} as any,
+        { getSkill: () => undefined } as any,
+      );
+      const slow = await manager.spawn(
+        parentSessionKey,
+        {
+          agentType: 'worker',
+          taskDescription: 'slow task',
+          userMessage: 'slow task',
+        },
+        process.cwd(),
+        {} as any,
+        { getSkill: () => undefined } as any,
+      );
+      assert.ok(!('error' in fast));
+      assert.ok(!('error' in slow));
+
+      const result = await new WaitSubagentsTool().execute({
+        timeout_ms: 60,
+      }, {
+        workingDirectory: process.cwd(),
+        conversationHistory: [],
+        sessionId: parentSessionKey,
+      });
+
+      assert.equal(result.ok, true);
+      const content = result.ok ? result.content : result.message;
+      assert.match(content, /等待超时/);
+      await waitFor(() => injectedMessages.some(text => /fast result/.test(text)));
+    } finally {
+      finishSlow?.();
+      SubAgentSession.prototype.run = originalRun;
+      SubAgentSession.prototype.close = originalClose;
+      for (const info of manager.listByParent(parentSessionKey)) {
+        (manager as any).subAgents.delete(info.id);
+        (manager as any).completedSubAgents.delete(info.id);
+        (manager as any).parentMap.delete(info.id);
+        (manager as any).displayNameByAgent.delete(info.id);
+        (manager as any).resultConsumedByWait.delete(info.id);
+        (manager as any).resultWaitClaimCount.delete(info.id);
+        (manager as any).pendingResultObservations.delete(info.id);
+      }
       manager.unregisterPlatformCallbacks(parentSessionKey);
     }
   });
