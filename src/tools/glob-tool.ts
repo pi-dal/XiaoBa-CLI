@@ -95,8 +95,10 @@ export class GlobTool implements Tool {
       ignore: ['**/node_modules/**', '**/.git/**', '**/dist/**', '**/build/**']
     });
 
+    const resultLabel = include_directories ? '目录项' : '文件';
+
     if (files.length === 0) {
-      return { ok: true, content: `未找到匹配的文件。\n模式: ${pattern}\n目录: ${visibleSearchPath}\nPath: ${visibleCwd}` };
+      return { ok: true, content: `未找到匹配的${resultLabel}。\n模式: ${pattern}\n目录: ${visibleSearchPath}\nPath: ${visibleCwd}` };
     }
 
     // 使用Promise.allSettled容错处理stat（文件可能在glob后被删除）
@@ -123,7 +125,7 @@ export class GlobTool implements Tool {
       durationMs: Date.now() - startTime
     };
 
-    return { ok: true, content: this.formatResult(result, pattern, visibleSearchPath, visibleCwd) };
+    return { ok: true, content: this.formatResult(result, pattern, visibleSearchPath, visibleCwd, resultLabel) };
   }
 
   private formatResult(
@@ -131,12 +133,13 @@ export class GlobTool implements Tool {
     pattern: string,
     visibleSearchPath: string,
     visibleCwd: string,
+    resultLabel: string,
   ): string {
     const { numFiles, filenames, truncated, durationMs } = result;
 
-    const header = `找到 ${numFiles} 个文件 (${durationMs}ms)${truncated ? ' - 结果已截断，考虑使用更精确的模式' : ''}:\n模式: ${pattern}\n目录: ${visibleSearchPath}\nPath: ${visibleCwd}\n\n`;
+    const header = `找到 ${numFiles} 个${resultLabel} (${durationMs}ms)${truncated ? ' - 结果已截断，考虑使用更精确的模式' : ''}:\n模式: ${pattern}\n目录: ${visibleSearchPath}\nPath: ${visibleCwd}\n\n`;
     const fileList = filenames.map((file, i) => `${(i + 1).toString().padStart(4, ' ')}. ${file}`).join('\n');
     
-    return header + fileList + (truncated ? '\n\n提示: 结果被限制在前 100 个文件。使用更具体的路径或模式来缩小范围。' : '');
+    return header + fileList + (truncated ? `\n\n提示: 结果被限制在前 100 个${resultLabel}。使用更具体的路径或模式来缩小范围。` : '');
   }
 }
