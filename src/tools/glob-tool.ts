@@ -22,7 +22,7 @@ export class GlobTool implements Tool {
     description: [
       '按 glob 模式查找文件路径，返回匹配文件列表并按修改时间倒序排列。',
       '适合先定位候选文件；要搜索文件内容请使用 grep。',
-      '当用户问“桌面/下载/文档里有哪些文件”时，先用 resolve_common_directory 解析目录，再用本工具列出文件；不要用 execute_shell 跑 dir/ls。',
+      '当用户问“桌面/下载/文档里有什么/有哪些文件或文件夹”时，先用 resolve_common_directory 解析目录，再用 pattern="*" 且 include_directories=true 列出目录项；不要用 execute_shell 跑 dir/ls。',
     ].join('\n'),
     parameters: {
       type: 'object',
@@ -40,6 +40,11 @@ export class GlobTool implements Tool {
           description: '返回结果最大数量，默认 100。',
           default: 100
         },
+        include_directories: {
+          type: 'boolean',
+          description: '是否包含匹配到的目录。默认 false，保持只返回文件；用户要查看目录里有什么、有哪些文件夹或列目录内容时设为 true。',
+          default: false
+        },
         target: targetParameterDescription()
       },
       required: ['pattern']
@@ -47,7 +52,7 @@ export class GlobTool implements Tool {
   };
 
   async execute(args: any, context: ToolExecutionContext): Promise<ToolExecutionResult> {
-    const { pattern, path: searchPath, limit = 100 } = args;
+    const { pattern, path: searchPath, limit = 100, include_directories = false } = args;
     const startTime = Date.now();
 
     const route = resolveExecutionRoute(context, {
@@ -85,13 +90,15 @@ export class GlobTool implements Tool {
     const files = await glob(pattern, {
       cwd,
       absolute: false,
-      nodir: true,
+      nodir: !include_directories,
       dot: false,
       ignore: ['**/node_modules/**', '**/.git/**', '**/dist/**', '**/build/**']
     });
 
+    const resultLabel = include_directories ? '目录项' : '文件';
+
     if (files.length === 0) {
-      return { ok: true, content: `未找到匹配的文件。\n模式: ${pattern}\n目录: ${visibleSearchPath}\nPath: ${visibleCwd}` };
+      return { ok: true, content: `未找到匹配的${resultLabel}。\n模式: ${pattern}\n目录: ${visibleSearchPath}\nPath: ${visibleCwd}` };
     }
 
     // 使用Promise.allSettled容错处理stat（文件可能在glob后被删除）
@@ -118,7 +125,7 @@ export class GlobTool implements Tool {
       durationMs: Date.now() - startTime
     };
 
-    return { ok: true, content: this.formatResult(result, pattern, visibleSearchPath, visibleCwd) };
+    return { ok: true, content: this.formatResult(result, pattern, visibleSearchPath, visibleCwd, resultLabel) };
   }
 
   private formatResult(
@@ -126,12 +133,13 @@ export class GlobTool implements Tool {
     pattern: string,
     visibleSearchPath: string,
     visibleCwd: string,
+    resultLabel: string,
   ): string {
     const { numFiles, filenames, truncated, durationMs } = result;
 
-    const header = `找到 ${numFiles} 个文件 (${durationMs}ms)${truncated ? ' - 结果已截断，考虑使用更精确的模式' : ''}:\n模式: ${pattern}\n目录: ${visibleSearchPath}\nPath: ${visibleCwd}\n\n`;
+    const header = `找到 ${numFiles} 个${resultLabel} (${durationMs}ms)${truncated ? ' - 结果已截断，考虑使用更精确的模式' : ''}:\n模式: ${pattern}\n目录: ${visibleSearchPath}\nPath: ${visibleCwd}\n\n`;
     const fileList = filenames.map((file, i) => `${(i + 1).toString().padStart(4, ' ')}. ${file}`).join('\n');
     
-    return header + fileList + (truncated ? '\n\n提示: 结果被限制在前 100 个文件。使用更具体的路径或模式来缩小范围。' : '');
+    return header + fileList + (truncated ? `\n\n提示: 结果被限制在前 100 个${resultLabel}。使用更具体的路径或模式来缩小范围。` : '');
   }
 }
