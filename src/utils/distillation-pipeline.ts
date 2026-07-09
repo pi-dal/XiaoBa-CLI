@@ -146,6 +146,12 @@ export interface DistillationPipelineOptions {
    * review decision (promote / needs_review / reject) is appended here.
    */
   reviewOutcomesPath: string;
+  /**
+   * Optional root for branch-style per-unit work logs. Runtime startup passes
+   * `<runtime>/logs/branches/distillation`; tests may omit it to avoid writing
+   * audit logs for pure unit tests.
+   */
+  workLogRoot?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -164,6 +170,7 @@ export class DistillationPipeline {
   private readonly reviewer: ReviewerFn;
   private readonly outputDir: string;
   private readonly reviewOutcomesPath: string;
+  private readonly workLogRoot: string | null;
   private readonly outcomes: ReviewOutcomeEntry[];
 
   constructor(options: DistillationPipelineOptions) {
@@ -171,6 +178,7 @@ export class DistillationPipeline {
     this.reviewer = options.reviewer ?? DEFAULT_REVIEWER;
     this.outputDir = options.outputDir;
     this.reviewOutcomesPath = options.reviewOutcomesPath;
+    this.workLogRoot = options.workLogRoot ?? null;
     this.outcomes = loadReviewOutcomes(this.reviewOutcomesPath);
   }
 
@@ -185,46 +193,116 @@ export class DistillationPipeline {
    *  5. Append a durable review-outcome entry for every decision.
    */
   processUnit(unit: DistillationUnit): PipelineUnitResult {
-    const candidates = this.distiller(unit);
+    const workLogger = new DistillationWorkLogger(this.workLogRoot, unit);
+    workLogger.write('start', {
+      source_file_path: unit.filePath,
+      byte_range: unit.byteRange,
+      new_turns: unit.newTurns.map(turn => turn.turn),
+      continuity_turn_count: unit.continuityTurns.length,
+      generated_at: unit.generatedAt,
+    });
+
     const reviews: PromotionReviewResult[] = [];
     const installations: InstalledSkillSnapshot[] = [];
     const newOutcomes: ReviewOutcomeEntry[] = [];
+    let candidates: DistilledKnowledgeCandidate[] = [];
 
-    for (const candidate of candidates) {
-      const packet = buildPromotionPacket(candidate);
-      const review = this.reviewer(packet);
-      reviews.push(review);
+    try {
+      candidates = this.distiller(unit);
+      workLogger.write('distiller_output', {
+        candidate_count: candidates.length,
+        candidates: candidates.map(summarizeCandidateForLog),
+      });
 
-      let snapshot: InstalledSkillSnapshot | null = null;
-      if (review.decision === 'promote') {
-        snapshot = installPromotedCandidate(candidate, review, this.outputDir);
-        installations.push(snapshot);
+      for (const candidate of candidates) {
+        const packet = buildPromotionPacket(candidate);
+        workLogger.write('promotion_packet', {
+          capability_id: candidate.capabilityId,
+          recommendation: packet.recommendation,
+          provenance_ref_count: packet.provenance.length,
+          reviewer_risks: packet.reviewRisks,
+          solved_loop: packet.solvedLoopEvidence,
+        });
+
+        const review = this.reviewer(packet);
+        reviews.push(review);
+        workLogger.write('review_result', {
+          capability_id: candidate.capabilityId,
+          decision: review.decision,
+          rationale: review.rationale,
+          review_risks: review.reviewRisks,
+          rewrite: review.rewrite,
+          reviewed_at: review.reviewedAt,
+        });
+
+        let snapshot: InstalledSkillSnapshot | null = null;
+        if (review.decision === 'promote') {
+          snapshot = installPromotedCandidate(candidate, review, this.outputDir);
+          installations.push(snapshot);
+          workLogger.write('install_result', {
+            capability_id: candidate.capabilityId,
+            snapshot_id: snapshot.snapshotId,
+            skill_file_path: snapshot.filePath,
+            newly_created: snapshot.newlyCreated,
+            skill_name: snapshot.skillName,
+          });
+        }
+
+        const outcome: ReviewOutcomeEntry = {
+          capabilityId: candidate.capabilityId,
+          decision: review.decision,
+          rationale: review.rationale,
+          reviewedAt: review.reviewedAt,
+          sourceUnit: candidate.sourceUnit,
+        };
+        if (snapshot) {
+          outcome.snapshotId = snapshot.snapshotId;
+          outcome.skillFilePath = snapshot.filePath;
+        }
+        newOutcomes.push(outcome);
       }
 
-      const outcome: ReviewOutcomeEntry = {
-        capabilityId: candidate.capabilityId,
-        decision: review.decision,
-        rationale: review.rationale,
-        reviewedAt: review.reviewedAt,
-        sourceUnit: candidate.sourceUnit,
+      const nextOutcomes = [...this.outcomes, ...newOutcomes];
+      persistReviewOutcomes(this.reviewOutcomesPath, nextOutcomes);
+      this.outcomes.push(...newOutcomes);
+
+      workLogger.write('run_result', {
+        candidate_count: candidates.length,
+        review_counts: countReviewDecisions(reviews),
+        installation_count: installations.length,
+        outcome_count: newOutcomes.length,
+      });
+
+      return {
+        candidates,
+        reviews,
+        installations,
+        outcomes: newOutcomes,
       };
-      if (snapshot) {
-        outcome.snapshotId = snapshot.snapshotId;
-        outcome.skillFilePath = snapshot.filePath;
-      }
-      newOutcomes.push(outcome);
+    } catch (error: any) {
+      workLogger.write('failed', {
+        message: String(error?.message || error || 'unknown error'),
+        name: error?.name,
+        candidate_count: candidates.length,
+        review_count: reviews.length,
+        installation_count: installations.length,
+      });
+      throw error;
+    } finally {
+      workLogger.write('transcript', {
+        unit: {
+          source_file_path: unit.filePath,
+          byte_range: unit.byteRange,
+          new_turns: unit.newTurns.map(turn => turn.turn),
+          continuity_turn_count: unit.continuityTurns.length,
+          generated_at: unit.generatedAt,
+        },
+        candidates: candidates.map(summarizeCandidateForLog),
+        reviews,
+        installations,
+        outcomes: newOutcomes,
+      });
     }
-
-    const nextOutcomes = [...this.outcomes, ...newOutcomes];
-    persistReviewOutcomes(this.reviewOutcomesPath, nextOutcomes);
-    this.outcomes.push(...newOutcomes);
-
-    return {
-      candidates,
-      reviews,
-      installations,
-      outcomes: newOutcomes,
-    };
   }
 
   /** All durable review outcomes recorded so far (promote / needs_review / reject). */
@@ -288,4 +366,74 @@ function persistReviewOutcomes(
  */
 export function defaultDistilledOutputDir(skillsRoot: string): string {
   return path.join(skillsRoot, GENERATED_DISTILLED_DIR_NAME);
+}
+
+// ---------------------------------------------------------------------------
+// Branch-style distillation work logging
+// ---------------------------------------------------------------------------
+
+class DistillationWorkLogger {
+  private readonly filePath: string | null;
+  private readonly branchId: string;
+
+  constructor(workLogRoot: string | null, unit: DistillationUnit) {
+    this.branchId = buildDistillationBranchId(unit);
+    if (!workLogRoot) {
+      this.filePath = null;
+      return;
+    }
+
+    const date = new Date();
+    const dateStr = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
+    const dir = path.join(workLogRoot, dateStr);
+    fs.mkdirSync(dir, { recursive: true });
+    this.filePath = path.join(dir, `${this.branchId}.jsonl`);
+  }
+
+  write(eventType: string, payload: Record<string, unknown> = {}): void {
+    if (!this.filePath) return;
+    const entry = {
+      entry_type: 'branch',
+      branch_type: 'distillation',
+      branch_id: this.branchId,
+      event_type: eventType,
+      timestamp: new Date().toISOString(),
+      ...payload,
+    };
+    try {
+      fs.appendFileSync(this.filePath, JSON.stringify(entry) + '\n');
+    } catch {
+      // Work logs are audit-only. Never fail the distillation pipeline because
+      // branch-style logging could not be written.
+    }
+  }
+}
+
+function buildDistillationBranchId(unit: DistillationUnit): string {
+  const raw = `${unit.filePath}:${unit.byteRange.start}:${unit.byteRange.end}:${unit.generatedAt}`;
+  const hash = Buffer.from(raw).toString('base64url').slice(0, 18);
+  return `distillation-${Date.now().toString(36)}-${hash}`;
+}
+
+function summarizeCandidateForLog(candidate: DistilledKnowledgeCandidate): Record<string, unknown> {
+  return {
+    kind: candidate.kind,
+    capability_id: candidate.capabilityId,
+    title: candidate.title,
+    applicability: candidate.applicability,
+    action_pattern: candidate.actionPattern,
+    boundaries: candidate.boundaries,
+    risks: candidate.risks,
+    solved_loop: candidate.solvedLoop,
+    provenance: candidate.provenance,
+    source_unit: candidate.sourceUnit,
+    generated_at: candidate.generatedAt,
+  };
+}
+
+function countReviewDecisions(reviews: PromotionReviewResult[]): Record<PromotionDecision, number> {
+  return reviews.reduce<Record<PromotionDecision, number>>((counts, review) => {
+    counts[review.decision] += 1;
+    return counts;
+  }, { promote: 0, needs_review: 0, reject: 0 });
 }
