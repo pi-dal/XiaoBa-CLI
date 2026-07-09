@@ -37,9 +37,19 @@ import {
  *                   attention before installation.
  * - `reject`      — the candidate should not be installed.
  */
-export type PromotionDecision = 'promote' | 'needs_review' | 'reject';
+export type PromotionDecision =
+  | 'promote'
+  | 'needs_review'
+  | 'reject'
+  | 'new_capability'
+  | 'append_evidence'
+  | 'supersede_snapshot';
 
-/** Version of the deterministic reviewer logic for retry gating. */
+/**
+ * Version identifier for the deterministic promotion reviewer. Bumps when
+ * the review heuristics change materially, so needs-review retry gating can
+ * detect that a stronger/changed reviewer should revisit queued entries.
+ */
 export const PROMOTION_REVIEWER_VERSION = 'promotion-reviewer-v1';
 
 /**
@@ -125,9 +135,8 @@ export interface PromotionReviewResult {
   rewrite: FaithfulRewrite | null;
   /**
    * Reviewer questions describing what evidence or context is missing.
-   *
-   * Populated for `needs_review` decisions so a later pass knows what to look
-   * for. Empty/absent for `promote` and `reject`.
+   * Populated mainly for `needs_review` decisions so a later retry pass
+   * knows what to look for.
    */
   questions?: string[];
   /** ISO timestamp of the review. */
