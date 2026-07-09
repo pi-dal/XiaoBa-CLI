@@ -50,6 +50,8 @@ export async function startRuntimeCommandSupport(
         const pipeline = new DistillationPipeline({
           outputDir: defaultDistilledOutputDir(PathResolver.getSkillsPath()),
           reviewOutcomesPath: config.reviewOutcomesPath,
+          needsReviewQueuePath: config.needsReviewQueuePath,
+          capabilityRegistryPath: config.capabilityRegistryPath,
           workLogRoot: config.workLogRoot,
         });
         distillationPipeline = pipeline;

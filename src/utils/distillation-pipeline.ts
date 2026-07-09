@@ -10,11 +10,25 @@ import {
 } from './capability-distiller';
 import {
   buildPromotionPacket,
+  PROMOTION_REVIEWER_VERSION,
   PromotionDecision,
   PromotionPacket,
   PromotionReviewResult,
   reviewPromotionPacket,
 } from './promotion-reviewer';
+import {
+  CapabilityRegistryState,
+  emptyCapabilityRegistryState,
+  loadCapabilityRegistry,
+} from './capability-registry';
+import { prefilterCapabilities } from './capability-prefilter';
+import {
+  addNeedsReviewEntry,
+  loadNeedsReviewQueue,
+  NeedsReviewQueueEntry,
+  NeedsReviewQueueState,
+  saveNeedsReviewQueue,
+} from './needs-review-queue';
 import {
   GENERATED_DISTILLED_DIR_NAME,
   installPromotedCandidate,
@@ -123,6 +137,8 @@ export interface PipelineUnitResult {
   installations: InstalledSkillSnapshot[];
   /** Durable review-outcome entries written this run. */
   outcomes: ReviewOutcomeEntry[];
+  /** Needs-review queue entries written this run. */
+  needsReviewEntries: NeedsReviewQueueEntry[];
 }
 
 export interface DistillationPipelineOptions {
@@ -147,6 +163,23 @@ export interface DistillationPipelineOptions {
    */
   reviewOutcomesPath: string;
   /**
+   * Optional path to the durable needs-review queue state file. When provided,
+   * every `needs_review` decision is enqueued without mutating the Capability
+   * Registry.
+   */
+  needsReviewQueuePath?: string;
+  /**
+   * Optional path to the Capability Registry current-state file. The pipeline
+   * reads this file to compute matched capability IDs and registry-state
+   * fingerprints for needs-review queue entries.
+   */
+  capabilityRegistryPath?: string;
+  /**
+   * Reviewer version used for needs-review retry gating. Defaults to the
+   * deterministic reviewer version exported by promotion-reviewer.
+   */
+  reviewerVersion?: string;
+  /**
    * Optional root for branch-style per-unit work logs. Runtime startup passes
    * `<runtime>/logs/branches/distillation`; tests may omit it to avoid writing
    * audit logs for pure unit tests.
@@ -170,6 +203,9 @@ export class DistillationPipeline {
   private readonly reviewer: ReviewerFn;
   private readonly outputDir: string;
   private readonly reviewOutcomesPath: string;
+  private readonly needsReviewQueuePath: string | null;
+  private readonly capabilityRegistryPath: string | null;
+  private readonly reviewerVersion: string;
   private readonly workLogRoot: string | null;
   private readonly outcomes: ReviewOutcomeEntry[];
 
@@ -178,6 +214,9 @@ export class DistillationPipeline {
     this.reviewer = options.reviewer ?? DEFAULT_REVIEWER;
     this.outputDir = options.outputDir;
     this.reviewOutcomesPath = options.reviewOutcomesPath;
+    this.needsReviewQueuePath = options.needsReviewQueuePath ?? null;
+    this.capabilityRegistryPath = options.capabilityRegistryPath ?? null;
+    this.reviewerVersion = options.reviewerVersion ?? PROMOTION_REVIEWER_VERSION;
     this.workLogRoot = options.workLogRoot ?? null;
     this.outcomes = loadReviewOutcomes(this.reviewOutcomesPath);
   }
@@ -205,7 +244,12 @@ export class DistillationPipeline {
     const reviews: PromotionReviewResult[] = [];
     const installations: InstalledSkillSnapshot[] = [];
     const newOutcomes: ReviewOutcomeEntry[] = [];
+    const needsReviewEntries: NeedsReviewQueueEntry[] = [];
     let candidates: DistilledKnowledgeCandidate[] = [];
+    const needsReviewQueue = this.needsReviewQueuePath
+      ? loadNeedsReviewQueue(this.needsReviewQueuePath)
+      : null;
+    const capabilityRegistry = this.loadCurrentCapabilityRegistry();
 
     try {
       candidates = this.distiller(unit);
@@ -248,6 +292,27 @@ export class DistillationPipeline {
           });
         }
 
+        if (review.decision === 'needs_review' && needsReviewQueue) {
+          const prefilterResult = prefilterCapabilities(candidate, capabilityRegistry);
+          const entry = addNeedsReviewEntry(needsReviewQueue, {
+            packet,
+            review,
+            matchedCapabilityIds: prefilterResult.matches.map(match => match.capabilityId),
+            registry: capabilityRegistry,
+            reviewerVersion: this.reviewerVersion,
+            createdAt: review.reviewedAt,
+          });
+          needsReviewEntries.push(entry);
+          workLogger.write('needs_review_queue_entry', {
+            capability_id: candidate.capabilityId,
+            entry_id: entry.entryId,
+            matched_capability_ids: entry.matchedCapabilityIds,
+            evidence_fingerprint: entry.evidenceFingerprint,
+            registry_state_fingerprint: entry.registryStateFingerprint,
+            reviewer_version: entry.reviewerVersion,
+          });
+        }
+
         const outcome: ReviewOutcomeEntry = {
           capabilityId: candidate.capabilityId,
           decision: review.decision,
@@ -263,6 +328,9 @@ export class DistillationPipeline {
       }
 
       const nextOutcomes = [...this.outcomes, ...newOutcomes];
+      if (needsReviewQueue && this.needsReviewQueuePath) {
+        saveNeedsReviewQueue(this.needsReviewQueuePath, needsReviewQueue);
+      }
       persistReviewOutcomes(this.reviewOutcomesPath, nextOutcomes);
       this.outcomes.push(...newOutcomes);
 
@@ -271,6 +339,7 @@ export class DistillationPipeline {
         review_counts: countReviewDecisions(reviews),
         installation_count: installations.length,
         outcome_count: newOutcomes.length,
+        needs_review_queue_entry_count: needsReviewEntries.length,
       });
 
       return {
@@ -278,6 +347,7 @@ export class DistillationPipeline {
         reviews,
         installations,
         outcomes: newOutcomes,
+        needsReviewEntries,
       };
     } catch (error: any) {
       workLogger.write('failed', {
@@ -286,6 +356,7 @@ export class DistillationPipeline {
         candidate_count: candidates.length,
         review_count: reviews.length,
         installation_count: installations.length,
+        needs_review_queue_entry_count: needsReviewEntries.length,
       });
       throw error;
     } finally {
@@ -301,6 +372,7 @@ export class DistillationPipeline {
         reviews,
         installations,
         outcomes: newOutcomes,
+        needs_review_entries: needsReviewEntries,
       });
     }
   }
@@ -308,6 +380,13 @@ export class DistillationPipeline {
   /** All durable review outcomes recorded so far (promote / needs_review / reject). */
   getReviewOutcomes(): ReviewOutcomeEntry[] {
     return [...this.outcomes];
+  }
+
+  private loadCurrentCapabilityRegistry(): CapabilityRegistryState {
+    if (!this.capabilityRegistryPath) {
+      return emptyCapabilityRegistryState();
+    }
+    return loadCapabilityRegistry(this.capabilityRegistryPath);
   }
 }
 

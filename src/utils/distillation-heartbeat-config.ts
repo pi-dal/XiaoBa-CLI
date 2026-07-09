@@ -32,6 +32,10 @@ export interface DistillationHeartbeatConfig {
   heartbeatRecordPath: string;
   /** Path to the durable review-outcomes log (promote/needs_review/reject). */
   reviewOutcomesPath: string;
+  /** Path to the durable needs-review queue state file. */
+  needsReviewQueuePath: string;
+  /** Path to the durable Capability Registry state file. */
+  capabilityRegistryPath: string;
   /** Root directory for branch-style distillation work logs. */
   workLogRoot: string;
 }
@@ -150,6 +154,18 @@ export function getDistillationHeartbeatConfig(
     readEnv(runtimeEnv, 'DISTILLATION_HEARTBEAT_REVIEW_OUTCOMES_FILE'),
     'data/distillation-review-outcomes.json',
   );
+  const needsReviewQueuePath = resolveContainedPath(
+    workingDirectory,
+    'data',
+    readEnv(runtimeEnv, 'DISTILLATION_HEARTBEAT_NEEDS_REVIEW_QUEUE_FILE'),
+    'data/needs-review-queue-state.json',
+  );
+  const capabilityRegistryPath = resolveContainedPath(
+    workingDirectory,
+    'data',
+    readEnv(runtimeEnv, 'DISTILLATION_HEARTBEAT_CAPABILITY_REGISTRY_FILE'),
+    'data/capability-registry-state.json',
+  );
   const workLogRoot = resolveContainedPath(
     workingDirectory,
     'logs',
@@ -164,6 +180,8 @@ export function getDistillationHeartbeatConfig(
     stateFilePath,
     heartbeatRecordPath,
     reviewOutcomesPath,
+    needsReviewQueuePath,
+    capabilityRegistryPath,
     workLogRoot,
   };
 }
