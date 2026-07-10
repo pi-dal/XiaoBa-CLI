@@ -429,6 +429,71 @@ describe('DistillationPipeline V2 consolidation state wiring (issue #20)', () =>
     );
   });
 
+  test('does not swallow an independent fallback candidate with unchanged provenance', () => {
+    env.teardown();
+
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'xiaoba-pipeline-v2-matching-'));
+    const outputDir = path.join(root, 'skills', 'generated-distilled');
+    const reviewOutcomesPath = path.join(root, 'data', 'review-outcomes.json');
+    const registryPath = path.join(root, 'data', 'capability-registry.json');
+    const queuePath = path.join(root, 'data', 'needs-review-queue.json');
+    let pass = 0;
+    let reviewerCalls = 0;
+
+    const pipeline = new DistillationPipeline({
+      outputDir,
+      reviewOutcomesPath,
+      capabilityRegistryPath: registryPath,
+      needsReviewQueuePath: queuePath,
+      distiller: () => {
+        pass += 1;
+        const candidate = fixtureCandidate(
+          makeUnit(),
+          pass === 1 ? 'cap-v2-needs-review' : 'cap-v2-reject',
+        );
+        if (pass === 2) {
+          candidate.solvedLoop = {
+            ...candidate.solvedLoop,
+            noCorrection: 'Independent candidate metadata with the same source evidence.',
+          };
+        }
+        return [candidate];
+      },
+      reviewer: packet => {
+        reviewerCalls += 1;
+        const decision: PromotionDecision =
+          packet.candidate.capabilityId === 'cap-v2-needs-review'
+            ? 'needs_review'
+            : 'reject';
+        return {
+          schemaVersion: 1,
+          capabilityId: packet.candidate.capabilityId,
+          decision,
+          rationale: `Fixture reviewer decision: ${decision}`,
+          reviewRisks: [],
+          rewrite: null,
+          reviewedAt: `2026-07-10T0${reviewerCalls}:00:00.000Z`,
+        };
+      },
+    });
+
+    try {
+      const first = pipeline.processUnit(makeUnit());
+      const second = pipeline.processUnit(makeUnit());
+
+      assert.equal(first.reviews.length, 1);
+      assert.equal(first.reviews[0]!.decision, 'needs_review');
+      assert.equal(reviewerCalls, 2, 'the independent candidate reaches the reviewer');
+      assert.equal(second.reviews.length, 1);
+      assert.equal(second.reviews[0]!.decision, 'reject');
+      assert.equal(second.outcomes.length, 1);
+      assert.equal(second.outcomes[0]!.capabilityId, 'cap-v2-reject');
+      assert.equal(second.outcomes[0]!.decision, 'reject');
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test('reject writes a review outcome without mutating registry state or installing a skill', () => {
     const registryBefore = loadCapabilityRegistry(env.registryPath);
 

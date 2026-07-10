@@ -508,8 +508,9 @@ export function findPendingEntryByCapabilityId(
  * repeated occurrences of the same solved loop can refresh one durable queue
  * entry even when the distiller emits per-occurrence capability identities.
  * Exact capability matches require new provenance. Fallback matches require
- * matching guidance plus a changed evidence fingerprint before refreshing an
- * existing queue entry.
+ * matching guidance plus new provenance before refreshing an existing queue
+ * entry, so changed candidate metadata alone cannot suppress an independent
+ * review.
  */
 export function findPendingEntryForCandidate(
   state: NeedsReviewQueueState,
@@ -530,7 +531,7 @@ export function findPendingEntryForCandidate(
       normalizeMatcherText(e.candidatePayload.solvedLoop.problem) === normalizedProblem &&
       normalizeMatcherText(e.candidatePayload.solvedLoop.action) === normalizedAction &&
       normalizeMatcherText(e.candidatePayload.solvedLoop.verification) === normalizedVerification &&
-      matchingCandidateAddsEvidence(e, candidate)
+      candidateAddsNewProvenance(e, candidate)
     );
   });
   if (candidates.length === 0) return undefined;
@@ -606,15 +607,6 @@ export function refreshQueueEntryWithMatchingEvidence(
   };
   entry.updatedAt = input.updatedAt;
   return entry;
-}
-
-function matchingCandidateAddsEvidence(
-  entry: NeedsReviewQueueEntry,
-  candidate: DistilledKnowledgeCandidate,
-): boolean {
-  return computeEvidenceFingerprintFromCandidate(
-    mergeMatchingCandidateEvidence(entry, candidate),
-  ) !== entry.evidenceFingerprint;
 }
 
 function mergeMatchingCandidateEvidence(
