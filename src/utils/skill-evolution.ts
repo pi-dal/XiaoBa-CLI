@@ -10,6 +10,7 @@ import { PathResolver } from './path-resolver';
 import { SkillParser } from '../skills/skill-parser';
 import {
   addOrUpdateOperationalFailure,
+  findDeferByBundleId,
   findOperationalByBundleId,
   popDueOperationalEntries,
   getDueDeferredEntries,
@@ -413,6 +414,15 @@ export class SkillEvolutionRuntime {
   async reviewAndApply(bundle: EvidenceBundle): Promise<SkillEvolutionResult> {
     const { result } = await this.reviewAndApplyWithRetries(bundle);
     return result;
+  }
+
+  getQueuedReviewKind(bundleId: string): 'deferred' | 'operational' | undefined {
+    const queuePath = this.options.reviewQueuePath;
+    if (!queuePath) return undefined;
+    const queue = loadReviewQueueState(queuePath);
+    if (findDeferByBundleId(queue, bundleId)) return 'deferred';
+    if (findOperationalByBundleId(queue, bundleId)) return 'operational';
+    return undefined;
   }
 
   private async reviewAndApplyWithRetries(

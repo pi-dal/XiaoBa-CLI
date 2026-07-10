@@ -49,6 +49,7 @@ interface LegacyParsedSkill {
 }
 
 let inFlightBootstrap = new Map<string, Promise<LegacyDistilledBootstrapResult[]>>();
+const MAX_LEGACY_SOURCE_EVIDENCE_BYTES = 16 * 1024;
 
 export async function bootstrapLegacyDistilledSkillsOnce(
   options: LegacyDistilledBootstrapOptions,
@@ -103,6 +104,17 @@ async function bootstrapLegacyDistilledSkills(
     }
 
     const bundle = buildBootstrapBundle(parsed, options.skillEvolution, now);
+    const pendingQueue = options.skillEvolution.getQueuedReviewKind(bundle.bundleId);
+    if (pendingQueue) {
+      results.push({
+        filePath,
+        bundleId: bundle.bundleId,
+        transition: pendingQueue === 'deferred' ? 'defer' : 'reject_candidate',
+        queued: pendingQueue,
+        deleted: false,
+      });
+      continue;
+    }
     const committedTransition = committedTransitions.get(bundle.bundleId);
     if (committedTransition && shouldDeleteArtifact(committedTransition)) {
       try {
@@ -272,6 +284,7 @@ function buildBootstrapBundle(
   };
 
   const [completion, settlement] = buildLegacyEvidenceRefs(legacy);
+  const sourceEvidence = buildLegacySourceEvidence(legacy, completion, settlement);
 
   const bundleIdInput = [legacy.filePath, legacy.capabilityId, legacy.sourceFilePath].join('::');
   const bundleId = `legacy-v3:${crypto.createHash('sha256').update(bundleIdInput).digest('hex').slice(0, 16)}`;
@@ -292,34 +305,7 @@ function buildBootstrapBundle(
     boundedContinuity: [],
     referencedSkills: skillEvolution.getReferencedSkillSnapshots(),
     relatedCurrentSkills,
-    sourceEvidence: [
-      {
-        ref: completion,
-        sourceFilePath: legacy.sourceFilePath,
-        turn: legacy.provenanceTurns[0]?.turn,
-        byteRange: candidate.provenance[0]?.unitByteRange,
-        role: 'problem-action',
-        content: JSON.stringify({
-          capabilityId: legacy.capabilityId,
-          title: legacy.title,
-          source: 'legacy distilled skill artifact bootstrap',
-          parsedAt: now(),
-        }),
-      },
-      {
-        ref: settlement,
-        sourceFilePath: legacy.sourceFilePath,
-        turn: legacy.provenanceTurns[1]?.turn,
-        byteRange: candidate.provenance[1]?.unitByteRange,
-        role: 'verification',
-        content: JSON.stringify({
-          capabilityId: legacy.capabilityId,
-          title: legacy.title,
-          source: 'legacy distilled skill artifact bootstrap',
-          parsedAt: now(),
-        }),
-      },
-    ] as BoundedSourceEvidence[],
+    sourceEvidence,
   };
 }
 
@@ -347,6 +333,70 @@ function buildLegacyEvidenceRefs(legacy: LegacyParsedSkill): [string, string] {
     : settlementRef;
 
   return [distinctCompletion, distinctSettlement];
+}
+
+function buildLegacySourceEvidence(
+  legacy: LegacyParsedSkill,
+  completionRef: string,
+  settlementRef: string,
+): BoundedSourceEvidence[] {
+  return [
+    makeBoundedSourceEvidence(
+      legacy.provenanceTurns[0] ?? {
+        turn: 1,
+        role: 'problem-action',
+        start: legacy.sourceByteRange.start,
+        end: legacy.sourceByteRange.end,
+        sourceFilePath: legacy.sourceFilePath,
+      },
+      completionRef,
+      'problem-action',
+    ),
+    makeBoundedSourceEvidence(
+      legacy.provenanceTurns[1] ?? {
+        turn: 2,
+        role: 'verification',
+        start: legacy.sourceByteRange.start,
+        end: legacy.sourceByteRange.end,
+        sourceFilePath: legacy.sourceFilePath,
+      },
+      settlementRef,
+      'verification',
+    ),
+  ];
+}
+
+function makeBoundedSourceEvidence(
+  provenance: LegacyParsedSkill['provenanceTurns'][number],
+  ref: string,
+  role: BoundedSourceEvidence['role'],
+): BoundedSourceEvidence {
+  return {
+    ref,
+    sourceFilePath: provenance.sourceFilePath,
+    turn: provenance.turn,
+    byteRange: { start: provenance.start, end: provenance.end },
+    role,
+    content: readBoundedLegacySource(provenance.sourceFilePath, provenance.start, provenance.end),
+  };
+}
+
+function readBoundedLegacySource(sourceFilePath: string, start: number, end: number): string {
+  const offset = Math.max(0, start);
+  const length = Math.min(MAX_LEGACY_SOURCE_EVIDENCE_BYTES, Math.max(0, end - offset));
+  if (length === 0) return '';
+
+  let descriptor: number | undefined;
+  try {
+    descriptor = fs.openSync(sourceFilePath, 'r');
+    const buffer = Buffer.alloc(length);
+    const bytesRead = fs.readSync(descriptor, buffer, 0, length, offset);
+    return buffer.subarray(0, bytesRead).toString('utf-8');
+  } catch {
+    return '';
+  } finally {
+    if (descriptor !== undefined) fs.closeSync(descriptor);
+  }
 }
 
 function makeEvidenceRef(

@@ -8,8 +8,10 @@ import {
   findDeferByBundleId,
   findOperationalByBundleId,
   loadReviewQueueState,
+  markDeferredEntryExplicitRetry,
+  saveReviewQueueState,
 } from '../src/utils/skill-evolution-review-queue';
-import { loadCurrentSkillRegistry, SkillEvolutionRuntime } from '../src/utils/skill-evolution';
+import { EvidenceBundle, loadCurrentSkillRegistry, SkillEvolutionRuntime } from '../src/utils/skill-evolution';
 
 type LegacyOutcome = 'adopt' | 'improve' | 'merge' | 'retire' | 'defer' | 'reject' | 'operational';
 
@@ -95,7 +97,11 @@ describe('Legacy distilled skill bootstrap (issue #40)', () => {
 
   test('keeps deferred legacy generated skill until later evidence triggers re-review', async () => {
     const artifactPath = writeLegacyDistilledArtifact(artifacts.generatedRoot, 'cap-defer', 'snap-defer');
-    const runtime = buildRuntime(artifacts, { 'cap-defer': 'defer' });
+    const outcomes: Record<string, LegacyOutcome> = { 'cap-defer': 'defer' };
+    let authorCalls = 0;
+    const runtime = buildRuntime(artifacts, outcomes, () => {
+      authorCalls++;
+    });
 
     const results = await bootstrapLegacyDistilledSkillsOnce({
       skillEvolution: runtime,
@@ -110,6 +116,44 @@ describe('Legacy distilled skill bootstrap (issue #40)', () => {
     const queue = loadReviewQueueState(artifacts.reviewQueuePath);
     const queued = findDeferByBundleId(queue, results[0]!.bundleId);
     assert.ok(queued, 'deferred entry is written to review queue');
+
+    const repeated = await bootstrapLegacyDistilledSkillsOnce({
+      skillEvolution: runtime,
+      generatedDistilledRoot: artifacts.generatedRoot,
+    });
+    assert.equal(repeated[0]!.queued, 'deferred');
+    assert.equal(repeated[0]!.deleted, false);
+    assert.equal(authorCalls, 1, 'pending deferred work is not reassessed during bootstrap');
+
+    markDeferredEntryExplicitRetry(queue, queued!.entryId);
+    saveReviewQueueState(artifacts.reviewQueuePath, queue);
+    outcomes['cap-defer'] = 'adopt';
+    await runtime.reviewDueQueueEntries();
+
+    const afterReview = await bootstrapLegacyDistilledSkillsOnce({
+      skillEvolution: runtime,
+      generatedDistilledRoot: artifacts.generatedRoot,
+    });
+    assert.equal(afterReview[0]!.deleted, true);
+    assert.equal(fs.existsSync(artifactPath), false);
+    assert.equal(authorCalls, 2, 'eligible deferred work is reassessed by the V3 queue');
+  });
+
+  test('reads bounded provenance logs into source evidence', async () => {
+    writeLegacyDistilledArtifact(artifacts.generatedRoot, 'cap-source-evidence', 'snap-source-evidence');
+    let authoredBundle: EvidenceBundle | undefined;
+    const runtime = buildRuntime(artifacts, { 'cap-source-evidence': 'adopt' }, bundle => {
+      authoredBundle = bundle;
+    });
+
+    await bootstrapLegacyDistilledSkillsOnce({
+      skillEvolution: runtime,
+      generatedDistilledRoot: artifacts.generatedRoot,
+    });
+
+    assert.ok(authoredBundle?.sourceEvidence);
+    assert.match(authoredBundle!.sourceEvidence![0]!.content, /^problem-action evidence:/u);
+    assert.match(authoredBundle!.sourceEvidence![1]!.content, /verification evidence:/u);
   });
 
   test('improves an adopted current skill and removes the legacy artifact', async () => {
@@ -224,7 +268,11 @@ describe('Legacy distilled skill bootstrap (issue #40)', () => {
 
   test('keeps legacy generated skill after operational bootstrap failure', async () => {
     const artifactPath = writeLegacyDistilledArtifact(artifacts.generatedRoot, 'cap-operational', 'snap-operational');
-    const runtime = buildRuntime(artifacts, { 'cap-operational': 'operational' });
+    const outcomes: Record<string, LegacyOutcome> = { 'cap-operational': 'operational' };
+    let authorCalls = 0;
+    const runtime = buildRuntime(artifacts, outcomes, () => {
+      authorCalls++;
+    });
 
     const results = await bootstrapLegacyDistilledSkillsOnce({
       skillEvolution: runtime,
@@ -241,13 +289,35 @@ describe('Legacy distilled skill bootstrap (issue #40)', () => {
     const queued = findOperationalByBundleId(queue, results[0]!.bundleId);
     assert.ok(queued, 'operational entry is written to review queue');
     assert.equal(queued!.attempts, 1);
+
+    const repeated = await bootstrapLegacyDistilledSkillsOnce({
+      skillEvolution: runtime,
+      generatedDistilledRoot: artifacts.generatedRoot,
+    });
+    assert.equal(repeated[0]!.queued, 'operational');
+    assert.equal(authorCalls, 1, 'operational retry waits for the V3 backoff window');
+
+    queue.operational = queue.operational.map(entry => entry.bundleId === queued!.bundleId
+      ? { ...entry, nextRetryAt: new Date(0).toISOString() }
+      : entry);
+    saveReviewQueueState(artifacts.reviewQueuePath, queue);
+    outcomes['cap-operational'] = 'adopt';
+    await runtime.reviewDueQueueEntries();
+
+    const afterRetry = await bootstrapLegacyDistilledSkillsOnce({
+      skillEvolution: runtime,
+      generatedDistilledRoot: artifacts.generatedRoot,
+    });
+    assert.equal(afterRetry[0]!.deleted, true);
+    assert.equal(fs.existsSync(artifactPath), false);
+    assert.equal(authorCalls, 2, 'due operational work is retried by the V3 queue');
   });
 });
 
 function buildRuntime(
   artifacts: RuntimeArtifacts,
   outcomes: Record<string, LegacyOutcome>,
-  onAuthor?: () => void,
+  onAuthor?: (bundle: EvidenceBundle) => void,
 ): SkillEvolutionRuntime {
   return new SkillEvolutionRuntime({
     workingDirectory: artifacts.root,
@@ -257,7 +327,7 @@ function buildRuntime(
     journalPath: artifacts.journalPath,
     reviewQueuePath: artifacts.reviewQueuePath,
     authorFixture: ({ bundle }) => {
-      onAuthor?.();
+      onAuthor?.(bundle);
       const candidate = bundle.episode as { capabilityId: string };
       const safeName = candidate.capabilityId.replace(/[^a-z0-9-]+/giu, '-');
       const outcome = outcomes[candidate.capabilityId] ?? 'adopt';
@@ -349,6 +419,10 @@ function acceptedTransition(
 function writeLegacyDistilledArtifact(baseDir: string, capabilityId: string, snapshotId: string): string {
   const sourceFilePath = path.join(baseDir, 'session.jsonl');
   const filePath = path.join(baseDir, capabilityId, snapshotId, 'SKILL.md');
+  const sourceLog = [
+    `problem-action evidence: ${'x'.repeat(36)}`,
+    `verification evidence: ${'y'.repeat(48)}`,
+  ].join('\n');
   const markdown = `---
 name: "distilled-${snapshotId}"
 description: "Legacy capability for ${capabilityId}"
@@ -395,6 +469,7 @@ This is synthetic test data for bootstrap reassessment.
 - "${sourceFilePath}" turn 2 (verification) — byte range 61-120
 `;
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  fs.writeFileSync(sourceFilePath, sourceLog, { encoding: 'utf-8' });
   fs.writeFileSync(filePath, markdown, { encoding: 'utf-8' });
   return filePath;
 }
