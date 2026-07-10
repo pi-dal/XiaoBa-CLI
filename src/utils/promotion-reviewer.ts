@@ -1,15 +1,32 @@
+import * as fs from 'fs';
+import * as path from 'path';
 import {
   CapabilityProvenanceRef,
   DistilledKnowledgeCandidate,
   SolvedLoopEvidence,
 } from './capability-distiller';
+import {
+  CapabilityPrefilterMatch,
+  prefilterCapabilities,
+} from './capability-prefilter';
+import {
+  CapabilityRegistryState,
+  EvidenceRef,
+} from './capability-registry';
 
 /**
- * Promotion Reviewer (issue #4).
+ * Promotion Reviewer (issue #4, #27, #28).
  *
  * Reviews a Promotion Packet built from a capability candidate, solved-loop
  * evidence, risks, and provenance refs, and returns one of `promote`,
  * `needs_review`, or `reject` with review rationale.
+ *
+ * When the packet carries an optional V2 Capability Registry context, the
+ * reviewer also performs registry-aware consolidation: a candidate with no
+ * related capability becomes `new_capability`, equivalent guidance appends
+ * evidence, and a material action-pattern or boundary change produces
+ * `supersede_snapshot`. This exposes the matched capability's Active Snapshot
+ * and traceable evidence refs to the reviewer so the decision is auditable.
  *
  * The reviewer may perform a **Faithful Rewrite** — editing structured fields
  * to improve wording or structure — but it must **not** add capability claims
@@ -50,7 +67,7 @@ export type PromotionDecision =
  * the review heuristics change materially, so needs-review retry gating can
  * detect that a stronger/changed reviewer should revisit queued entries.
  */
-export const PROMOTION_REVIEWER_VERSION = 'promotion-reviewer-v1';
+export const PROMOTION_REVIEWER_VERSION = 'promotion-reviewer-v2';
 
 /**
  * Risks surfaced during review that are independent of the candidate's own
@@ -61,6 +78,20 @@ export interface ReviewerRisk {
   label: string;
   /** Human-readable explanation. */
   detail: string;
+}
+
+/**
+ * V2 Capability Registry context exposed to the reviewer so it can compare a
+ * candidate against the Active Snapshot and traceable evidence of a matched
+ * capability. This is the registry-aware consolidation input for issue #28.
+ */
+export interface RegistryPromotionContext {
+  /** Top related capabilities returned by the Capability Prefilter. */
+  matches: CapabilityPrefilterMatch[];
+  /** Active snapshot SKILL.md content keyed by capabilityId. */
+  activeSnapshotContents: Record<string, string>;
+  /** Evidence refs for each matched capability (traceable sources). */
+  evidenceRefsByCapability: Record<string, EvidenceRef[]>;
 }
 
 /**
@@ -83,6 +114,12 @@ export interface PromotionPacket {
   reviewRisks: ReviewerRisk[];
   /** Preliminary recommendation before the reviewer decides. */
   recommendation: 'promote' | 'needs_review' | 'reject';
+  /**
+   * Optional V2 Capability Registry context for consolidation decisions. When
+   * present, the reviewer compares the candidate against matched capabilities'
+   * Active Snapshots and traceable evidence refs.
+   */
+  registryContext?: RegistryPromotionContext;
 }
 
 export interface BuildPromotionPacketOptions {
@@ -92,6 +129,8 @@ export interface BuildPromotionPacketOptions {
   provenance?: CapabilityProvenanceRef[];
   /** Reviewer-observed risks to carry into the packet. */
   reviewRisks?: ReviewerRisk[];
+  /** Optional V2 Capability Registry context for consolidation decisions. */
+  registryContext?: RegistryPromotionContext;
 }
 
 /**
@@ -141,6 +180,12 @@ export interface PromotionReviewResult {
   questions?: string[];
   /** ISO timestamp of the review. */
   reviewedAt: string;
+  /**
+   * V2 consolidation target: the registry capability this decision appends
+   * evidence to or supersedes the Active Snapshot of. Absent when the decision
+   * is not registry-backed or the candidate is new.
+   */
+  targetCapabilityId?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -198,6 +243,7 @@ export function buildPromotionPacket(
     provenance,
     reviewRisks,
     recommendation,
+    registryContext: options.registryContext,
   };
 }
 
@@ -212,6 +258,13 @@ export function buildPromotionPacket(
  * supported by the supplied provenance and solved-loop evidence, performs a
  * Faithful Rewrite where useful, and returns one of `promote`, `needs_review`,
  * or `reject` with rationale.
+ *
+ * When the packet includes a V2 Capability Registry context, a candidate that
+ * would otherwise be promoted is further consolidated: `new_capability` for
+ * an unrelated candidate, `append_evidence` for equivalent guidance, or
+ * `supersede_snapshot` for a material action-pattern or boundary change. The
+ * prior Active Snapshot and its traceable evidence refs are exposed in the
+ * context for this decision.
  *
  * Decision logic:
  *  - **reject**      — essential evidence is missing, provenance is empty or
@@ -342,14 +395,52 @@ export function reviewPromotionPacket(packet: PromotionPacket): PromotionReviewR
     );
   }
 
-  // All checks pass → promote.
-  return makeResult(
-    candidate.capabilityId,
-    'promote',
-    'All checks passed: solved-loop evidence is complete, provenance is sufficient, and no unsupported claims were detected.',
-    [...risks, ...packet.reviewRisks],
+  // All checks pass → promote, or perform V2 registry-aware consolidation when
+  // a Capability Registry context is present.
+  const baseRisks = [...risks, ...packet.reviewRisks];
+  const finalDecision = packet.registryContext
+    ? consolidateWithRegistry(packet, baseRisks, rewrite)
+    : 'promote';
+
+  if (finalDecision === 'needs_review') {
+    return makeResult(
+      candidate.capabilityId,
+      'needs_review',
+      'Registry-aware consolidation could not safely compare the candidate against the active snapshot; held for review.',
+      baseRisks,
+      hasRewrite(rewrite) ? rewrite : null,
+      [
+        'Could the active snapshot content be read from disk?',
+        'Is the action-pattern or boundary change intentional and well-supported by evidence?',
+      ],
+    );
+  }
+
+  // For registry-backed append/supersede the decision is about the matched
+  // registry capability, so the review identity is the target capabilityId.
+  // This keeps the reviewer's `capabilityId` aligned with the immutable snapshot
+  // install path and the registry transition target.
+  const consolidationTarget =
+    packet.registryContext && finalDecision !== 'promote' && finalDecision !== 'new_capability'
+      ? selectConsolidationTarget(packet.registryContext, candidate)
+      : undefined;
+  const reviewCapabilityId = consolidationTarget
+    ? consolidationTarget.capabilityId
+    : candidate.capabilityId;
+
+  const rationale = buildConsolidationRationale(finalDecision, packet, consolidationTarget);
+  const result = makeResult(
+    reviewCapabilityId,
+    finalDecision,
+    rationale,
+    baseRisks,
     hasRewrite(rewrite) ? rewrite : null,
   );
+  if (consolidationTarget) {
+    result.targetCapabilityId = consolidationTarget.capabilityId;
+  }
+
+  return result;
 }
 
 // ---------------------------------------------------------------------------
@@ -627,4 +718,290 @@ function makeResult(
     result.questions = questions;
   }
   return result;
+}
+
+// ---------------------------------------------------------------------------
+// Internal: V2 registry-aware consolidation (issue #28)
+// ---------------------------------------------------------------------------
+
+/**
+ * Build a RegistryPromotionContext for a candidate by running the Capability
+ * Prefilter against the registry and reading each matched capability's Active
+ * Snapshot from disk. This exposes the Active Snapshot and traceable evidence
+ * refs to the reviewer without giving the reviewer direct registry mutation
+ * access.
+ */
+export function buildRegistryPromotionContext(
+  candidate: DistilledKnowledgeCandidate,
+  registry: CapabilityRegistryState,
+  outputDir: string,
+): RegistryPromotionContext {
+  const prefilterResult = prefilterCapabilities(candidate, registry, { limit: 5 });
+  const activeSnapshotContents: Record<string, string> = {};
+  const evidenceRefsByCapability: Record<string, EvidenceRef[]> = {};
+
+  for (const match of prefilterResult.matches) {
+    const entry = registry.capabilities[match.capabilityId];
+    if (!entry) continue;
+
+    const snapshotPath = path.join(
+      outputDir,
+      entry.capabilityId,
+      entry.activeSnapshotId,
+      'SKILL.md',
+    );
+    try {
+      if (fs.existsSync(snapshotPath)) {
+        activeSnapshotContents[entry.capabilityId] = fs.readFileSync(snapshotPath, 'utf-8');
+      }
+    } catch {
+      // Snapshot is unreadable; leave content absent so the reviewer can fall
+      // back to needs_review rather than guessing.
+    }
+    evidenceRefsByCapability[entry.capabilityId] = entry.evidenceRefs;
+  }
+
+  return {
+    matches: prefilterResult.matches,
+    activeSnapshotContents,
+    evidenceRefsByCapability,
+  };
+}
+
+/**
+ * Consolidate a promoted candidate against its matched registry capabilities.
+ *
+ * - No related capability above the match threshold → `new_capability`.
+ * - Related capability exists and the candidate's action pattern + boundaries
+ *   are materially equivalent to the Active Snapshot → `append_evidence`.
+ * - Related capability exists and the action pattern or boundaries changed
+ *   materially → `supersede_snapshot`.
+ * - Active Snapshot content is unreadable → `needs_review`.
+ */
+function consolidateWithRegistry(
+  packet: PromotionPacket,
+  reviewRisks: ReviewerRisk[],
+  rewrite: FaithfulRewrite,
+): PromotionDecision {
+  const { registryContext, candidate } = packet;
+  if (!registryContext || registryContext.matches.length === 0) {
+    return 'new_capability';
+  }
+
+  const target = selectConsolidationTarget(registryContext, candidate);
+  if (!target) {
+    const unreadableMatch = registryContext.matches.find(
+      match => !registryContext.activeSnapshotContents[match.capabilityId],
+    );
+    if (unreadableMatch) {
+      reviewRisks.push({
+        label: 'unreadable-active-snapshot',
+        detail: `Active snapshot for prefiltered capability ${unreadableMatch.capabilityId} could not be read.`,
+      });
+      return 'needs_review';
+    }
+    return 'new_capability';
+  }
+
+  const activeContent = registryContext.activeSnapshotContents[target.capabilityId];
+  if (!activeContent) {
+    reviewRisks.push({
+      label: 'unreadable-active-snapshot',
+      detail: `Active snapshot for matched capability ${target.capabilityId} could not be read.`,
+    });
+    return 'needs_review';
+  }
+
+  const candidateGuidance = resolveCandidateGuidance(candidate, hasRewrite(rewrite) ? rewrite : null);
+  const snapshotGuidance = parseSnapshotGuidance(activeContent);
+  if (!snapshotGuidance) {
+    reviewRisks.push({
+      label: 'malformed-active-snapshot',
+      detail: `Active snapshot for matched capability ${target.capabilityId} does not contain complete guidance.`,
+    });
+    return 'needs_review';
+  }
+
+  const actionPatternChanged =
+    !guidanceTextEquivalent(
+      candidateGuidance.actionPattern,
+      snapshotGuidance.actionPattern,
+    );
+  const boundariesChanged = !boundariesEquivalent(
+    candidateGuidance.boundaries,
+    snapshotGuidance.boundaries,
+  );
+
+  if (actionPatternChanged || boundariesChanged) {
+    return 'supersede_snapshot';
+  }
+
+  return 'append_evidence';
+}
+
+/**
+ * Select the best consolidation target from the prefilter matches. An exact
+ * capabilityId match wins. Otherwise, a prefilter result must also have a
+ * strongly matching title/applicability in its readable Active Snapshot before
+ * it is eligible as a consolidation target. The prefilter is recall only, so a
+ * weak lexical hit must not append evidence to or supersede another capability.
+ */
+function selectConsolidationTarget(
+  registryContext: RegistryPromotionContext,
+  candidate: DistilledKnowledgeCandidate,
+): CapabilityPrefilterMatch | undefined {
+  const exact = registryContext.matches.find(m => m.capabilityId === candidate.capabilityId);
+  if (exact) return exact;
+
+  return registryContext.matches.find(match => {
+    const content = registryContext.activeSnapshotContents[match.capabilityId];
+    const guidance = content ? parseSnapshotGuidance(content) : null;
+    return guidance !== null && hasStrongCapabilityIdentity(candidate, guidance);
+  });
+}
+
+function buildConsolidationRationale(
+  decision: PromotionDecision,
+  packet: PromotionPacket,
+  target: CapabilityPrefilterMatch | undefined,
+): string {
+  if (decision === 'promote') {
+    return 'All checks passed: solved-loop evidence is complete, provenance is sufficient, and no unsupported claims were detected.';
+  }
+  if (decision === 'new_capability') {
+    return 'No related capability found in the registry; create a new capability entry and Active Snapshot.';
+  }
+
+  const targetId = target ? target.capabilityId : 'matched capability';
+
+  if (decision === 'append_evidence') {
+    return `Matched capability ${targetId} has materially equivalent action pattern and boundaries; append traceable evidence without changing the Active Snapshot.`;
+  }
+
+  if (decision === 'supersede_snapshot') {
+    return `Matched capability ${targetId} has a material action-pattern or boundary change; install a new immutable Active Snapshot and preserve the predecessor.`;
+  }
+
+  return 'Registry-aware consolidation produced an unexpected decision.';
+}
+
+function resolveCandidateGuidance(
+  candidate: DistilledKnowledgeCandidate,
+  rewrite: FaithfulRewrite | null,
+): { actionPattern: string; boundaries: string[] } {
+  return {
+    actionPattern: rewrite?.actionPattern ?? candidate.actionPattern,
+    boundaries: rewrite?.boundaries ?? candidate.boundaries,
+  };
+}
+
+interface SnapshotGuidance {
+  title: string;
+  applicability: string;
+  actionPattern: string;
+  boundaries: string[];
+}
+
+function parseSnapshotGuidance(content: string): SnapshotGuidance | null {
+  const guidance: SnapshotGuidance = {
+    title: extractDocumentTitle(content),
+    applicability: extractSectionParagraph(content, 'Capability Guidance', 'Applicability'),
+    actionPattern: extractSectionParagraph(content, 'Capability Guidance', 'Action Pattern'),
+    boundaries: extractBulletList(extractSection(content, 'Boundaries')),
+  };
+  return guidance.title && guidance.applicability && guidance.actionPattern && guidance.boundaries.length > 0
+    ? guidance
+    : null;
+}
+
+function extractDocumentTitle(content: string): string {
+  const body = content.replace(/^---\s*[\s\S]*?\n---\s*/u, '');
+  const match = body.match(/^#\s+(.+)$/m);
+  return match ? match[1].trim() : '';
+}
+
+function extractSection(content: string, heading: string): string {
+  const regex = new RegExp(`##\\s+${escapeRegExp(heading)}\\s*(.*?)(?=\\n##\\s|$)`, 's');
+  const match = content.match(regex);
+  return match ? match[1].trim() : '';
+}
+
+function extractSectionParagraph(
+  content: string,
+  heading: string,
+  subheading: string,
+): string {
+  const section = extractSection(content, heading);
+  const regex = new RegExp(
+    `\\*\\*${escapeRegExp(subheading)}\\*\\*\\s*(.*?)(?=\\n\\n|$)`,
+    's',
+  );
+  const match = section.match(regex);
+  return match ? match[1].trim() : '';
+}
+
+function extractBulletList(section: string): string[] {
+  const items: string[] = [];
+  for (const line of section.split('\n')) {
+    const match = line.match(/^-\s+(.*)$/);
+    if (match) {
+      items.push(match[1].trim());
+    }
+  }
+  return items;
+}
+
+function boundariesEquivalent(a: string[], b: string[]): boolean {
+  if (a.length !== b.length) return false;
+  const remaining = b.filter(Boolean);
+  return a.filter(Boolean).every(boundary => {
+    const index = remaining.findIndex(other => guidanceTextEquivalent(boundary, other));
+    if (index < 0) return false;
+    remaining.splice(index, 1);
+    return true;
+  });
+}
+
+/**
+ * Treat formatting-only differences as equivalent so punctuation, casing, and
+ * singular/plural wording do not churn immutable snapshots. A real content
+ * change remains material unless its meaningful token sets substantially
+ * overlap.
+ */
+function guidanceTextEquivalent(a: string, b: string): boolean {
+  const canonical = (value: string) =>
+    value
+      .toLocaleLowerCase('en')
+      .replace(/[^\p{L}\p{N}]+/gu, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+  if (canonical(a) === canonical(b)) return true;
+
+  const tokens = (value: string) => new Set(
+    canonical(value)
+      .split(' ')
+      .filter(Boolean)
+      .map(token => token.length > 3 && token.endsWith('s') ? token.slice(0, -1) : token),
+  );
+  const left = tokens(a);
+  const right = tokens(b);
+  if (left.size === 0 || right.size === 0) return false;
+  let shared = 0;
+  for (const token of left) {
+    if (right.has(token)) shared += 1;
+  }
+  return shared / (left.size + right.size - shared) >= 0.8;
+}
+
+function hasStrongCapabilityIdentity(
+  candidate: DistilledKnowledgeCandidate,
+  snapshot: SnapshotGuidance,
+): boolean {
+  const candidateIdentity = `${candidate.title} ${candidate.applicability}`;
+  const snapshotIdentity = `${snapshot.title} ${snapshot.applicability}`;
+  return guidanceTextEquivalent(candidateIdentity, snapshotIdentity);
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }

@@ -239,9 +239,12 @@ describe('startRuntimeCommandSupport() distillation wiring (issue #13)', () => {
 
     const outcomes = loadReviewOutcomesSync(env.reviewOutcomesFile);
     assert.ok(outcomes.length > 0, 'the pipeline wrote durable review outcomes');
+    // Issue #28: the runtime heartbeat is registry-aware, so a first
+    // occurrence on an empty registry is consolidated as `new_capability`
+    // (an installing decision) rather than the V1 `promote` decision.
     assert.ok(
-      outcomes.some(o => o.decision === 'promote'),
-      'at least one promoted outcome was recorded durably',
+      outcomes.some(o => o.decision === 'new_capability' || o.decision === 'promote'),
+      'at least one installing outcome was recorded durably',
     );
 
     const workLogEntries = readDistillationWorkLogEntries(env.workLogRoot);
@@ -258,6 +261,7 @@ describe('startRuntimeCommandSupport() distillation wiring (issue #13)', () => {
         'promotion_packet',
         'review_result',
         'install_result',
+        'registry_new_capability',
         'run_result',
         'transcript',
       ],
@@ -407,8 +411,10 @@ describe('startRuntimeCommandSupport() distillation wiring (issue #13)', () => {
     const outcomes = loadReviewOutcomesSync(env.reviewOutcomesFile);
     assert.ok(outcomes.length > 0, 'durable review outcomes were written');
     assert.ok(
-      outcomes.some(o => o.decision === 'promote' && o.skillFilePath === skillPath),
-      'the promoted outcome points at the installed skill file',
+      outcomes.some(
+        o => (o.decision === 'new_capability' || o.decision === 'promote') && o.skillFilePath === skillPath,
+      ),
+      'the installing outcome points at the installed skill file',
     );
 
     const workLogEntries = readDistillationWorkLogEntries(env.workLogRoot);
@@ -419,8 +425,10 @@ describe('startRuntimeCommandSupport() distillation wiring (issue #13)', () => {
       'work log links installer result to generated SKILL.md',
     );
     assert.ok(
-      workLogEntries.some(e => e.event_type === 'review_result' && e.decision === 'promote'),
-      'work log records reviewer promotion decision',
+      workLogEntries.some(
+        e => e.event_type === 'review_result' && (e.decision === 'new_capability' || e.decision === 'promote'),
+      ),
+      'work log records the reviewer installing decision',
     );
 
     // The Log Cursor advanced durably, so a repeated heartbeat with no new
