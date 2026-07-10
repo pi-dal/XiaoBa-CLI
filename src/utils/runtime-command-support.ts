@@ -1,9 +1,11 @@
 import { CatscoLogUploadScheduler } from './catsco-log-upload-scheduler';
 import { DistillationHeartbeatScheduler } from './distillation-heartbeat-scheduler';
 import { DistillationPipeline, defaultDistilledOutputDir } from './distillation-pipeline';
+import { bootstrapLegacyDistilledSkillsOnce } from './distilled-skill-bootstrap';
 import { getDistillationHeartbeatConfig } from './distillation-heartbeat-config';
 import { PathResolver } from './path-resolver';
 import { AIService } from './ai-service';
+import { Logger } from './logger';
 import { SkillEvolutionRuntime } from './skill-evolution';
 
 interface ActiveRuntimeSupport {
@@ -66,6 +68,17 @@ export async function startRuntimeCommandSupport(
             verifierModel: config.skillEvolutionVerifierModel,
           })
           : undefined;
+        if (skillEvolution) {
+          try {
+            await bootstrapLegacyDistilledSkillsOnce({
+              skillEvolution,
+              generatedDistilledRoot: defaultDistilledOutputDir(PathResolver.getSkillsPath()),
+            });
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            Logger.warning(`Legacy distilled skill bootstrap failed: ${message}`);
+          }
+        }
         const pipeline = new DistillationPipeline({
           outputDir: defaultDistilledOutputDir(PathResolver.getSkillsPath()),
           reviewOutcomesPath: config.reviewOutcomesPath,

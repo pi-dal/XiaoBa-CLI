@@ -316,6 +316,8 @@ export interface TransitionAuditEntry {
   schemaVersion: typeof SKILL_EVOLUTION_SCHEMA_VERSION;
   transitionId: string;
   transition: CapabilityTransitionKind;
+  /** Stable input identity, used by bootstrap recovery to avoid re-review. */
+  bundleId?: string;
   occurredAt: string;
   reviewerVersion: string;
   promptVersion: string;
@@ -1229,6 +1231,7 @@ export function applyCapabilityTransition(input: ApplyTransitionInput): AppliedT
     schemaVersion: SKILL_EVOLUTION_SCHEMA_VERSION,
     transitionId,
     transition: input.transition,
+    bundleId: input.bundle.bundleId,
     occurredAt: now,
     reviewerVersion: input.reviewerVersion,
     promptVersion: input.promptVersion,
