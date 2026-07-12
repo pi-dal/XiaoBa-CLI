@@ -28,6 +28,7 @@ import { SkillEvolutionRuntime } from '../src/utils/skill-evolution';
 import { SkillUsageCurator } from '../src/utils/skill-usage-curator';
 import { SkillUsageLedger } from '../src/utils/skill-usage-ledger';
 import { DistillationPipeline, defaultDistilledOutputDir } from '../src/utils/distillation-pipeline';
+import { startRuntimeCommandSupport, stopRuntimeCommandSupport } from '../src/utils/runtime-command-support';
 import { SessionTurnLogEntry } from '../src/utils/session-log-schema';
 import { SkillParser } from '../src/skills/skill-parser';
 
@@ -582,5 +583,243 @@ describe('RuntimeLearning — Curation', () => {
     if (episodes.length > 0) {
       curator.observeEpisode(episodes[0]);
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Issue #53 / PR #58 blocker follow-up tests
+// ---------------------------------------------------------------------------
+
+describe('Issue 1 — V3-disabled compatibility', () => {
+  let savedEnv: Record<string, string | undefined> = {};
+
+  beforeEach(() => {
+    savedEnv = {
+      XIAOBA_SKILL_EVOLUTION_V3_ENABLED: process.env.XIAOBA_SKILL_EVOLUTION_V3_ENABLED,
+      DISTILLATION_HEARTBEAT_ENABLED: process.env.DISTILLATION_HEARTBEAT_ENABLED,
+    };
+  });
+
+  afterEach(async () => {
+    await stopRuntimeCommandSupport();
+    for (const [key, value] of Object.entries(savedEnv)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  });
+
+  test('startup does not construct RuntimeLearning when skillEvolutionEnabled=false', async () => {
+    process.env.XIAOBA_SKILL_EVOLUTION_V3_ENABLED = 'false';
+    process.env.DISTILLATION_HEARTBEAT_ENABLED = 'true';
+
+    const support = await startRuntimeCommandSupport(process.cwd());
+
+    assert.equal(support.runtimeLearning, null,
+      'expected runtimeLearning to be null when V3 disabled');
+    assert.equal(support.distillationHeartbeatScheduler, null,
+      'expected distillationHeartbeatScheduler to be null when V3 disabled');
+    // Legacy DistillationPipeline is still available for API-based compatibility
+    assert.ok(support.distillationPipeline instanceof DistillationPipeline,
+      'expected DistillationPipeline to be constructed for compatibility');
+  });
+});
+
+describe('Issue 2 — Generic wake reconciliation', () => {
+  let env: TestEnv;
+
+  beforeEach(() => { env = setupEnv(0); });
+  afterEach(() => { env.restore(); env.teardown(); });
+
+  test('generic wake reconciles pre-existing eligible episode without due deadlines', async () => {
+    // Pre-populate the episode store with an eligible episode that has a
+    // future settlement deadline (so the planner reports nothing due).
+    const episodeId = 'episode-test-reconcile';
+    const episodeData = {
+      schemaVersion: 2,
+      episodes: {
+        [episodeId]: {
+          schemaVersion: 2,
+          episodeId,
+          runtimeSessionId: 'cli',
+          sourceFilePath: env.logFile,
+          deliveryTurn: 1,
+          status: 'eligible',
+          settlementDeadline: new Date(Date.now() + 24 * 3600 * 1000).toISOString(),
+          completionEvidence: [
+            { ref: 'ev-1', sourceFilePath: env.logFile, turn: 1, kind: 'artifact-delivery', detail: 'send_file:test.md' },
+            { ref: 'ev-2', sourceFilePath: env.logFile, turn: 2, kind: 'user-acceptance' },
+          ],
+          contradictionSignals: [],
+          createdAt: new Date(Date.now() - 2 * 3600 * 1000).toISOString(),
+        },
+      },
+    };
+    fs.mkdirSync(path.dirname(env.episodeStorePath), { recursive: true });
+    fs.writeFileSync(env.episodeStorePath, JSON.stringify(episodeData, null, 2), 'utf-8');
+
+    // Planner should report nothing due (eligible episode, future deadline)
+    const plan = env.runtimeLearning.getPlanner().plan();
+    assert.equal(plan.due.settlementDue, false, 'expected settlementDue=false');
+    assert.equal(plan.due.operationalRetryDue, false, 'expected operationalRetryDue=false');
+
+    // Generic wake should still run review and find the eligible episode
+    const branchCallsBefore = { ...env.branchCalls };
+    const result = await env.runtimeLearning.wake('startup');
+
+    assert.equal(result.review.status, 'succeeded',
+      `expected 'succeeded' got '${result.review.status}'`);
+    assert.equal(result.review.reviewedEpisodes, 1,
+      'expected 1 reviewed episode');
+    assert.ok(env.branchCalls.author > branchCallsBefore.author,
+      `expected author call, was ${env.branchCalls.author} before ${branchCallsBefore.author}`);
+    assert.ok(env.branchCalls.verifier > branchCallsBefore.verifier,
+      `expected verifier call, was ${env.branchCalls.verifier} before ${branchCallsBefore.verifier}`);
+
+    // A transition was recorded
+    const foundCreate = Object.entries(result.review.transitionsByKind)
+      .some(([kind, count]) => kind === 'create_current_skill' && (count as number) >= 1);
+    assert.ok(foundCreate,
+      `expected create_current_skill, got ${JSON.stringify(result.review.transitionsByKind)}`);
+  });
+});
+
+describe('Issue 3 — Review failure status', () => {
+  let env: TestEnv;
+
+  beforeEach(() => { env = setupEnv(0); });
+  afterEach(() => { env.restore(); env.teardown(); });
+
+  test('queue review failure reports failed status with error message', async () => {
+    const [delivery, acceptance] = deliveryPair(-2);
+    writeLog(env.logFile, [delivery, acceptance]);
+
+    // Override reviewDueQueueEntries to throw
+    const originalQueueReview = env.skillEvolution.reviewDueQueueEntries.bind(env.skillEvolution);
+    env.skillEvolution.reviewDueQueueEntries = async () => {
+      throw new Error('Simulated queue review failure');
+    };
+
+    try {
+      const result = await env.runtimeLearning.wake('startup');
+
+      assert.equal(result.review.status, 'failed',
+        `expected 'failed' got '${result.review.status}'`);
+      assert.ok(result.review.errorMessage, 'expected error message');
+      assert.ok(result.review.errorMessage!.includes('queue review failed'),
+        `expected queue failure in message, got: ${result.review.errorMessage}`);
+
+      // Completed episode review counts are preserved
+      assert.ok(result.review.reviewedEpisodes >= 0,
+        'reviewedEpisodes should be >= 0');
+    } finally {
+      env.skillEvolution.reviewDueQueueEntries = originalQueueReview;
+    }
+  });
+
+  test('per-episode review failure reports failed status with error message', async () => {
+    const [delivery, acceptance] = deliveryPair(-2);
+    writeLog(env.logFile, [delivery, acceptance]);
+
+    // Override reviewAndApply to throw on first call
+    const originalReviewAndApply = env.skillEvolution.reviewAndApply.bind(env.skillEvolution);
+    let callCount = 0;
+    env.skillEvolution.reviewAndApply = async (bundle: any) => {
+      callCount++;
+      if (callCount === 1) {
+        throw new Error('Simulated episode review failure');
+      }
+      return originalReviewAndApply(bundle);
+    };
+
+    try {
+      const result = await env.runtimeLearning.wake('startup');
+
+      assert.equal(result.review.status, 'failed',
+        `expected 'failed' got '${result.review.status}'`);
+      assert.ok(result.review.errorMessage, 'expected error message');
+      assert.ok(result.review.errorMessage!.includes('episode review(s) failed'),
+        `expected episode failure in message, got: ${result.review.errorMessage}`);
+
+      // Episode was not reviewed but counts still have the correct value
+      assert.equal(result.review.reviewedEpisodes, 0,
+        'expected 0 reviewed episodes (the only episode failed)');
+    } finally {
+      env.skillEvolution.reviewAndApply = originalReviewAndApply;
+    }
+  });
+
+  test('combined episode + queue failure reports failed status with combined message', async () => {
+    const [delivery, acceptance] = deliveryPair(-2);
+    writeLog(env.logFile, [delivery, acceptance]);
+
+    // Override both methods to throw
+    const originalReviewAndApply = env.skillEvolution.reviewAndApply.bind(env.skillEvolution);
+    const originalQueueReview = env.skillEvolution.reviewDueQueueEntries.bind(env.skillEvolution);
+
+    let reviewCallCount = 0;
+    env.skillEvolution.reviewAndApply = async (bundle: any) => {
+      reviewCallCount++;
+      if (reviewCallCount === 1) {
+        throw new Error('Episode review failure');
+      }
+      return originalReviewAndApply(bundle);
+    };
+    env.skillEvolution.reviewDueQueueEntries = async () => {
+      throw new Error('Queue review failure');
+    };
+
+    try {
+      const result = await env.runtimeLearning.wake('startup');
+
+      assert.equal(result.review.status, 'failed',
+        `expected 'failed' got '${result.review.status}'`);
+      assert.ok(result.review.errorMessage, 'expected error message');
+      assert.ok(result.review.errorMessage!.includes('episode review(s) failed'),
+        `expected episode failure in message: ${result.review.errorMessage}`);
+      assert.ok(result.review.errorMessage!.includes('queue review failed'),
+        `expected queue failure in message: ${result.review.errorMessage}`);
+    } finally {
+      env.skillEvolution.reviewAndApply = originalReviewAndApply;
+      env.skillEvolution.reviewDueQueueEntries = originalQueueReview;
+    }
+  });
+});
+
+describe('Issue 4 — Heartbeat single-write', () => {
+  let env: TestEnv;
+
+  beforeEach(() => { env = setupEnv(0); });
+  afterEach(() => { env.restore(); env.teardown(); });
+
+  test('a single production wake increments runCount exactly once', async () => {
+    const [delivery, acceptance] = deliveryPair(-2);
+    writeLog(env.logFile, [delivery, acceptance]);
+
+    const before = env.runtimeLearning.loadHeartbeatRecord();
+    assert.equal(before.runCount, 0, 'expected 0 before first wake');
+
+    await env.runtimeLearning.wake('startup');
+
+    const after = env.runtimeLearning.loadHeartbeatRecord();
+    // runCount must be 1 — if the scheduler also wrote the record, it would be 2.
+    assert.equal(after.runCount, 1,
+      `expected runCount=1 (single write), got ${after.runCount}`);
+    assert.ok(after.lastRunAt, 'expected lastRunAt to be set');
+    assert.ok(after.lastReason, 'expected lastReason to be set');
+  });
+
+  test('consecutive wakes increment runCount monotonically', async () => {
+    const [delivery, acceptance] = deliveryPair(-4);
+    writeLog(env.logFile, [delivery, acceptance]);
+
+    await env.runtimeLearning.wake('startup');
+    const after1 = env.runtimeLearning.loadHeartbeatRecord();
+    assert.equal(after1.runCount, 1, 'expected 1 after first wake');
+
+    await env.runtimeLearning.wake('scheduled');
+    const after2 = env.runtimeLearning.loadHeartbeatRecord();
+    assert.equal(after2.runCount, 2, 'expected 2 after second wake');
+    assert.equal(after2.lastReason, 'scheduled',
+      `expected reason=scheduled, got ${after2.lastReason}`);
   });
 });
