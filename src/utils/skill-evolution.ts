@@ -668,6 +668,20 @@ export class SkillEvolutionRuntime {
       if (author.transcriptPath) branchTranscriptPaths.push(author.transcriptPath);
       const draftIssues = validateDraft(draft, frozenBundle, this.getManualSkillNames());
       if (draftIssues.length > 0) {
+        // A malformed Author completion is an operational/schema failure, not
+        // a semantic rejection. Keep the frozen Evidence Bundle in the
+        // durable retry queue so a corrected prompt/model can recover it on a
+        // later wake. Safety and policy violations remain terminal rejects.
+        if (
+          this.options.reviewQueuePath
+          && draftIssues.every(isRetryableAuthorDraftIssue)
+        ) {
+          throw new OperationalReviewError(
+            'invalid_completion_schema',
+            `Skill Author returned an invalid completion schema: ${draftIssues.map(issue => issue.message).join(' ')}`,
+            author.transcriptPath ?? undefined,
+          );
+        }
         const result: SkillVerifierResult = {
           decision: draftIssues.some(issue => issue.severity === 'danger') ? 'reject' : 'defer',
           issues: draftIssues,
@@ -1336,6 +1350,22 @@ function validateDraft(draft: SkillDraft, bundle: EvidenceBundle, manualSkillNam
     issues.push(issue('creation-metadata', 'Current Skill creation requires a routing name and description.', 'danger'));
   }
   return issues;
+}
+
+const RETRYABLE_AUTHOR_DRAFT_ISSUES = new Set([
+  'empty-draft',
+  'frontmatter',
+  'envelope',
+  'routing-name',
+  'creation-metadata',
+  'referenced-skills-shape',
+  'missing-referenced-skill',
+  'evidence-refs-shape',
+  'missing-evidence',
+]);
+
+function isRetryableAuthorDraftIssue(issue: SkillVerifierIssue): boolean {
+  return RETRYABLE_AUTHOR_DRAFT_ISSUES.has(issue.code);
 }
 
 function validateTransitionInput(

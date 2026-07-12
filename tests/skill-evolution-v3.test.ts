@@ -554,6 +554,41 @@ describe('V3 verified semantic Current Skills', () => {
     }
   });
 
+  test('queues a legacy Author envelope for operational retry instead of discarding the candidate', async () => {
+    const env = setup();
+    try {
+      const reviewQueuePath = path.join(env.root, 'data', 'review-queue.json');
+      env.options.reviewQueuePath = reviewQueuePath;
+      env.options.authorFixture = () => ({
+        body: 'Use the bounded workflow and validate the result.',
+        // Simulates the pre-V3 Author output observed in the production queue.
+        envelope: {
+          name: 'cursor-backed-jsonl-append-only-reader',
+          description: 'Legacy envelope without decision or routingName.',
+        },
+      } as any);
+
+      const result = await new SkillEvolutionRuntime(env.options).reviewAndApply(
+        fixtureCandidateBundle(fixtureCandidate(), 'legacy-author-envelope'),
+      );
+
+      assert.equal(result.transition, 'reject_candidate');
+      assert.equal(result.verified, false);
+      assert.equal(result.queued, 'operational');
+      const entry = findOperationalByBundleId(
+        loadReviewQueueState(reviewQueuePath),
+        'legacy-author-envelope',
+      );
+      assert.ok(entry);
+      assert.equal(entry!.failureKind, 'invalid_completion_schema');
+      assert.match(entry!.failureMessage, /invalid completion schema/i);
+      assert.deepEqual(loadCurrentSkillRegistry(env.options.registryPath).capabilities, {});
+      assert.deepEqual(loadTransitionAudit(env.options.auditPath), []);
+    } finally {
+      env.cleanup();
+    }
+  });
+
   test('the default Evidence Bundle carries real source evidence and manual skill snapshots', async () => {
     const env = setup();
     try {
