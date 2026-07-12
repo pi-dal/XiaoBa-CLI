@@ -2,6 +2,8 @@ import { DistillationPipeline, QueueReviewResultV3, V3PipelineUnitResult } from 
 import { CapabilityTransitionKind } from './skill-evolution';
 import { CuratorRunResult, SkillUsageCurator } from './skill-usage-curator';
 
+export type RuntimeLearningStageStatus = 'succeeded' | 'failed' | 'skipped';
+
 export interface RuntimeLearningDiscoveryReport {
   scanned: boolean;
   filesScanned: number;
@@ -15,12 +17,16 @@ export interface RuntimeLearningIngestionReport {
 }
 
 export interface RuntimeLearningMaturationReport {
+  status: RuntimeLearningStageStatus;
+  errorMessage?: string;
   maturedEpisodes: number;
   becameEligible: number;
   becameContradicted: number;
 }
 
 export interface RuntimeLearningReviewReport {
+  status: RuntimeLearningStageStatus;
+  errorMessage?: string;
   reviewedEpisodes: number;
   reviewedQueueEntries: number;
   deferredQueueReviews: number;
@@ -31,6 +37,8 @@ export interface RuntimeLearningReviewReport {
 }
 
 export interface RuntimeLearningCurationReport {
+  status: RuntimeLearningStageStatus;
+  errorMessage?: string;
   ran: boolean;
   expedited: boolean;
   transitionsByKind: Partial<Record<CapabilityTransitionKind, number>>;
@@ -48,6 +56,15 @@ export interface RuntimeLearningWakeContext {
   ingestion: RuntimeLearningIngestionReport;
 }
 
+const EMPTY_SETTLEMENT_RESULT: V3PipelineUnitResult = { candidates: [], evolutions: [] };
+const EMPTY_QUEUE_REVIEW_RESULT: QueueReviewResultV3 = {
+  reviewed: 0,
+  deferredReviewed: 0,
+  operationalReviewed: 0,
+  operationalRetried: 0,
+  deferredRetried: 0,
+  transitionsByKind: {},
+};
 export class RuntimeLearningCoordinator {
   constructor(
     private readonly pipeline: DistillationPipeline,
@@ -55,31 +72,85 @@ export class RuntimeLearningCoordinator {
   ) {}
 
   async runWake(_context: RuntimeLearningWakeContext): Promise<RuntimeLearningWakeReport> {
-    const settlement = await this.pipeline.processSettledLearningEpisodes();
-    const queue = await this.pipeline.reviewSkillEvolutionQueueEntries();
-    const curation = this.curator
-      ? await this.curator.runDue()
-      : { ran: false, expedited: false, transitions: [] } as CuratorRunResult;
+    let settlement = EMPTY_SETTLEMENT_RESULT;
+    let settlementError: unknown;
 
-    return {
-      maturation: summarizeMaturation(settlement),
-      review: summarizeReview(settlement, queue),
-      curation: summarizeCuration(curation),
-    };
+    try {
+      settlement = await this.pipeline.processSettledLearningEpisodes();
+    } catch (error) {
+      settlementError = error;
+    }
+
+    const maturation = settlementError
+      ? failedMaturationReport(settlementError)
+      : summarizeMaturation(settlement);
+
+    let queue = EMPTY_QUEUE_REVIEW_RESULT;
+    let queueError: unknown;
+    try {
+      queue = await this.pipeline.reviewSkillEvolutionQueueEntries();
+    } catch (error) {
+      queueError = error;
+    }
+
+    const review = summarizeReview(
+      settlement,
+      queue,
+      settlementError || queueError ? 'failed' : 'succeeded',
+      settlementError || queueError
+        ? [settlementError, queueError].filter(Boolean).map(toErrorMessage).join('; ')
+        : undefined,
+    );
+
+    if (!this.curator) {
+      return {
+        maturation,
+        review,
+        curation: skippedCurationReport(),
+      };
+    }
+
+    try {
+      const curation = await this.curator.runDue();
+      return {
+        maturation,
+        review,
+        curation: summarizeCuration(curation),
+      };
+    } catch (error) {
+      return {
+        maturation,
+        review,
+        curation: failedCurationReport(error),
+      };
+    }
   }
 }
 
 function summarizeMaturation(result: V3PipelineUnitResult): RuntimeLearningMaturationReport {
   return {
+    status: 'succeeded',
     maturedEpisodes: result.maturation?.maturedEpisodeIds.length ?? 0,
     becameEligible: result.maturation?.becameEligible ?? 0,
     becameContradicted: result.maturation?.becameContradicted ?? 0,
   };
 }
 
+function failedMaturationReport(error: unknown): RuntimeLearningMaturationReport {
+  return {
+    status: 'failed',
+    errorMessage: toErrorMessage(error),
+    maturedEpisodes: 0,
+    becameEligible: 0,
+    becameContradicted: 0,
+  };
+}
+
 function summarizeReview(
   settlement: V3PipelineUnitResult,
   queue: QueueReviewResultV3,
+  status: RuntimeLearningStageStatus,
+  errorMessage?: string,
 ): RuntimeLearningReviewReport {
   const transitionsByKind: Partial<Record<CapabilityTransitionKind, number>> = {};
   for (const evolution of settlement.evolutions) {
@@ -92,6 +163,8 @@ function summarizeReview(
   }
 
   return {
+    status,
+    ...(errorMessage ? { errorMessage } : {}),
     reviewedEpisodes: settlement.candidates.length,
     reviewedQueueEntries: queue.reviewed,
     deferredQueueReviews: queue.deferredReviewed,
@@ -108,9 +181,29 @@ function summarizeCuration(result: CuratorRunResult): RuntimeLearningCurationRep
     incrementTransitionCount(transitionsByKind, transition.transition);
   }
   return {
+    status: result.ran ? 'succeeded' : 'skipped',
     ran: result.ran,
     expedited: result.expedited,
     transitionsByKind,
+  };
+}
+
+function skippedCurationReport(): RuntimeLearningCurationReport {
+  return {
+    status: 'skipped',
+    ran: false,
+    expedited: false,
+    transitionsByKind: {},
+  };
+}
+
+function failedCurationReport(error: unknown): RuntimeLearningCurationReport {
+  return {
+    status: 'failed',
+    errorMessage: toErrorMessage(error),
+    ran: false,
+    expedited: false,
+    transitionsByKind: {},
   };
 }
 
@@ -119,4 +212,9 @@ function incrementTransitionCount(
   transition: CapabilityTransitionKind,
 ): void {
   counts[transition] = (counts[transition] ?? 0) + 1;
+}
+
+function toErrorMessage(error: unknown): string {
+  if (error instanceof Error) return error.message;
+  return String(error);
 }

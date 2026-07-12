@@ -595,4 +595,51 @@ describe('issue #50: Evidence Ingestion decoupled from Capability Review', () =>
     assert.equal(loadTransitionAudit(env.auditPath).length, 1, 'restart recovery commits the due settlement transition exactly once');
     assert.equal(Object.keys(loadCurrentSkillRegistry(env.registryPath).capabilities).length, 1);
   });
+
+  test('(d4) queue review failure preserves settled review counts and reports review stage failure', async () => {
+    writeLog(env.logFile, [DELIVERY_TURN, ACCEPTANCE_TURN]);
+    env.pipeline.reviewSkillEvolutionQueueEntries = async () => {
+      throw new Error('review queue state write failed');
+    };
+
+    const scheduler = env.makeScheduler();
+    const result = await scheduler.runHeartbeat('manual');
+
+    assert.equal(result.maturation.status, 'succeeded');
+    assert.equal(result.maturation.maturedEpisodes, 1);
+    assert.equal(result.review.status, 'failed');
+    assert.match(result.review.errorMessage ?? '', /review queue state write failed/);
+    assert.equal(result.review.reviewedEpisodes, 1, 'the settled episode review survives the later queue failure');
+    assert.equal(result.review.reviewedQueueEntries, 0);
+    assert.equal(result.review.transitionsByKind.create_current_skill, 1);
+    assert.equal(loadTransitionAudit(env.auditPath).length, 1, 'the completed Capability Transition remains durable');
+    assert.equal(cursorFor(env).byteOffset, fs.statSync(env.logFile).size, 'review-stage failure still preserves the acknowledged cursor');
+  });
+
+  test('(d5) curation failure preserves completed capability work and reports curation stage failure', async () => {
+    env.restore();
+    env = setupEnv('approve', { withCurator: true });
+    writeLog(env.logFile, [DELIVERY_TURN, ACCEPTANCE_TURN]);
+
+    assert.ok(env.curator, 'expected runtime curator');
+    env.curator.runDue = async () => {
+      throw new Error('EACCES: curation state write failed');
+    };
+
+    const scheduler = env.makeScheduler();
+    const result = await scheduler.runHeartbeat('manual');
+
+    assert.equal(result.maturation.status, 'succeeded');
+    assert.equal(result.maturation.maturedEpisodes, 1);
+    assert.equal(result.review.status, 'succeeded');
+    assert.equal(result.review.reviewedEpisodes, 1);
+    assert.equal(result.review.transitionsByKind.create_current_skill, 1);
+    assert.equal(result.curation.status, 'failed');
+    assert.match(result.curation.errorMessage ?? '', /curation state write failed/);
+    assert.equal(result.curation.ran, false);
+    assert.equal(loadTransitionAudit(env.auditPath).length, 1, 'curation failure must not undo the completed Capability Transition');
+    assert.equal(Object.keys(loadCurrentSkillRegistry(env.registryPath).capabilities).length, 1);
+    assert.equal(cursorFor(env).byteOffset, fs.statSync(env.logFile).size, 'curation failure still preserves the acknowledged cursor');
+  });
+
 });

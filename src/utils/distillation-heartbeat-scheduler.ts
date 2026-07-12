@@ -131,8 +131,14 @@ function emptyWakeReport(ran: boolean): HeartbeatRunResult {
     ran,
     discovery: { scanned: false, filesScanned: 0, unitsProcessed: 0, advancedFiles: 0 },
     ingestion: { admittedEpisodes: 0, contradictionSignals: 0 },
-    maturation: { maturedEpisodes: 0, becameEligible: 0, becameContradicted: 0 },
+    maturation: {
+      status: 'skipped',
+      maturedEpisodes: 0,
+      becameEligible: 0,
+      becameContradicted: 0,
+    },
     review: {
+      status: 'skipped',
       reviewedEpisodes: 0,
       reviewedQueueEntries: 0,
       deferredQueueReviews: 0,
@@ -141,7 +147,7 @@ function emptyWakeReport(ran: boolean): HeartbeatRunResult {
       operationalRetries: 0,
       transitionsByKind: {},
     },
-    curation: { ran: false, expedited: false, transitionsByKind: {} },
+    curation: { status: 'skipped', ran: false, expedited: false, transitionsByKind: {} },
   };
 }
 
