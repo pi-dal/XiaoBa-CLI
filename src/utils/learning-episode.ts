@@ -417,66 +417,85 @@ export interface LearningEpisodeStoreState {
   episodes: Record<string, LearningEpisode>;
 }
 
+export interface LearningEpisodeStoreOptions {
+  /**
+   * Injectable atomic writer used by both `load()` migration and `save()`.
+   * Defaults to a temp-file + rename atomic write. Tests inject a deterministic
+   * writer to simulate migration I/O failure without leaving partial state.
+   */
+  atomicWrite?: (filePath: string, state: LearningEpisodeStoreState) => void;
+}
+
 export class LearningEpisodeStore {
-  constructor(private readonly filePath: string) {}
+  constructor(
+    private readonly filePath: string,
+    private readonly options: LearningEpisodeStoreOptions = {},
+  ) {}
 
   load(): LearningEpisodeStoreState {
     if (!fs.existsSync(this.filePath)) return emptyEpisodeStoreState();
+
+    // Parse and structural validation only. Malformed or unknown-schema stores
+    // fall back to an empty state here. This catch is intentionally narrow so
+    // that a structurally valid legacy store whose migration write later fails
+    // cannot collapse into the same empty fallback and be overwritten.
+    let parsed: LearningEpisodeStoreState & { schemaVersion?: number };
     try {
       const raw = fs.readFileSync(this.filePath, 'utf8');
-      const parsed = JSON.parse(raw) as unknown as LearningEpisodeStoreState & { schemaVersion?: number };
-
-      // Structural validation
+      parsed = JSON.parse(raw) as unknown as typeof parsed;
       if (!parsed.episodes || typeof parsed.episodes !== 'object') throw new Error('invalid episode store');
-
-      // Validate schema version. Accept both v1 (legacy label semantics)
-      // and the current v2.
       const persistedVersion: number | undefined = parsed.schemaVersion;
       if (persistedVersion !== undefined && persistedVersion !== 1 && persistedVersion !== 2) {
         throw new Error('invalid episode store');
       }
-
-      let needsSave = false;
-
-      // Apply v1 → v2 migration when needed.
-      // Legacy status 'promoted' → 'eligible', 'rejected' → 'contradicted'.
-      const persistingV1 = persistedVersion === undefined || persistedVersion === 1;
-      if (persistingV1) {
-        for (const episode of Object.values(parsed.episodes)) {
-          const rawStatus = episode.status as string;
-          if (rawStatus === 'promoted') {
-            episode.status = 'eligible' as const;
-            needsSave = true;
-          } else if (rawStatus === 'rejected') {
-            episode.status = 'contradicted' as const;
-            needsSave = true;
-          }
-        }
-        // Record schema version bump regardless of whether episodes changed
-        // status — a v1 file is not semantically v2 until we persist this.
-        parsed.schemaVersion = LEARNING_EPISODE_SCHEMA_VERSION;
-        needsSave = true;
-      }
-
-      // Auto-save migrated state so callers don't need to save manually.
-      if (needsSave) {
-        fs.mkdirSync(path.dirname(this.filePath), { recursive: true });
-        const temp = `${this.filePath}.${process.pid}.${Date.now()}.migrate.tmp`;
-        fs.writeFileSync(temp, JSON.stringify(parsed, null, 2), { encoding: 'utf8', mode: 0o600 });
-        fs.renameSync(temp, this.filePath);
-      }
-
-      return parsed;
     } catch {
       return emptyEpisodeStoreState();
     }
+
+    const persistedVersion: number | undefined = parsed.schemaVersion;
+    const persistingV1 = persistedVersion === undefined || persistedVersion === 1;
+    if (!persistingV1) {
+      return parsed as LearningEpisodeStoreState;
+    }
+
+    // v1 → v2 migration: the store-level schemaVersion AND each nested episode
+    // schemaVersion must be upgraded together. Legacy status labels
+    // 'promoted' → 'eligible' and 'rejected' → 'contradicted' are migrated in
+    // the same pass. Evidence, settlement deadline, and predecessor/retry
+    // linkage are preserved untouched.
+    for (const episode of Object.values(parsed.episodes)) {
+      const rawStatus = episode.status as string;
+      if (rawStatus === 'promoted') {
+        episode.status = 'eligible' as const;
+      } else if (rawStatus === 'rejected') {
+        episode.status = 'contradicted' as const;
+      }
+      episode.schemaVersion = LEARNING_EPISODE_SCHEMA_VERSION;
+    }
+    parsed.schemaVersion = LEARNING_EPISODE_SCHEMA_VERSION;
+
+    // Durable migration write. A structurally valid legacy store whose atomic
+    // migration write fails must NOT return an empty state that a later caller
+    // could overwrite — report a durable migration I/O failure instead so the
+    // source evidence is retained for diagnosis and retry.
+    try {
+      this.atomicWrite(parsed as LearningEpisodeStoreState);
+    } catch (cause) {
+      throw new Error(
+        `Learning Episode store migration write failed: ${cause instanceof Error ? cause.message : String(cause)}`,
+      );
+    }
+
+    return parsed as LearningEpisodeStoreState;
   }
 
   save(state: LearningEpisodeStoreState): void {
-    fs.mkdirSync(path.dirname(this.filePath), { recursive: true });
-    const temp = `${this.filePath}.${process.pid}.${Date.now()}.tmp`;
-    fs.writeFileSync(temp, JSON.stringify(state, null, 2), { encoding: 'utf8', mode: 0o600 });
-    fs.renameSync(temp, this.filePath);
+    this.atomicWrite(state);
+  }
+
+  private atomicWrite(state: LearningEpisodeStoreState): void {
+    const writer = this.options.atomicWrite ?? defaultLearningEpisodeAtomicWrite;
+    writer(this.filePath, state);
   }
 
   upsert(episodes: readonly LearningEpisode[]): LearningEpisodeStoreState {
@@ -523,6 +542,13 @@ export class LearningEpisodeStore {
 
 function emptyEpisodeStoreState(): LearningEpisodeStoreState {
   return { schemaVersion: LEARNING_EPISODE_SCHEMA_VERSION, episodes: {} };
+}
+
+function defaultLearningEpisodeAtomicWrite(filePath: string, state: LearningEpisodeStoreState): void {
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  const temp = `${filePath}.${process.pid}.${Date.now()}.tmp`;
+  fs.writeFileSync(temp, JSON.stringify(state, null, 2), { encoding: 'utf8', mode: 0o600 });
+  fs.renameSync(temp, filePath);
 }
 
 function mergeEpisode(existing: LearningEpisode | undefined, incoming: LearningEpisode): LearningEpisode {

@@ -677,6 +677,7 @@ describe('V3 flashcard Composition Capability regression', () => {
         const reloaded = new LearningEpisodeStore(storePath).load();
         assert.equal(reloaded.schemaVersion, 2);
         assert.equal(Object.values(reloaded.episodes)[0]!.status, 'eligible');
+        assert.equal(Object.values(reloaded.episodes)[0]!.schemaVersion, 2, 'per-episode schemaVersion must migrate to v2 on a raw v1 fixture');
         // Evidence, settlement deadline, and linkage are preserved
         assert.equal(Object.values(reloaded.episodes)[0]!.settlementDeadline, '2026-01-01T04:00:00.000Z');
         assert.equal(Object.values(reloaded.episodes)[0]!.completionEvidence.length, 1);
@@ -721,6 +722,7 @@ describe('V3 flashcard Composition Capability regression', () => {
         const reloaded = new LearningEpisodeStore(storePath).load();
         assert.equal(reloaded.schemaVersion, 2);
         assert.equal(Object.values(reloaded.episodes)[0]!.status, 'contradicted');
+        assert.equal(Object.values(reloaded.episodes)[0]!.schemaVersion, 2, 'per-episode schemaVersion must migrate to v2 on a raw v1 fixture');
       } finally {
         fs.rmSync(root, { recursive: true, force: true });
       }
@@ -774,45 +776,28 @@ describe('V3 flashcard Composition Capability regression', () => {
         assert.equal(reloaded.schemaVersion, 2);
         const migratedPredecessor = Object.values(reloaded.episodes).find(e => e.episodeId === predecessorId)!;
         assert.equal(migratedPredecessor.status, 'contradicted');
+        assert.equal(migratedPredecessor.schemaVersion, 2, 'migrated predecessor per-episode schemaVersion must be v2');
         const reloadedRetry = Object.values(reloaded.episodes).find(e => e.deliveryTurn === 3)!;
         assert.equal(reloadedRetry.retryOfEpisodeId, predecessorId);
+        assert.equal(reloadedRetry.schemaVersion, 2, 'retry episode per-episode schemaVersion must be v2');
       } finally {
         fs.rmSync(root, { recursive: true, force: true });
       }
     });
 
-    test('a controlled rejecting reviewer leaves episode eligible and persists reject_candidate audit', async () => {
-      const root = fs.mkdtempSync(path.join(os.tmpdir(), 'xiaoba-reject-candidate-integration-'));
+    test('a controlled rejecting reviewer end-to-end leaves episode eligible and persists reject_candidate audit', async () => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), 'xiaoba-reject-candidate-e2e-'));
+      process.env.XIAOBA_SKILLS_DIR = path.join(root, 'skills');
       try {
-        // ── Step 1: Create and persist a settled eligible episode ──────────
-        const storePath = path.join(root, 'episodes.json');
+        // ── Source unit that produces a durable Learning Episode ──────────
+        const storePath = path.join(root, 'data', 'learning-episodes.json');
         const sourcePath = path.join(root, 'session.jsonl');
-        const store = new LearningEpisodeStore(storePath);
-        const episodes = extractLearningEpisodes(unit([
+        const sourceUnit = unit([
           turn(1, 'Deliver a report.', [tool('1', 'send_file', 'report sent')], 'test-reject-rt'),
-          turn(2, 'Verified.', [], 'test-reject-rt'),
-        ], sourcePath)).episodes;
-        store.upsert(episodes);
-        const settled = store.settle({ now: new Date('2026-01-01T04:00:00.000Z') });
-        const eligibleEpisode = Object.values(settled.episodes)[0]!;
-        assert.equal(eligibleEpisode.status, 'eligible');
+          turn(2, 'Verified, works.', [], 'test-reject-rt'),
+        ], sourcePath);
 
-        // ── Step 2: Build a minimal Evidence Bundle ───────────────────────
-        const bundle: import('../src/utils/skill-evolution').EvidenceBundle = {
-          bundleId: `reject-test-${eligibleEpisode.episodeId}`,
-          episode: { problem: 'Deliver a report', completion: 'report sent' },
-          completionEvidence: eligibleEpisode.completionEvidence
-            .filter(ev => ev.kind === 'artifact-delivery')
-            .map(ev => ({ ref: ev.ref, sourceFilePath: ev.sourceFilePath, turn: ev.turn })),
-          settlementEvidence: eligibleEpisode.completionEvidence
-            .filter(ev => ev.kind !== 'artifact-delivery')
-            .map(ev => ({ ref: ev.ref, sourceFilePath: ev.sourceFilePath, turn: ev.turn })),
-          boundedContinuity: [],
-          referencedSkills: [],
-          relatedCurrentSkills: [],
-        };
-
-        // ── Step 3: Create SkillEvolutionRuntime with controlled rejecting fixtures ─
+        // ── Controlled rejecting V3 seam wired through the real pipeline ──
         const skillEvolution = new SkillEvolutionRuntime({
           workingDirectory: root,
           outputDir: path.join(root, 'skills', 'generated-distilled'),
@@ -824,8 +809,7 @@ describe('V3 flashcard Composition Capability regression', () => {
             envelope: {
               decision: 'create_current_skill' as const,
               routingName: 'test-report-delivery',
-              description: 'Test: deliver a report and wait for verification.',
-              evidenceRefs: [...bundle.completionEvidence, ...bundle.settlementEvidence].map(ref => ref.ref),
+              description: 'Deliver a report and wait for user verification.',
             },
           }),
           verifierFixture: () => ({
@@ -835,41 +819,121 @@ describe('V3 flashcard Composition Capability regression', () => {
           }),
         });
 
-        // ── Step 4: Run review — should produce reject_candidate ──────────
-        const result = await skillEvolution.reviewAndApply(bundle);
-        assert.equal(result.transition, 'reject_candidate');
-        assert.equal(result.verified, false);
+        const pipeline = new DistillationPipeline({
+          outputDir: path.join(root, 'skills', 'generated-distilled'),
+          reviewOutcomesPath: path.join(root, 'data', 'review-outcomes.json'),
+          learningEpisodeStorePath: storePath,
+          learningEpisodeSettlementWindowMs: 0,
+          skillEvolution,
+        });
 
-        // ── Step 5: Episode remains eligible ──────────────────────────────
-        const reloadedStore = new LearningEpisodeStore(storePath).load();
-        const episode = Object.values(reloadedStore.episodes)[0]!;
-        assert.equal(episode.status, 'eligible');
+        // ── Real processUnitAsync / settled path: extract → persist → settle → review ──
+        const result = await pipeline.processUnitAsync(sourceUnit);
+        assert.ok('evolutions' in result, 'processUnitAsync must use the V3 evolution path when skillEvolution and the episode store are configured');
+        const v3Result = result as import('../src/utils/distillation-pipeline').V3PipelineUnitResult;
+        assert.equal(v3Result.evolutions.length, 1, 'the one newly settled eligible episode is reviewed exactly once');
+        assert.equal(v3Result.evolutions[0]!.transition, 'reject_candidate');
+        assert.equal(v3Result.evolutions[0]!.verified, false);
 
-        // ── Step 6: No Current Skill or Registry entry created ────────────
-        const registryPath = path.join(root, 'data', 'current-skills.json');
-        if (fs.existsSync(registryPath)) {
-          const registry = JSON.parse(fs.readFileSync(registryPath, 'utf8'));
-          assert.equal(Object.keys(registry.capabilities ?? {}).length, 0);
-        } else {
-          // Registry file not created at all — also valid
-          assert.ok(true);
-        }
+        // ── The same episode remains eligible in the durable store ────────
+        const episodeAfter = Object.values(new LearningEpisodeStore(storePath).load().episodes)[0]!;
+        assert.equal(episodeAfter.status, 'eligible');
+        assert.equal(episodeAfter.schemaVersion, 2);
+        assert.ok(episodeAfter.completionEvidence.some(ev => ev.kind === 'artifact-delivery'));
 
-        // ── Step 7: Transition Audit has reject_candidate entry ───────────
-        const auditPath = path.join(root, 'data', 'transition-audit.jsonl');
-        assert.ok(fs.existsSync(auditPath), 'Transition Audit must be persisted');
-        const audits = fs.readFileSync(auditPath, 'utf8')
-          .split('\n')
-          .filter(Boolean)
-          .map(line => JSON.parse(line));
-        const rejectAudit = audits.find((a: any) => a.transition === 'reject_candidate');
-        assert.ok(rejectAudit, 'A reject_candidate Transition Audit entry must exist');
+        // ── No Current Skill or Capability Registry entry is created ──────
+        assert.deepEqual(skillEvolution.getRegistry().capabilities, {}, 'reject_candidate must not create a Capability Registry entry');
+        assert.deepEqual(fs.readdirSync(path.join(root, 'skills', 'generated-distilled')), [], 'reject_candidate must not install a Current Skill SKILL.md');
+
+        // ── reject_candidate Transition Audit is persisted (audit semantics) ──
+        const audits = skillEvolution.getAudit();
+        assert.equal(audits.length, 1, 'exactly one Transition Audit entry is written');
+        const rejectAudit = audits[0]!;
         assert.equal(rejectAudit.transition, 'reject_candidate');
         assert.ok(typeof rejectAudit.transitionId === 'string' && rejectAudit.transitionId.startsWith('transition-'));
         assert.ok(typeof rejectAudit.occurredAt === 'string');
         assert.ok(Array.isArray(rejectAudit.branchTranscriptPaths));
-        // involvedCapabilityHandles should be empty for a rejection with no target
         assert.ok(Array.isArray(rejectAudit.involvedCapabilityHandles));
+        assert.deepEqual(rejectAudit.involvedCapabilityHandles, [], 'reject_candidate with no target involves no Capability Handles');
+      } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+      }
+    });
+
+    test('migration write failure throws a durable migration I/O error and retains source evidence', () => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), 'xiaoba-migration-write-failure-'));
+      try {
+        const storePath = path.join(root, 'episodes.json');
+        const legacyState = {
+          schemaVersion: 1,
+          episodes: {
+            'episode-legacy-fail': {
+              schemaVersion: 1,
+              episodeId: 'episode-legacy-fail',
+              runtimeSessionId: 'legacy-session',
+              sourceFilePath: path.join(root, 'session.jsonl'),
+              deliveryTurn: 1,
+              completionEvidence: [{ ref: 'legacy#turn-1:delivery', sourceFilePath: root, turn: 1, kind: 'artifact-delivery' as const, detail: 'send_file: legacy report' }],
+              contradictionSignals: [],
+              settlementDeadline: '2026-01-01T04:00:00.000Z',
+              status: 'promoted' as any,
+            } as LearningEpisode,
+          },
+        };
+        fs.writeFileSync(storePath, JSON.stringify(legacyState), 'utf8');
+        const originalRaw = fs.readFileSync(storePath, 'utf8');
+
+        // Safe, deterministic test seam: the atomic migration writer fails
+        // without touching the source file, simulating a durable I/O failure.
+        const store = new LearningEpisodeStore(storePath, {
+          atomicWrite: () => {
+            throw new Error('deterministic migration write failure');
+          },
+        });
+        assert.throws(
+          () => store.load(),
+          /Learning Episode store migration write failed: deterministic migration write failure/,
+        );
+
+        // Source evidence is retained verbatim — the failed writer left no
+        // partial state, so a later caller can diagnose/retry rather than
+        // overwrite the legacy store with an empty state.
+        assert.equal(fs.readFileSync(storePath, 'utf8'), originalRaw);
+        // A later successful migration (after the I/O issue is resolved) still
+        // migrates the retained store cleanly: both store- and episode-level
+        // schemaVersion upgrade to v2.
+        const recovered = new LearningEpisodeStore(storePath).load();
+        assert.equal(recovered.schemaVersion, 2);
+        assert.equal(Object.values(recovered.episodes)[0]!.status, 'eligible');
+        assert.equal(Object.values(recovered.episodes)[0]!.schemaVersion, 2);
+      } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+      }
+    });
+
+    test('malformed and unknown-schema stores remain safely separated from migration failures', () => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), 'xiaoba-malformed-store-'));
+      try {
+        // Malformed JSON returns an empty state without throwing and
+        // crucially never engages the migration writer.
+        const malformedPath = path.join(root, 'malformed.json');
+        fs.writeFileSync(malformedPath, '{ not valid json', 'utf8');
+        let writerCalled = false;
+        const malformedStore = new LearningEpisodeStore(malformedPath, {
+          atomicWrite: () => { writerCalled = true; },
+        });
+        assert.deepEqual(malformedStore.load(), { schemaVersion: 2, episodes: {} });
+        assert.equal(writerCalled, false, 'malformed store must not engage the migration writer');
+
+        // Unknown schema version also returns an empty state without writing.
+        const unknownPath = path.join(root, 'unknown.json');
+        fs.writeFileSync(unknownPath, JSON.stringify({ schemaVersion: 99, episodes: {} }), 'utf8');
+        let unknownWriterCalled = false;
+        const unknownStore = new LearningEpisodeStore(unknownPath, {
+          atomicWrite: () => { unknownWriterCalled = true; },
+        });
+        assert.deepEqual(unknownStore.load(), { schemaVersion: 2, episodes: {} });
+        assert.equal(unknownWriterCalled, false, 'unknown-schema store must not engage the migration writer');
       } finally {
         fs.rmSync(root, { recursive: true, force: true });
       }
