@@ -343,7 +343,18 @@ export class RuntimeLearning {
 
       // ---- 2. Due work planning ----
       const plan = this.planner.plan(now);
-      const dueWork = plan.due;
+      // Generic wakes (startup, scheduled, manual): always run all stages so
+      // pre-existing eligible episodes, queue entries, and overdue deadline
+      // work are reconciled even when the planner reports nothing due.
+      // Targeted deadline reasons use the planner's actual due flags.
+      const dueWork = isTargetedWake
+        ? plan.due
+        : {
+          settlementDue: true,
+          operationalRetryDue: true,
+          routineCuratorDue: true,
+          expeditedCuratorDue: true,
+        };
 
       // ---- 3. Settlement (maturation) ----
       const maturation = await this.runMaturation(dueWork, reason === 'settlement-deadline');
@@ -459,6 +470,7 @@ export class RuntimeLearning {
 
     // Review eligible learning episodes
     let reviewedEpisodes = 0;
+    let episodeReviewFailures = 0;
     let settlementError: unknown;
 
     try {
@@ -479,6 +491,7 @@ export class RuntimeLearning {
           // then operational enqueue). If it still throws, the episode will be
           // re-examined on a future wake — safe because the cursor was already
           // advanced and the episode remains durable.
+          episodeReviewFailures++;
           Logger.warning(
             `[RuntimeLearning] review failed for ${episode.episodeId}: ${error.message}`,
           );
@@ -498,9 +511,11 @@ export class RuntimeLearning {
       reviewed: 0, deferredReviewed: 0, operationalReviewed: 0,
       operationalRetried: 0, deferredRetried: 0, transitionsByKind: {},
     };
+    let queueError: unknown;
     try {
       queueResult = await this.skillEvolution.reviewDueQueueEntries();
     } catch (error) {
+      queueError = error;
       Logger.warning(`[RuntimeLearning] queue review failed: ${toErrorMessage(error)}`);
     }
 
@@ -510,11 +525,23 @@ export class RuntimeLearning {
       transitionsByKind[key] = (transitionsByKind[key] ?? 0) + count;
     }
 
-    const status: RuntimeLearningStageStatus = settlementError ? 'failed' : 'succeeded';
+    // Report failure when any per-episode review or queue review failed.
+    // Completed counts and transitions are preserved; operational retry and
+    // cursor semantics are unaffected.
+    const hasEpisodeFailure = episodeReviewFailures > 0;
+    const hasQueueFailure = !!queueError;
+    const status: RuntimeLearningStageStatus = (hasEpisodeFailure || hasQueueFailure || !!settlementError)
+      ? 'failed'
+      : 'succeeded';
+
+    const errorParts: string[] = [];
+    if (hasEpisodeFailure) errorParts.push(`${episodeReviewFailures} episode review(s) failed`);
+    if (hasQueueFailure) errorParts.push(`queue review failed: ${toErrorMessage(queueError)}`);
+    if (settlementError) errorParts.push(`settlement error: ${toErrorMessage(settlementError)}`);
 
     return {
       status,
-      ...(settlementError ? { errorMessage: toErrorMessage(settlementError) } : {}),
+      ...(errorParts.length > 0 ? { errorMessage: errorParts.join('; ') } : {}),
       reviewedEpisodes,
       reviewedQueueEntries: queueResult.reviewed,
       deferredQueueReviews: queueResult.deferredReviewed,
