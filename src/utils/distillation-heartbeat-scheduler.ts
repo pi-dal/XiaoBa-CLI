@@ -378,20 +378,35 @@ export class DistillationHeartbeatScheduler {
       MAX_TIMEOUT_MS,
       Math.max(MIN_TIMEOUT_MS, config.intervalHours * 60 * 60 * 1000),
     );
-    const settlementDelay = this.settlementDeadlineWakeHook || this.runtimeLearningWakeHook
-      ? nextSettlementDeadlineDelay(config.learningEpisodeStorePath, new Date())
+    const settlementDelay = this.hasSettlementDeadlinePlanner()
+      ? this.planNextSettlementDeadlineDelay(config.learningEpisodeStorePath)
       : null;
     const delay = settlementDelay === null
       ? intervalDelay
       : Math.min(intervalDelay, settlementDelay);
     this.timer = setTimeout(async () => {
-      const reason = (this.settlementDeadlineWakeHook || this.runtimeLearningWakeHook)
-        && nextSettlementDeadlineDelay(config.learningEpisodeStorePath, new Date()) === 0
+      const reason = this.hasSettlementDeadlinePlanner()
+        && this.planNextSettlementDeadlineDelay(config.learningEpisodeStorePath) === 0
         ? 'settlement-deadline'
         : 'scheduled';
       await this.runHeartbeat(reason);
       this.scheduleNextRun();
     }, delay);
+  }
+
+  private hasSettlementDeadlinePlanner(): boolean {
+    return Boolean(this.settlementDeadlineWakeHook || this.runtimeLearningWakeHook);
+  }
+
+  private planNextSettlementDeadlineDelay(storePath: string): number | null {
+    try {
+      return nextSettlementDeadlineDelay(storePath, new Date());
+    } catch (error: any) {
+      Logger.warning(
+        `[DistillationHeartbeat] settlement deadline planning failed for ${storePath}: ${error?.message ?? error}; falling back to discovery interval`,
+      );
+      return null;
+    }
   }
 
   private recordHeartbeat(
