@@ -30,7 +30,7 @@ import { PathResolver } from './path-resolver';
 /** A completed delivery attempt is the unit of learning, not a whole task. */
 export const LEARNING_EPISODE_SCHEMA_VERSION = 1 as const;
 
-export type LearningEpisodeStatus = 'settling' | 'contradicted' | 'eligible' | 'rejected';
+export type LearningEpisodeStatus = 'settling' | 'contradicted' | 'eligible';
 
 export type CompletionEvidenceKind =
   | 'artifact-delivery'
@@ -399,7 +399,7 @@ export function settleLearningEpisodes(
   const now = (options.now ?? new Date()).getTime();
   return episodes.map(episode => {
     if (episode.status === 'contradicted' || episode.contradictionSignals.length > 0) {
-      return { ...cloneEpisode(episode), status: 'rejected' };
+      return { ...cloneEpisode(episode), status: 'contradicted' };
     }
     if (episode.status !== 'settling') return cloneEpisode(episode);
     if (Date.parse(episode.settlementDeadline) > now) return cloneEpisode(episode);
@@ -425,6 +425,14 @@ export class LearningEpisodeStore {
     try {
       const parsed = JSON.parse(fs.readFileSync(this.filePath, 'utf8')) as LearningEpisodeStoreState;
       if (parsed.schemaVersion !== LEARNING_EPISODE_SCHEMA_VERSION || !parsed.episodes) throw new Error('invalid episode store');
+      // Migrate legacy schema-v1 'promoted' status to 'eligible' on load.
+      // The parsed JSON may contain 'promoted' even though the current type
+      // does not include it; check the raw value to catch persisted state.
+      for (const episode of Object.values(parsed.episodes)) {
+        if ((episode.status as string) === 'promoted') {
+          episode.status = 'eligible' as const;
+        }
+      }
       return parsed;
     } catch {
       return emptyEpisodeStoreState();
@@ -464,7 +472,7 @@ export class LearningEpisodeStore {
       predecessor.contradictionSignals = [...new Map(
         [...predecessor.contradictionSignals, signal].map(item => [item.signalId, item]),
       ).values()];
-      predecessor.status = predecessor.status === 'eligible' ? 'rejected' : 'contradicted';
+      predecessor.status = 'contradicted';
       predecessor.completionEvidence = uniqueEvidence([...predecessor.completionEvidence, signal.source]);
     }
     this.save(state);
@@ -496,7 +504,7 @@ function mergeEpisode(existing: LearningEpisode | undefined, incoming: LearningE
     contradictionSignals: [...new Map(signals.map(signal => [signal.signalId, signal])).values()],
   };
   if (merged.contradictionSignals.length > 0) {
-    merged.status = existing.status === 'eligible' ? 'rejected' : 'contradicted';
+    merged.status = 'contradicted';
   }
   return merged;
 }
@@ -510,7 +518,7 @@ function linkRetryToStoredPredecessor(
       candidate.runtimeSessionId === episode.runtimeSessionId
       && candidate.deliveryTurn < episode.deliveryTurn,
     )
-    .filter(candidate => candidate.status === 'contradicted' || candidate.status === 'rejected')
+    .filter(candidate => candidate.status === 'contradicted')
     .sort((a, b) => b.deliveryTurn - a.deliveryTurn)[0];
   if (!predecessor) return episode;
   return {

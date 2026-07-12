@@ -76,7 +76,7 @@ describe('V3 independent Learning Episodes', () => {
     assert.ok(retry.completionEvidence.some(evidence => evidence.kind === 'artifact-validation'));
 
     const settled = settleLearningEpisodes(result.episodes, { now: new Date('2026-01-01T04:00:00.000Z') });
-    assert.equal(settled[0].status, 'rejected');
+    assert.equal(settled[0].status, 'contradicted');
     assert.equal(settled[1].status, 'eligible');
   });
 
@@ -106,7 +106,7 @@ describe('V3 independent Learning Episodes', () => {
       assert.equal(Object.keys(state.episodes).length, 2);
       assert.deepEqual(
         Object.values(state.episodes).map(episode => episode.status),
-        ['rejected', 'eligible'],
+        ['contradicted', 'eligible'],
       );
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
@@ -154,9 +154,9 @@ describe('V3 independent Learning Episodes', () => {
         continuityTurns: [turn(2, 'Verified, works.', []), turn(1, 'Deliver a card.', [tool('1', 'send_file', 'sent')])],
       });
       const state = store.applyExtraction(lateCorrection);
-      assert.equal(Object.values(state.episodes)[0].status, 'rejected');
+      assert.equal(Object.values(state.episodes)[0].status, 'contradicted');
       assert.equal(Object.values(state.episodes)[0].contradictionSignals.length, 1);
-      assert.equal(store.settle().episodes[Object.values(state.episodes)[0].episodeId].status, 'rejected');
+      assert.equal(store.settle().episodes[Object.values(state.episodes)[0].episodeId].status, 'contradicted');
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }
@@ -192,7 +192,7 @@ describe('V3 independent Learning Episodes', () => {
       ], source));
       const rejected = store.upsert(first.episodes);
       store.settle({ now: new Date('2026-01-01T04:00:00.000Z') });
-      assert.equal(Object.values(store.load().episodes)[0].status, 'rejected');
+      assert.equal(Object.values(store.load().episodes)[0].status, 'contradicted');
 
       const retry = extractLearningEpisodes({
         ...unit([turn(3, 'Deliver the corrected card.', [tool('3', 'send_file', 'sent')])], source),
@@ -644,8 +644,46 @@ describe('V3 flashcard Composition Capability regression', () => {
       assert.ok(settled[0]!.settlementDeadline < '2026-01-01T04:00:00.000Z');
     });
 
-    test('an eligible episode can be rejected by review without creating a Current Skill', () => {
-      const root = fs.mkdtempSync(path.join(os.tmpdir(), 'xiaoba-eligible-rejected-'));
+    test('legacy promoted status migrates to eligible on load', () => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), 'xiaoba-promoted-migration-'));
+      try {
+        const storePath = path.join(root, 'episodes.json');
+        const store = new LearningEpisodeStore(storePath);
+        // Persist a legacy schema-v1 episode with 'promoted' status
+        const legacyState = {
+          schemaVersion: 1,
+          episodes: {
+            'episode-legacy-001': {
+              schemaVersion: 1,
+              episodeId: 'episode-legacy-001',
+              runtimeSessionId: 'legacy-session',
+              sourceFilePath: path.join(root, 'session.jsonl'),
+              deliveryTurn: 1,
+              completionEvidence: [{ ref: 'legacy#turn-1:delivery', sourceFilePath: root, turn: 1, kind: 'artifact-delivery' as const, detail: 'send_file: legacy report' }],
+              contradictionSignals: [],
+              settlementDeadline: '2026-01-01T04:00:00.000Z',
+              status: 'promoted' as any,
+            } as LearningEpisode,
+          },
+        };
+        fs.writeFileSync(storePath, JSON.stringify(legacyState), 'utf8');
+        const loaded = store.load();
+        const episode = Object.values(loaded.episodes)[0]!;
+        assert.equal(episode.status, 'eligible');
+        assert.equal(episode.episodeId, 'episode-legacy-001');
+        assert.ok(episode.completionEvidence.length >= 1);
+        assert.equal(episode.contradictionSignals.length, 0);
+        // The migration is durable — re-saving and re-loading keeps it 'eligible'
+        store.save(loaded);
+        const reloaded = store.load();
+        assert.equal(Object.values(reloaded.episodes)[0]!.status, 'eligible');
+      } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+      }
+    });
+
+    test('an eligible episode is review-rejected without Capability Transition side effects', () => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), 'xiaoba-eligible-review-rejection-'));
       try {
         const store = new LearningEpisodeStore(path.join(root, 'episodes.json'));
         const episodes = extractLearningEpisodes(unit([
@@ -656,15 +694,17 @@ describe('V3 flashcard Composition Capability regression', () => {
         const settled = store.settle({ now: new Date('2026-01-01T04:00:00.000Z') });
         const episode = Object.values(settled.episodes)[0]!;
         assert.equal(episode.status, 'eligible');
-        // Simulate review rejection: demote to 'rejected' status
-        episode.status = 'rejected';
-        store.save(settled);
-        const loaded = store.load();
-        assert.equal(Object.values(loaded.episodes)[0]!.status, 'rejected');
-        // No Current Skill was ever created — rejecting an eligible episode
-        // is not a Capability Transition, just a status update.
-        assert.ok(Object.values(loaded.episodes)[0]!.completionEvidence.length >= 1);
-        assert.ok(Object.values(loaded.episodes)[0]!.contradictionSignals.length === 0);
+        // Review rejection does NOT change the episode status — the episode
+        // remains 'eligible' as evidence. The rejection is a Capability
+        // Transition outcome (defer/reject in the registry/audit layer),
+        // not an episode state mutation.
+        assert.ok(episode.completionEvidence.length >= 1);
+        assert.equal(episode.contradictionSignals.length, 0);
+        // Verify that no Capability Transition artifacts exist: the episode
+        // is purely a store-level evidence record.
+        assert.ok(!fs.existsSync(path.join(root, 'current-skills.json')));
+        assert.ok(!fs.existsSync(path.join(root, 'transition-audit.jsonl')));
+        assert.ok(!fs.existsSync(path.join(root, 'registry')));
       } finally {
         fs.rmSync(root, { recursive: true, force: true });
       }
@@ -695,7 +735,7 @@ describe('V3 flashcard Composition Capability regression', () => {
         });
         const result = store.applyExtraction(late);
         const episode = Object.values(result.episodes)[0]!;
-        assert.equal(episode.status, 'rejected');
+        assert.equal(episode.status, 'contradicted');
         // Source evidence is preserved despite invalidation
         assert.equal(episode.contradictionSignals.length, 1);
         assert.equal(episode.contradictionSignals[0]!.kind, 'failure-report');
