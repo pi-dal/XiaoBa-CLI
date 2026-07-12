@@ -9,6 +9,8 @@ import {
   loadHeartbeatRecord,
 } from '../src/utils/distillation-heartbeat-scheduler';
 import { getDistillationHeartbeatConfig } from '../src/utils/distillation-heartbeat-config';
+import { Logger } from '../src/utils/logger';
+import { LearningEpisodeStore } from '../src/utils/learning-episode';
 import { loadLogCursorState, getCursor } from '../src/utils/log-cursor-state';
 import { DistillationUnit } from '../src/utils/distillation-unit';
 import { SessionTurnLogEntry } from '../src/utils/session-log-schema';
@@ -282,6 +284,125 @@ describe('DistillationHeartbeatScheduler', () => {
         void scheduler.stop();
       } finally {
         globalThis.setTimeout = originalSetTimeout;
+        restoreProcessEnv(saved);
+        fs.rmSync(root, { recursive: true, force: true });
+      }
+    });
+
+    test('falls back to discovery-interval scheduling when settlement deadline planning cannot migrate the store', async () => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), 'xiaoba-dh-deadline-fallback-'));
+      const saved = { ...process.env };
+      const originalSetTimeout = globalThis.setTimeout;
+      const originalLoad = LearningEpisodeStore.prototype.load;
+      const originalWarning = Logger.warning;
+      const scheduledDelays: number[] = [];
+      const scheduledCallbacks: Array<() => Promise<void>> = [];
+      const warnings: string[] = [];
+      try {
+        const storePath = path.join(root, 'data', 'learning-episodes.json');
+        const recordPath = path.join(root, 'data', 'heartbeat.json');
+        process.env.DISTILLATION_HEARTBEAT_ENABLED = 'true';
+        process.env.DISTILLATION_HEARTBEAT_INTERVAL_MINUTES = '30';
+        delete process.env.DISTILLATION_HEARTBEAT_INTERVAL_HOURS;
+        process.env.DISTILLATION_HEARTBEAT_LOG_ROOT = 'logs';
+        process.env.DISTILLATION_HEARTBEAT_RECORD_FILE = recordPath;
+        process.env.XIAOBA_LEARNING_EPISODE_STORE_FILE = 'data/learning-episodes.json';
+        fs.mkdirSync(path.dirname(storePath), { recursive: true });
+        fs.writeFileSync(storePath, JSON.stringify({
+          schemaVersion: 1,
+          episodes: {
+            'episode-deadline': {
+              schemaVersion: 1,
+              episodeId: 'episode-deadline',
+              runtimeSessionId: 'deadline-runtime',
+              sourceFilePath: path.join(root, 'logs', 'sessions', 'flashcards.jsonl'),
+              deliveryTurn: 1,
+              completionEvidence: [],
+              contradictionSignals: [],
+              settlementDeadline: new Date(Date.now() + 5 * 60 * 1000).toISOString(),
+              status: 'settling',
+            },
+          },
+        }), 'utf8');
+
+        LearningEpisodeStore.prototype.load = function loadWithDeterministicMigrationFailure() {
+          if ((this as unknown as { filePath: string }).filePath === storePath) {
+            throw new Error(
+              'Learning Episode store migration write failed: deterministic migration write failure',
+            );
+          }
+          return originalLoad.call(this);
+        };
+        Logger.warning = (message: string) => {
+          warnings.push(message);
+        };
+        globalThis.setTimeout = ((callback: (...args: any[]) => void, delay?: number) => {
+          scheduledDelays.push(Number(delay));
+          scheduledCallbacks.push(async () => {
+            await callback();
+          });
+          return originalSetTimeout(() => {}, 0);
+        }) as typeof globalThis.setTimeout;
+
+        let runtimeWakeCalls = 0;
+        const scheduler = new DistillationHeartbeatScheduler(
+          root,
+          () => {},
+          null,
+          null,
+          null,
+          async () => {
+            runtimeWakeCalls++;
+            return {
+              maturation: {
+                status: 'skipped',
+                maturedEpisodes: 0,
+                becameEligible: 0,
+                becameContradicted: 0,
+              },
+              review: {
+                status: 'skipped',
+                reviewedEpisodes: 0,
+                reviewedQueueEntries: 0,
+                deferredQueueReviews: 0,
+                operationalQueueReviews: 0,
+                deferredRetries: 0,
+                operationalRetries: 0,
+                transitionsByKind: {},
+              },
+              curation: {
+                status: 'skipped',
+                ran: false,
+                expedited: false,
+                transitionsByKind: {},
+              },
+            };
+          },
+        );
+
+        await scheduler.start();
+        await new Promise(resolve => originalSetTimeout(resolve, 10));
+
+        assert.deepEqual(scheduledDelays, [30 * 60 * 1000]);
+        assert.equal(scheduledCallbacks.length, 1, 'startup should still install a retry timer');
+        assert.ok(
+          warnings.some(message => message.includes('settlement deadline planning failed')),
+          'planner failure should emit a diagnostic warning',
+        );
+
+        await scheduledCallbacks[0]!();
+
+        const record = loadHeartbeatRecord(recordPath);
+        assert.equal(runtimeWakeCalls, 2, 'startup and fallback interval wake should both run');
+        assert.equal(record.runCount, 2, 'the fallback timer should execute a second heartbeat');
+        assert.equal(record.lastReason, 'scheduled');
+        assert.deepEqual(scheduledDelays, [30 * 60 * 1000, 30 * 60 * 1000]);
+
+        await scheduler.stop();
+      } finally {
+        globalThis.setTimeout = originalSetTimeout;
+        LearningEpisodeStore.prototype.load = originalLoad;
+        Logger.warning = originalWarning;
         restoreProcessEnv(saved);
         fs.rmSync(root, { recursive: true, force: true });
       }
