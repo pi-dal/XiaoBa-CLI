@@ -30,7 +30,7 @@ import { PathResolver } from './path-resolver';
 /** A completed delivery attempt is the unit of learning, not a whole task. */
 export const LEARNING_EPISODE_SCHEMA_VERSION = 1 as const;
 
-export type LearningEpisodeStatus = 'settling' | 'contradicted' | 'promoted' | 'rejected';
+export type LearningEpisodeStatus = 'settling' | 'contradicted' | 'eligible' | 'rejected';
 
 export type CompletionEvidenceKind =
   | 'artifact-delivery'
@@ -403,7 +403,7 @@ export function settleLearningEpisodes(
     }
     if (episode.status !== 'settling') return cloneEpisode(episode);
     if (Date.parse(episode.settlementDeadline) > now) return cloneEpisode(episode);
-    const status = options.promote?.(episode) ?? 'promoted';
+    const status = options.promote?.(episode) ?? 'eligible';
     return { ...cloneEpisode(episode), status };
   });
 }
@@ -464,7 +464,7 @@ export class LearningEpisodeStore {
       predecessor.contradictionSignals = [...new Map(
         [...predecessor.contradictionSignals, signal].map(item => [item.signalId, item]),
       ).values()];
-      predecessor.status = predecessor.status === 'promoted' ? 'rejected' : 'contradicted';
+      predecessor.status = predecessor.status === 'eligible' ? 'rejected' : 'contradicted';
       predecessor.completionEvidence = uniqueEvidence([...predecessor.completionEvidence, signal.source]);
     }
     this.save(state);
@@ -496,7 +496,7 @@ function mergeEpisode(existing: LearningEpisode | undefined, incoming: LearningE
     contradictionSignals: [...new Map(signals.map(signal => [signal.signalId, signal])).values()],
   };
   if (merged.contradictionSignals.length > 0) {
-    merged.status = existing.status === 'promoted' ? 'rejected' : 'contradicted';
+    merged.status = existing.status === 'eligible' ? 'rejected' : 'contradicted';
   }
   return merged;
 }
@@ -629,8 +629,8 @@ export interface FlashcardCompositionResult {
 export async function promoteFlashcardComposition(
   options: FlashcardCompositionOptions,
 ): Promise<FlashcardCompositionResult> {
-  if (options.episode.status !== 'promoted') {
-    throw new Error('A flashcard Composition Capability requires a settled, promoted retry episode.');
+  if (options.episode.status !== 'eligible') {
+    throw new Error('A flashcard Composition Capability requires a settled, eligible retry episode.');
   }
   if (options.episode.contradictionSignals.length > 0 || !options.episode.retryOfEpisodeId) {
     throw new Error('A flashcard Composition Capability requires an uncontested retry episode.');
