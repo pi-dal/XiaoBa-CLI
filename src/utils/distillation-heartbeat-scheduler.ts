@@ -13,8 +13,9 @@ import {
   saveLogCursorState,
 } from './log-cursor-state';
 import { getDistillationHeartbeatConfig } from './distillation-heartbeat-config';
-import { LearningEpisodeStore } from './learning-episode';
+
 import { Logger } from './logger';
+import { DueWorkPlanner } from './due-work-planner';
 import {
   RuntimeLearningCurationReport,
   RuntimeLearningDiscoveryReport,
@@ -42,7 +43,7 @@ import {
  * See ADR 0001 → "Runtime Heartbeat Log Distillation".
  */
 
-export type HeartbeatReason = 'startup' | 'scheduled' | 'settlement-deadline' | 'manual';
+export type HeartbeatReason = 'startup' | 'scheduled' | 'settlement-deadline' | 'operational-retry' | 'curator' | 'manual';
 
 export interface HeartbeatRunResult {
   /** Number of Distillation Units produced this cycle. */
@@ -162,6 +163,22 @@ export class DistillationHeartbeatScheduler {
   private running = false;
   private started = false;
   private stopped = false;
+  private readonly overridePlanner: DueWorkPlanner | null;
+  private _planner: DueWorkPlanner | null = null;
+
+  private get planner(): DueWorkPlanner {
+    if (this.overridePlanner) return this.overridePlanner;
+    if (!this._planner) {
+      const config = getDistillationHeartbeatConfig(this.workingDirectory);
+      this._planner = new DueWorkPlanner({
+        learningEpisodeStorePath: config.learningEpisodeStorePath,
+        reviewQueuePath: config.skillEvolutionReviewQueuePath,
+        curatorStatePath: config.skillEvolutionCuratorStatePath,
+        curatorIntervalMs: config.skillEvolutionCuratorIntervalHours * 60 * 60 * 1000,
+      });
+    }
+    return this._planner;
+  }
 
   constructor(
     workingDirectory: string = process.cwd(),
@@ -170,6 +187,7 @@ export class DistillationHeartbeatScheduler {
     settlementDeadlineWakeHook: SettlementDeadlineWakeHook | null = null,
     curatorReviewHook: CuratorReviewHook | null = null,
     runtimeLearningWakeHook: RuntimeLearningWakeHook | null = null,
+    planner?: DueWorkPlanner | null,
   ) {
     this.workingDirectory = workingDirectory;
     this.processor = processor;
@@ -177,6 +195,7 @@ export class DistillationHeartbeatScheduler {
     this.settlementDeadlineWakeHook = settlementDeadlineWakeHook;
     this.curatorReviewHook = curatorReviewHook;
     this.runtimeLearningWakeHook = runtimeLearningWakeHook;
+    this.overridePlanner = planner ?? null;
   }
 
   /**
@@ -251,7 +270,12 @@ export class DistillationHeartbeatScheduler {
     try {
       const config = getDistillationHeartbeatConfig(this.workingDirectory);
       const sessionLogsRoot = resolveSessionLogsRoot(config.logsRoot);
-      const shouldScan = reason !== 'settlement-deadline';
+
+      // Targeted deadline-driven reasons skip session-log scanning.
+      // Generic reasons (startup, scheduled, manual) always scan.
+      const isTargetedWake = reason === 'settlement-deadline' || reason === 'operational-retry' || reason === 'curator';
+      const shouldScan = !isTargetedWake;
+
       if (shouldScan && fs.existsSync(sessionLogsRoot) && fs.statSync(sessionLogsRoot).isDirectory()) {
         const files = collectJsonlFilesForHeartbeat(sessionLogsRoot);
         wake.discovery.scanned = true;
@@ -288,22 +312,27 @@ export class DistillationHeartbeatScheduler {
         Logger.info(`[DistillationHeartbeat] skipped session log scan (${reason})`);
       }
 
+      // For targeted deadline-driven wakes (settlement-deadline,
+      // operational-retry, curator), use the planner to pass due-work
+      // filtering to the coordinator. For generic wakes (startup,
+      // scheduled, manual), omit dueWork so the coordinator runs all
+      // stages as before (backward compatible).
+      const plan = isTargetedWake ? this.planner.plan() : null;
       const coordinated = await this.runRuntimeLearningWakeHook({
         reason,
         discovery: wake.discovery,
         ingestion: wake.ingestion,
+        ...(plan ? { dueWork: plan.due } : {}),
       });
       if (coordinated) {
         wake.maturation = coordinated.maturation;
         wake.review = coordinated.review;
         wake.curation = coordinated.curation;
       } else {
+        // Legacy hooks path (V1/V2). These hooks run unconditionally
+        // for backward compatibility; the runtime learning coordinator
+        // path is the production V3 path.
         await this.runSettlementDeadlineWakeHook();
-
-        // Issue #29: after the new-candidate pass, re-review eligible Needs Review
-        // Queue entries so the heartbeat autonomously consumes retry-eligible
-        // reviews (reviewer version, registry-state, explicit-command, or
-        // matching-evidence changes). The hook is best-effort.
         await this.runCycleCompleteHook();
         await this.runCuratorReviewHook();
       }
@@ -378,35 +407,40 @@ export class DistillationHeartbeatScheduler {
       MAX_TIMEOUT_MS,
       Math.max(MIN_TIMEOUT_MS, config.intervalHours * 60 * 60 * 1000),
     );
-    const settlementDelay = this.hasSettlementDeadlinePlanner()
-      ? this.planNextSettlementDeadlineDelay(config.learningEpisodeStorePath)
-      : null;
-    const delay = settlementDelay === null
-      ? intervalDelay
-      : Math.min(intervalDelay, settlementDelay);
-    this.timer = setTimeout(async () => {
-      const reason = this.hasSettlementDeadlinePlanner()
-        && this.planNextSettlementDeadlineDelay(config.learningEpisodeStorePath) === 0
-        ? 'settlement-deadline'
-        : 'scheduled';
-      await this.runHeartbeat(reason);
-      this.scheduleNextRun();
-    }, delay);
-  }
 
-  private hasSettlementDeadlinePlanner(): boolean {
-    return Boolean(this.settlementDeadlineWakeHook || this.runtimeLearningWakeHook);
-  }
-
-  private planNextSettlementDeadlineDelay(storePath: string): number | null {
+    // Use the planner to derive the next wake time from durable state.
+    // If any non-discovery deadline fires before the discovery interval,
+    // wake earlier. A corrupt or missing planner source falls back to the
+    // interval delay gracefully (the planner returns null for each source).
+    let nextDelay: number;
+    let wakeReason: HeartbeatReason;
     try {
-      return nextSettlementDeadlineDelay(storePath, new Date());
+      const plan = this.planner.plan();
+      if (plan.nextWakeTime !== null) {
+        const deadlineDelta = Math.max(0, plan.nextWakeTime - plan.now.getTime());
+        if (deadlineDelta < intervalDelay) {
+          nextDelay = deadlineDelta;
+          wakeReason = plan.nextWakeReason as HeartbeatReason;
+        } else {
+          nextDelay = intervalDelay;
+          wakeReason = 'scheduled';
+        }
+      } else {
+        nextDelay = intervalDelay;
+        wakeReason = 'scheduled';
+      }
     } catch (error: any) {
       Logger.warning(
-        `[DistillationHeartbeat] settlement deadline planning failed for ${storePath}: ${error?.message ?? error}; falling back to discovery interval`,
+        `[DistillationHeartbeat] planner failed: ${error?.message ?? error}; falling back to discovery interval`,
       );
-      return null;
+      nextDelay = intervalDelay;
+      wakeReason = 'scheduled';
     }
+
+    this.timer = setTimeout(async () => {
+      await this.runHeartbeat(wakeReason);
+      this.scheduleNextRun();
+    }, nextDelay);
   }
 
   private recordHeartbeat(
@@ -446,15 +480,7 @@ export class DistillationHeartbeatScheduler {
   }
 }
 
-function nextSettlementDeadlineDelay(storePath: string, now: Date): number | null {
-  const store = new LearningEpisodeStore(storePath).load();
-  const deadlines = Object.values(store.episodes)
-    .filter(episode => episode.status === 'settling')
-    .map(episode => Date.parse(episode.settlementDeadline))
-    .filter(deadline => Number.isFinite(deadline));
-  if (deadlines.length === 0) return null;
-  return Math.max(0, Math.min(...deadlines) - now.getTime());
-}
+
 
 async function processSessionLogAsync(
   filePath: string,

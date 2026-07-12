@@ -5,6 +5,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 
 import { DistillationHeartbeatScheduler } from '../src/utils/distillation-heartbeat-scheduler';
+import { DueWorkPlanner } from '../src/utils/due-work-planner';
 import { DistillationPipeline } from '../src/utils/distillation-pipeline';
 import { DistillationUnit } from '../src/utils/distillation-unit';
 import { LearningEpisode, LearningEpisodeStore } from '../src/utils/learning-episode';
@@ -210,6 +211,13 @@ function setupEnv(
   });
   const runtimeLearningCoordinator = new RuntimeLearningCoordinator(pipeline, curator);
 
+  const testPlanner = new DueWorkPlanner({
+    learningEpisodeStorePath: episodeStorePath,
+    reviewQueuePath,
+    curatorStatePath: curatorStatePath ?? null,
+    curatorIntervalMs: 24 * 60 * 60 * 1000,
+  });
+
   const makeScheduler = () =>
     new DistillationHeartbeatScheduler(
       root,
@@ -219,6 +227,7 @@ function setupEnv(
       null,
       null,
       context => runtimeLearningCoordinator.runWake(context),
+      testPlanner,
     );
 
   return {

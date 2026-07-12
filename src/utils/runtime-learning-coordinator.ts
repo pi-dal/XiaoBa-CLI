@@ -1,6 +1,7 @@
 import { DistillationPipeline, QueueReviewResultV3, V3PipelineUnitResult } from './distillation-pipeline';
 import { CapabilityTransitionKind } from './skill-evolution';
 import { CuratorRunResult, SkillUsageCurator } from './skill-usage-curator';
+import type { DueWork } from './due-work-planner';
 
 export type RuntimeLearningStageStatus = 'succeeded' | 'failed' | 'skipped';
 
@@ -51,9 +52,11 @@ export interface RuntimeLearningWakeReport {
 }
 
 export interface RuntimeLearningWakeContext {
-  reason: 'startup' | 'scheduled' | 'settlement-deadline' | 'manual';
+  reason: 'startup' | 'scheduled' | 'settlement-deadline' | 'operational-retry' | 'curator' | 'manual';
   discovery: RuntimeLearningDiscoveryReport;
   ingestion: RuntimeLearningIngestionReport;
+  /** Optional filter: when provided, only the due stages execute. */
+  dueWork?: DueWork;
 }
 
 const EMPTY_SETTLEMENT_RESULT: V3PipelineUnitResult = { candidates: [], evolutions: [] };
@@ -71,38 +74,58 @@ export class RuntimeLearningCoordinator {
     private readonly curator?: SkillUsageCurator | null,
   ) {}
 
-  async runWake(_context: RuntimeLearningWakeContext): Promise<RuntimeLearningWakeReport> {
+  async runWake(context: RuntimeLearningWakeContext): Promise<RuntimeLearningWakeReport> {
+    const dueWork = context.dueWork;
+
+    // Track whether each stage was actually attempted so the report can
+    // distinguish 'skipped' (not attempted) from 'succeeded' (ran, zero work).
+    const maturationAttempted = !dueWork || dueWork.settlementDue;
     let settlement = EMPTY_SETTLEMENT_RESULT;
     let settlementError: unknown;
 
-    try {
-      settlement = await this.pipeline.processSettledLearningEpisodes();
-    } catch (error) {
-      settlementError = error;
+    if (maturationAttempted) {
+      try {
+        settlement = await this.pipeline.processSettledLearningEpisodes();
+      } catch (error) {
+        settlementError = error;
+      }
     }
 
-    const maturation = settlementError
-      ? failedMaturationReport(settlementError)
-      : summarizeMaturation(settlement);
+    const maturation = !maturationAttempted
+      ? skippedMaturationReport()
+      : settlementError
+        ? failedMaturationReport(settlementError)
+        : summarizeMaturation(settlement);
 
+    const reviewAttempted = !dueWork || dueWork.settlementDue || dueWork.operationalRetryDue;
     let queue = EMPTY_QUEUE_REVIEW_RESULT;
     let queueError: unknown;
-    try {
-      queue = await this.pipeline.reviewSkillEvolutionQueueEntries();
-    } catch (error) {
-      queueError = error;
+    if (reviewAttempted) {
+      try {
+        queue = await this.pipeline.reviewSkillEvolutionQueueEntries();
+      } catch (error) {
+        queueError = error;
+      }
     }
+
+    const reviewReportStatus = !reviewAttempted
+      ? 'skipped'
+      : settlementError || queueError
+        ? 'failed'
+        : 'succeeded';
 
     const review = summarizeReview(
       settlement,
       queue,
-      settlementError || queueError ? 'failed' : 'succeeded',
-      settlementError || queueError
-        ? [settlementError, queueError].filter(Boolean).map(toErrorMessage).join('; ')
-        : undefined,
+      reviewReportStatus,
+      reviewReportStatus !== 'failed'
+        ? undefined
+        : [settlementError, queueError].filter(Boolean).map(toErrorMessage).join('; '),
     );
 
-    if (!this.curator) {
+    const curationAttempted = !!(this.curator && (!dueWork || dueWork.routineCuratorDue || dueWork.expeditedCuratorDue));
+
+    if (!curationAttempted) {
       return {
         maturation,
         review,
@@ -125,6 +148,15 @@ export class RuntimeLearningCoordinator {
       };
     }
   }
+}
+
+function skippedMaturationReport(): RuntimeLearningMaturationReport {
+  return {
+    status: 'skipped',
+    maturedEpisodes: 0,
+    becameEligible: 0,
+    becameContradicted: 0,
+  };
 }
 
 function summarizeMaturation(result: V3PipelineUnitResult): RuntimeLearningMaturationReport {
