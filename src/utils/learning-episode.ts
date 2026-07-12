@@ -28,7 +28,7 @@ import { SkillParser } from '../skills/skill-parser';
 import { PathResolver } from './path-resolver';
 
 /** A completed delivery attempt is the unit of learning, not a whole task. */
-export const LEARNING_EPISODE_SCHEMA_VERSION = 1 as const;
+export const LEARNING_EPISODE_SCHEMA_VERSION = 2 as const;
 
 export type LearningEpisodeStatus = 'settling' | 'contradicted' | 'eligible';
 
@@ -423,16 +423,49 @@ export class LearningEpisodeStore {
   load(): LearningEpisodeStoreState {
     if (!fs.existsSync(this.filePath)) return emptyEpisodeStoreState();
     try {
-      const parsed = JSON.parse(fs.readFileSync(this.filePath, 'utf8')) as LearningEpisodeStoreState;
-      if (parsed.schemaVersion !== LEARNING_EPISODE_SCHEMA_VERSION || !parsed.episodes) throw new Error('invalid episode store');
-      // Migrate legacy schema-v1 'promoted' status to 'eligible' on load.
-      // The parsed JSON may contain 'promoted' even though the current type
-      // does not include it; check the raw value to catch persisted state.
-      for (const episode of Object.values(parsed.episodes)) {
-        if ((episode.status as string) === 'promoted') {
-          episode.status = 'eligible' as const;
-        }
+      const raw = fs.readFileSync(this.filePath, 'utf8');
+      const parsed = JSON.parse(raw) as unknown as LearningEpisodeStoreState & { schemaVersion?: number };
+
+      // Structural validation
+      if (!parsed.episodes || typeof parsed.episodes !== 'object') throw new Error('invalid episode store');
+
+      // Validate schema version. Accept both v1 (legacy label semantics)
+      // and the current v2.
+      const persistedVersion: number | undefined = parsed.schemaVersion;
+      if (persistedVersion !== undefined && persistedVersion !== 1 && persistedVersion !== 2) {
+        throw new Error('invalid episode store');
       }
+
+      let needsSave = false;
+
+      // Apply v1 → v2 migration when needed.
+      // Legacy status 'promoted' → 'eligible', 'rejected' → 'contradicted'.
+      const persistingV1 = persistedVersion === undefined || persistedVersion === 1;
+      if (persistingV1) {
+        for (const episode of Object.values(parsed.episodes)) {
+          const rawStatus = episode.status as string;
+          if (rawStatus === 'promoted') {
+            episode.status = 'eligible' as const;
+            needsSave = true;
+          } else if (rawStatus === 'rejected') {
+            episode.status = 'contradicted' as const;
+            needsSave = true;
+          }
+        }
+        // Record schema version bump regardless of whether episodes changed
+        // status — a v1 file is not semantically v2 until we persist this.
+        parsed.schemaVersion = LEARNING_EPISODE_SCHEMA_VERSION;
+        needsSave = true;
+      }
+
+      // Auto-save migrated state so callers don't need to save manually.
+      if (needsSave) {
+        fs.mkdirSync(path.dirname(this.filePath), { recursive: true });
+        const temp = `${this.filePath}.${process.pid}.${Date.now()}.migrate.tmp`;
+        fs.writeFileSync(temp, JSON.stringify(parsed, null, 2), { encoding: 'utf8', mode: 0o600 });
+        fs.renameSync(temp, this.filePath);
+      }
+
       return parsed;
     } catch {
       return emptyEpisodeStoreState();
