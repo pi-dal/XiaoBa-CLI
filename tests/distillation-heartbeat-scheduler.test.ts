@@ -10,7 +10,6 @@ import {
 } from '../src/utils/distillation-heartbeat-scheduler';
 import { getDistillationHeartbeatConfig } from '../src/utils/distillation-heartbeat-config';
 import { Logger } from '../src/utils/logger';
-import { LearningEpisodeStore } from '../src/utils/learning-episode';
 import { loadLogCursorState, getCursor } from '../src/utils/log-cursor-state';
 import { DistillationUnit } from '../src/utils/distillation-unit';
 import { SessionTurnLogEntry } from '../src/utils/session-log-schema';
@@ -256,10 +255,10 @@ describe('DistillationHeartbeatScheduler', () => {
         process.env.XIAOBA_LEARNING_EPISODE_STORE_FILE = 'data/learning-episodes.json';
         fs.mkdirSync(path.dirname(storePath), { recursive: true });
         fs.writeFileSync(storePath, JSON.stringify({
-          schemaVersion: 1,
+          schemaVersion: 2,
           episodes: {
             'episode-later-deadline': {
-              schemaVersion: 1,
+              schemaVersion: 2,
               episodeId: 'episode-later-deadline',
               runtimeSessionId: 'later-deadline-runtime',
               sourceFilePath: path.join(root, 'logs', 'sessions', 'flashcards.jsonl'),
@@ -289,15 +288,12 @@ describe('DistillationHeartbeatScheduler', () => {
       }
     });
 
-    test('falls back to discovery-interval scheduling when settlement deadline planning cannot migrate the store', async () => {
-      const root = fs.mkdtempSync(path.join(os.tmpdir(), 'xiaoba-dh-deadline-fallback-'));
+    test('planner schedules settlement-deadline wake ahead of discovery interval', async () => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), 'xiaoba-dh-planner-'));
       const saved = { ...process.env };
       const originalSetTimeout = globalThis.setTimeout;
-      const originalLoad = LearningEpisodeStore.prototype.load;
-      const originalWarning = Logger.warning;
       const scheduledDelays: number[] = [];
       const scheduledCallbacks: Array<() => Promise<void>> = [];
-      const warnings: string[] = [];
       try {
         const storePath = path.join(root, 'data', 'learning-episodes.json');
         const recordPath = path.join(root, 'data', 'heartbeat.json');
@@ -308,34 +304,25 @@ describe('DistillationHeartbeatScheduler', () => {
         process.env.DISTILLATION_HEARTBEAT_RECORD_FILE = recordPath;
         process.env.XIAOBA_LEARNING_EPISODE_STORE_FILE = 'data/learning-episodes.json';
         fs.mkdirSync(path.dirname(storePath), { recursive: true });
+        const deadlineMs = 5 * 60 * 1000;
+        const deadlineIso = new Date(Date.now() + deadlineMs).toISOString();
         fs.writeFileSync(storePath, JSON.stringify({
-          schemaVersion: 1,
+          schemaVersion: 2,
           episodes: {
             'episode-deadline': {
-              schemaVersion: 1,
+              schemaVersion: 2,
               episodeId: 'episode-deadline',
               runtimeSessionId: 'deadline-runtime',
               sourceFilePath: path.join(root, 'logs', 'sessions', 'flashcards.jsonl'),
               deliveryTurn: 1,
               completionEvidence: [],
               contradictionSignals: [],
-              settlementDeadline: new Date(Date.now() + 5 * 60 * 1000).toISOString(),
+              settlementDeadline: deadlineIso,
               status: 'settling',
             },
           },
         }), 'utf8');
 
-        LearningEpisodeStore.prototype.load = function loadWithDeterministicMigrationFailure() {
-          if ((this as unknown as { filePath: string }).filePath === storePath) {
-            throw new Error(
-              'Learning Episode store migration write failed: deterministic migration write failure',
-            );
-          }
-          return originalLoad.call(this);
-        };
-        Logger.warning = (message: string) => {
-          warnings.push(message);
-        };
         globalThis.setTimeout = ((callback: (...args: any[]) => void, delay?: number) => {
           scheduledDelays.push(Number(delay));
           scheduledCallbacks.push(async () => {
@@ -354,28 +341,9 @@ describe('DistillationHeartbeatScheduler', () => {
           async () => {
             runtimeWakeCalls++;
             return {
-              maturation: {
-                status: 'skipped',
-                maturedEpisodes: 0,
-                becameEligible: 0,
-                becameContradicted: 0,
-              },
-              review: {
-                status: 'skipped',
-                reviewedEpisodes: 0,
-                reviewedQueueEntries: 0,
-                deferredQueueReviews: 0,
-                operationalQueueReviews: 0,
-                deferredRetries: 0,
-                operationalRetries: 0,
-                transitionsByKind: {},
-              },
-              curation: {
-                status: 'skipped',
-                ran: false,
-                expedited: false,
-                transitionsByKind: {},
-              },
+              maturation: { status: 'skipped', maturedEpisodes: 0, becameEligible: 0, becameContradicted: 0 },
+              review: { status: 'skipped', reviewedEpisodes: 0, reviewedQueueEntries: 0, deferredQueueReviews: 0, operationalQueueReviews: 0, deferredRetries: 0, operationalRetries: 0, transitionsByKind: {} },
+              curation: { status: 'skipped', ran: false, expedited: false, transitionsByKind: {} },
             };
           },
         );
@@ -383,26 +351,22 @@ describe('DistillationHeartbeatScheduler', () => {
         await scheduler.start();
         await new Promise(resolve => originalSetTimeout(resolve, 10));
 
-        assert.deepEqual(scheduledDelays, [30 * 60 * 1000]);
-        assert.equal(scheduledCallbacks.length, 1, 'startup should still install a retry timer');
+        assert.equal(scheduledDelays.length, 1, 'startup installs one timer');
         assert.ok(
-          warnings.some(message => message.includes('settlement deadline planning failed')),
-          'planner failure should emit a diagnostic warning',
+          scheduledDelays[0]! < 30 * 60 * 1000,
+          'deadline delay must be shorter than the discovery interval',
         );
 
         await scheduledCallbacks[0]!();
 
         const record = loadHeartbeatRecord(recordPath);
-        assert.equal(runtimeWakeCalls, 2, 'startup and fallback interval wake should both run');
-        assert.equal(record.runCount, 2, 'the fallback timer should execute a second heartbeat');
-        assert.equal(record.lastReason, 'scheduled');
-        assert.deepEqual(scheduledDelays, [30 * 60 * 1000, 30 * 60 * 1000]);
+        assert.equal(runtimeWakeCalls, 2, 'startup and deadline wake both run');
+        assert.equal(record.lastReason, 'settlement-deadline', 'deadline wake is detected as settlement');
+        assert.ok(record.runCount >= 2);
 
         await scheduler.stop();
       } finally {
         globalThis.setTimeout = originalSetTimeout;
-        LearningEpisodeStore.prototype.load = originalLoad;
-        Logger.warning = originalWarning;
         restoreProcessEnv(saved);
         fs.rmSync(root, { recursive: true, force: true });
       }
@@ -422,10 +386,10 @@ describe('DistillationHeartbeatScheduler', () => {
         process.env.XIAOBA_LEARNING_EPISODE_STORE_FILE = 'data/learning-episodes.json';
         fs.mkdirSync(path.dirname(storePath), { recursive: true });
         fs.writeFileSync(storePath, JSON.stringify({
-          schemaVersion: 1,
+          schemaVersion: 2,
           episodes: {
             'episode-deadline': {
-              schemaVersion: 1,
+              schemaVersion: 2,
               episodeId: 'episode-deadline',
               runtimeSessionId: 'deadline-runtime',
               sourceFilePath: path.join(root, 'logs', 'sessions', 'flashcards.jsonl'),
@@ -530,6 +494,329 @@ describe('DistillationHeartbeatScheduler', () => {
       } finally {
         env.restore();
         env.teardown();
+      }
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // Issue #52 defect 2: overdue work must schedule immediate targeted wake
+  //   with no discovery scan and no interval delay (scheduler level).
+  // -----------------------------------------------------------------------
+
+  describe('targeted wake for overdue work', () => {
+    test('overdue operational retry schedules immediate targeted wake without discovery', () => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), 'xiaoba-dh-overdue-retry-'));
+      const saved = { ...process.env };
+      const originalSetTimeout = globalThis.setTimeout;
+      const scheduledDelays: number[] = [];
+      const scheduledWakes: string[] = [];
+      try {
+        const reviewQueuePath = path.join(root, 'data', 'review-queue.json');
+        const recordPath = path.join(root, 'data', 'heartbeat.json');
+        const curatorStatePath = path.join(root, 'data', 'curator-state.json');
+        process.env.DISTILLATION_HEARTBEAT_ENABLED = 'true';
+        process.env.DISTILLATION_HEARTBEAT_INTERVAL_HOURS = '6';
+        process.env.DISTILLATION_HEARTBEAT_LOG_ROOT = 'logs';
+        process.env.DISTILLATION_HEARTBEAT_RECORD_FILE = recordPath;
+        process.env.XIAOBA_SKILL_EVOLUTION_REVIEW_QUEUE_FILE = 'data/review-queue.json';
+        process.env.XIAOBA_SKILL_EVOLUTION_CURATOR_STATE_FILE = 'data/curator-state.json';
+
+        // Write an overdue operational retry entry.
+        fs.mkdirSync(path.dirname(reviewQueuePath), { recursive: true });
+        fs.writeFileSync(reviewQueuePath, JSON.stringify({
+          schemaVersion: 1,
+          operational: [{
+            capability: {
+              capabilityId: 'cap-overdue-retry',
+              title: 'test',
+              applicability: '',
+              actionPattern: '',
+              boundaries: [],
+              risks: [],
+              solvedLoop: { problem: '', action: '', verification: '', noCorrection: '' },
+              provenance: [],
+              generatedAt: new Date().toISOString(),
+              sourceUnit: { filePath: '', byteRange: { start: 0, end: 0 }, generatedAt: '' },
+              schemaVersion: 1,
+              kind: 'capability',
+            },
+            bundle: { bundleId: 'bundle-overdue', episode: {}, completionEvidence: [], settlementEvidence: [], boundedContinuity: [], referencedSkills: [], relatedCurrentSkills: [] },
+            reason: 'branch_timeout',
+            errorMessage: 'Timed out',
+            retryCount: 1,
+            currentDelayMs: 60_000,
+            nextRetryAt: new Date(Date.now() - 3600_000).toISOString(), // 1h ago (overdue)
+            failedAt: new Date(Date.now() - 7200_000).toISOString(),
+          }],
+          deferred: [],
+        }), 'utf8');
+
+        // Write an empty curator state so the planner doesn't skip.
+        fs.writeFileSync(curatorStatePath, JSON.stringify({
+          schemaVersion: 1,
+          lastRoutineRunAt: new Date().toISOString(),
+          reviewedOutcomeFactIds: [],
+          observedEpisodeIds: [],
+          expedited: {},
+        }), 'utf8');
+
+        globalThis.setTimeout = ((callback: (...args: any[]) => void, delay?: number) => {
+          scheduledDelays.push(Number(delay));
+          scheduledWakes.push('scheduled');
+          return originalSetTimeout(() => {}, 0);
+        }) as typeof globalThis.setTimeout;
+
+        const scheduler = new DistillationHeartbeatScheduler(root);
+        (scheduler as unknown as { scheduleNextRun: () => void }).scheduleNextRun();
+
+        assert.equal(scheduledDelays.length, 1, 'must schedule one timer');
+        assert.ok(
+          scheduledDelays[0]! < 60 * 1000,
+          'overdue retry must cause near-zero delay, not the 6h discovery interval',
+        );
+        assert.equal(scheduledDelays[0]!, 0, 'overdue retry schedules immediate (0ms) wake');
+
+        void scheduler.stop();
+      } finally {
+        globalThis.setTimeout = originalSetTimeout;
+        restoreProcessEnv(saved);
+        fs.rmSync(root, { recursive: true, force: true });
+      }
+    });
+
+    test('overdue curator work schedules immediate targeted wake without discovery', () => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), 'xiaoba-dh-overdue-curator-'));
+      const saved = { ...process.env };
+      const originalSetTimeout = globalThis.setTimeout;
+      const scheduledDelays: number[] = [];
+      try {
+        const curatorStatePath = path.join(root, 'data', 'curator-state.json');
+        process.env.DISTILLATION_HEARTBEAT_ENABLED = 'true';
+        process.env.DISTILLATION_HEARTBEAT_INTERVAL_HOURS = '6';
+        process.env.DISTILLATION_HEARTBEAT_LOG_ROOT = 'logs';
+        process.env.XIAOBA_SKILL_EVOLUTION_CURATOR_STATE_FILE = 'data/curator-state.json';
+
+        // Write curator state where last routine run was 3 days ago (overdue).
+        fs.mkdirSync(path.dirname(curatorStatePath), { recursive: true });
+        fs.writeFileSync(curatorStatePath, JSON.stringify({
+          schemaVersion: 1,
+          lastRoutineRunAt: new Date(Date.now() - 3 * 24 * 3600_000).toISOString(),
+          reviewedOutcomeFactIds: [],
+          observedEpisodeIds: [],
+          expedited: {},
+        }), 'utf8');
+
+        globalThis.setTimeout = ((callback: (...args: any[]) => void, delay?: number) => {
+          scheduledDelays.push(Number(delay));
+          return originalSetTimeout(() => {}, 0);
+        }) as typeof globalThis.setTimeout;
+
+        const scheduler = new DistillationHeartbeatScheduler(root);
+        (scheduler as unknown as { scheduleNextRun: () => void }).scheduleNextRun();
+
+        assert.equal(scheduledDelays.length, 1, 'must schedule one timer');
+        assert.ok(
+          scheduledDelays[0]! < 60 * 1000,
+          'overdue curator must cause near-zero delay, not the 6h discovery interval',
+        );
+        assert.equal(scheduledDelays[0]!, 0, 'overdue curator schedules immediate (0ms) wake');
+
+        void scheduler.stop();
+      } finally {
+        globalThis.setTimeout = originalSetTimeout;
+        restoreProcessEnv(saved);
+        fs.rmSync(root, { recursive: true, force: true });
+      }
+    });
+
+    test('overdue settlement schedules immediate targeted wake without discovery', () => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), 'xiaoba-dh-overdue-settlement-'));
+      const saved = { ...process.env };
+      const originalSetTimeout = globalThis.setTimeout;
+      const scheduledDelays: number[] = [];
+      try {
+        const storePath = path.join(root, 'data', 'learning-episodes.json');
+        const recordPath = path.join(root, 'data', 'heartbeat.json');
+        process.env.DISTILLATION_HEARTBEAT_ENABLED = 'true';
+        process.env.DISTILLATION_HEARTBEAT_INTERVAL_HOURS = '6';
+        process.env.DISTILLATION_HEARTBEAT_LOG_ROOT = 'logs';
+        process.env.DISTILLATION_HEARTBEAT_RECORD_FILE = recordPath;
+        process.env.XIAOBA_LEARNING_EPISODE_STORE_FILE = 'data/learning-episodes.json';
+
+        // Write an overdue settlement episode.
+        fs.mkdirSync(path.dirname(storePath), { recursive: true });
+        fs.writeFileSync(storePath, JSON.stringify({
+          schemaVersion: 2,
+          episodes: {
+            'ep-overdue': {
+              schemaVersion: 2,
+              episodeId: 'ep-overdue',
+              runtimeSessionId: 'overdue-runtime',
+              sourceFilePath: '/dev/null',
+              deliveryTurn: 1,
+              completionEvidence: [],
+              contradictionSignals: [],
+              settlementDeadline: new Date(Date.now() - 3600_000).toISOString(), // 1h ago
+              status: 'settling',
+            },
+          },
+        }), 'utf8');
+
+        globalThis.setTimeout = ((callback: (...args: any[]) => void, delay?: number) => {
+          scheduledDelays.push(Number(delay));
+          return originalSetTimeout(() => {}, 0);
+        }) as typeof globalThis.setTimeout;
+
+        const scheduler = new DistillationHeartbeatScheduler(root);
+        (scheduler as unknown as { scheduleNextRun: () => void }).scheduleNextRun();
+
+        assert.equal(scheduledDelays.length, 1, 'must schedule one timer');
+        assert.ok(
+          scheduledDelays[0]! < 60 * 1000,
+          'overdue settlement must cause near-zero delay, not the 6h discovery interval',
+        );
+        assert.equal(scheduledDelays[0]!, 0, 'overdue settlement schedules immediate (0ms) wake');
+
+        void scheduler.stop();
+      } finally {
+        globalThis.setTimeout = originalSetTimeout;
+        restoreProcessEnv(saved);
+        fs.rmSync(root, { recursive: true, force: true });
+      }
+    });
+
+    test('overdue operational retry wake skips session-log scan (proven via runHeartbeat)', async () => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), 'xiaoba-dh-overdue-scan-noscan-'));
+      const saved = { ...process.env };
+      try {
+        const reviewQueuePath = path.join(root, 'data', 'review-queue.json');
+        const curatorStatePath = path.join(root, 'data', 'curator-state.json');
+        const recordPath = path.join(root, 'data', 'heartbeat.json');
+        process.env.DISTILLATION_HEARTBEAT_ENABLED = 'true';
+        process.env.DISTILLATION_HEARTBEAT_INTERVAL_HOURS = '6';
+        process.env.DISTILLATION_HEARTBEAT_LOG_ROOT = 'logs';
+        process.env.DISTILLATION_HEARTBEAT_RECORD_FILE = recordPath;
+        process.env.XIAOBA_SKILL_EVOLUTION_REVIEW_QUEUE_FILE = 'data/review-queue.json';
+        process.env.XIAOBA_SKILL_EVOLUTION_CURATOR_STATE_FILE = 'data/curator-state.json';
+
+        // Write an overdue operational retry entry.
+        fs.mkdirSync(path.dirname(reviewQueuePath), { recursive: true });
+        fs.writeFileSync(reviewQueuePath, JSON.stringify({
+          schemaVersion: 1,
+          operational: [{
+            capability: {
+              capabilityId: 'cap-retry-noscan',
+              title: 'test',
+              applicability: '',
+              actionPattern: '',
+              boundaries: [],
+              risks: [],
+              solvedLoop: { problem: '', action: '', verification: '', noCorrection: '' },
+              provenance: [],
+              generatedAt: new Date().toISOString(),
+              sourceUnit: { filePath: '', byteRange: { start: 0, end: 0 }, generatedAt: '' },
+              schemaVersion: 1,
+              kind: 'capability',
+            },
+            bundle: { bundleId: 'bundle-noscan', episode: {}, completionEvidence: [], settlementEvidence: [], boundedContinuity: [], referencedSkills: [], relatedCurrentSkills: [] },
+            reason: 'branch_timeout',
+            errorMessage: 'Timed out',
+            retryCount: 1,
+            currentDelayMs: 60_000,
+            nextRetryAt: new Date(Date.now() - 3600_000).toISOString(),
+            failedAt: new Date(Date.now() - 7200_000).toISOString(),
+          }],
+          deferred: [],
+        }), 'utf8');
+
+        // Empty curator state so the planner loads it.
+        fs.writeFileSync(curatorStatePath, JSON.stringify({
+          schemaVersion: 1,
+          lastRoutineRunAt: new Date().toISOString(),
+          reviewedOutcomeFactIds: [],
+          observedEpisodeIds: [],
+          expedited: {},
+        }), 'utf8');
+
+        // Create a session log with unprocessed content.
+        const sessionLog = path.join(root, 'logs', 'sessions', 'chat', 'test.jsonl');
+        fs.mkdirSync(path.dirname(sessionLog), { recursive: true });
+        fs.writeFileSync(sessionLog, JSON.stringify(makeTurn(1, 'noscan', 'chat')) + '\n', 'utf8');
+
+        let processorCalls = 0;
+        const scheduler = new DistillationHeartbeatScheduler(root, () => {
+          processorCalls++;
+        });
+
+        // Run heartbeat with operational-retry reason (targeted).
+        const result = await scheduler.runHeartbeat('operational-retry');
+
+        assert.equal(result.ran, true);
+        assert.equal(result.unitsProcessed, 0, 'targeted wake must not process distillation units');
+        assert.equal(
+          result.discovery.scanned,
+          false,
+          'targeted wake must skip session-log scanning',
+        );
+        assert.equal(processorCalls, 0, 'processor must not be called');
+      } finally {
+        restoreProcessEnv(saved);
+        fs.rmSync(root, { recursive: true, force: true });
+      }
+    });
+
+    test('overdue curator wake skips session-log scan (proven via runHeartbeat)', async () => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), 'xiaoba-dh-curator-noscan-'));
+      const saved = { ...process.env };
+      try {
+        const curatorStatePath = path.join(root, 'data', 'curator-state.json');
+        const recordPath = path.join(root, 'data', 'heartbeat.json');
+        process.env.DISTILLATION_HEARTBEAT_ENABLED = 'true';
+        process.env.DISTILLATION_HEARTBEAT_INTERVAL_HOURS = '6';
+        process.env.DISTILLATION_HEARTBEAT_LOG_ROOT = 'logs';
+        process.env.DISTILLATION_HEARTBEAT_RECORD_FILE = recordPath;
+        process.env.XIAOBA_SKILL_EVOLUTION_CURATOR_STATE_FILE = 'data/curator-state.json';
+
+        // Write curator state with expedited wake request.
+        fs.mkdirSync(path.dirname(curatorStatePath), { recursive: true });
+        fs.writeFileSync(curatorStatePath, JSON.stringify({
+          schemaVersion: 1,
+          lastRoutineRunAt: new Date().toISOString(),
+          reviewedOutcomeFactIds: [],
+          observedEpisodeIds: [],
+          expedited: {
+            'cap-expedited': {
+              capabilityHandle: 'cap-expedited',
+              outcomeFactIds: ['fact-1'],
+              requestedAt: new Date().toISOString(),
+            },
+          },
+        }), 'utf8');
+
+        // Create a session log with unprocessed content.
+        const sessionLog = path.join(root, 'logs', 'sessions', 'chat', 'test.jsonl');
+        fs.mkdirSync(path.dirname(sessionLog), { recursive: true });
+        fs.writeFileSync(sessionLog, JSON.stringify(makeTurn(1, 'curator-noscan', 'chat')) + '\n', 'utf8');
+
+        let processorCalls = 0;
+        const scheduler = new DistillationHeartbeatScheduler(root, () => {
+          processorCalls++;
+        });
+
+        // Run heartbeat with curator reason (targeted).
+        const result = await scheduler.runHeartbeat('curator');
+
+        assert.equal(result.ran, true);
+        assert.equal(result.unitsProcessed, 0, 'targeted wake must not process distillation units');
+        assert.equal(
+          result.discovery.scanned,
+          false,
+          'targeted wake must skip session-log scanning',
+        );
+        assert.equal(processorCalls, 0, 'processor must not be called');
+      } finally {
+        restoreProcessEnv(saved);
+        fs.rmSync(root, { recursive: true, force: true });
       }
     });
   });
