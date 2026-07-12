@@ -270,10 +270,16 @@ function extractShellMetadata(
     command: firstNonEmpty(stringArg(args, 'command'), readCommand(rawText)),
     description: stringArg(args, 'description'),
     timeout: numberArg(args, 'timeout'),
-    cwd: firstNonEmpty(stringArg(args, 'cwd'), stringArg(args, 'workingDirectory')),
+    cwd: firstNonEmpty(
+      stringArg(args, 'cwd'),
+      stringArg(args, 'workingDirectory'),
+      readField(rawText, 'cwd'),
+      readField(rawText, 'cwd_after'),
+      readField(rawText, 'cwd_before'),
+    ),
     status: readStatus(rawText),
-    elapsed: readHeader(rawText, 'Elapsed'),
-    outputLines: readHeader(rawText, 'Output lines'),
+    elapsed: firstNonEmpty(readHeader(rawText, 'Elapsed'), readDuration(rawText)),
+    outputLines: firstNonEmpty(readHeader(rawText, 'Output lines'), readOutputLines(rawText)),
   };
 }
 
@@ -368,6 +374,19 @@ function readField(rawText: string, key: string): string | undefined {
 
 function readHeader(rawText: string, label: string): string | undefined {
   return readField(rawText, label);
+}
+
+function readDuration(rawText: string): string | undefined {
+  const durationMs = readField(rawText, 'duration_ms');
+  return durationMs ? `${durationMs}ms` : undefined;
+}
+
+function readOutputLines(rawText: string): string | undefined {
+  const stdoutLines = Number(readField(rawText, 'stdout_lines'));
+  const stderrLines = Number(readField(rawText, 'stderr_lines'));
+  if (!Number.isFinite(stdoutLines) && !Number.isFinite(stderrLines)) return undefined;
+  return String((Number.isFinite(stdoutLines) ? stdoutLines : 0)
+    + (Number.isFinite(stderrLines) ? stderrLines : 0));
 }
 
 function parseToolArguments(toolCall?: NonNullable<Message['tool_calls']>[number]): Record<string, unknown> {
