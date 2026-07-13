@@ -92,7 +92,7 @@ test('deferred reassessment remains durable across repeated wakes until input ch
   }
 });
 
-test('route-only dependent drift refreshes registry metadata without changing guidance revision', async () => {
+test('route-only dependent drift refreshes registry metadata without changing guidance content', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'xiaoba-reassessment-dependent-'));
   try {
     const outputDir = path.join(root, 'skills', 'generated-distilled');
@@ -127,7 +127,7 @@ test('route-only dependent drift refreshes registry metadata without changing gu
 
     const results = await bootstrapSemanticReassessmentOnce({ skillEvolution: runtime, manifestPath: path.join(root, 'data', 'manifest.json') });
     assert.equal(results.length, 1);
-    assert.equal(runtime.getRegistry().capabilities.dependent!.revision, 1);
+    assert.equal(runtime.getRegistry().capabilities.dependent!.revision, 2);
     assert.equal(runtime.getRegistry().capabilities.dependent!.guidanceHash, dependentHash);
     assert.equal(runtime.getRegistry().capabilities.dependent!.referencedSkills[0]!.name, 'new-route');
     assert.ok(runtime.getAudit().some(entry => entry.transition === 'append_evidence' && entry.involvedCapabilityHandles.includes('dependent')));
@@ -197,7 +197,7 @@ test('changed referenced guidance reviews every stale dependent skill', async ()
     const updated = runtime.getRegistry();
     for (const handle of ['dependent-a', 'dependent-b']) {
       assert.equal(updated.capabilities[handle]!.referencedSkills[0]!.guidanceHash, sourceHash);
-      assert.equal(updated.capabilities[handle]!.revision, 1);
+      assert.equal(updated.capabilities[handle]!.revision, 2);
     }
   } finally {
     fs.rmSync(root, { recursive: true, force: true });

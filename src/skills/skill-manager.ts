@@ -111,6 +111,11 @@ export class SkillManager {
    * 获取所有可用的 skills
    */
   getAllSkills(): Skill[] {
+    // This API is intentionally synchronous because it is used by prompt
+    // construction, command discovery, and dashboard snapshots. Reconcile
+    // the durable Registry here so those callers do not keep exposing a
+    // retired generated route until the next async resolveSkill call.
+    this.refreshCatalogSynchronously();
     return Array.from(this.skills.values());
   }
 
@@ -151,7 +156,7 @@ export class SkillManager {
       this.removeGeneratedSkills();
       return;
     }
-    if (latest.catalogRevision === this.catalogRevision) {
+    if (!this.registryLoadFailed && latest.catalogRevision === this.catalogRevision) {
       this.registry = latest;
       return;
     }
@@ -160,6 +165,52 @@ export class SkillManager {
     this.catalogRevision = latest.catalogRevision;
     this.registryLoadFailed = false;
     await this.loadSkillsFromPath(this.skillsPath);
+  }
+
+  /**
+   * Synchronous counterpart used by discovery/listing consumers. The
+   * Registry's catalogRevision is the durable invalidation token; when it
+   * changes, keep manual filesystem skills and replace only generated
+   * entries with the active Registry-referenced files.
+   */
+  private refreshCatalogSynchronously(): void {
+    let latest: CurrentSkillRegistryState;
+    try {
+      latest = loadCurrentSkillRegistry(PathResolver.getSkillEvolutionRegistryPath());
+    } catch (error: any) {
+      Logger.warning(`Failed to refresh generated skill Registry: ${error.message}`);
+      this.registry = undefined;
+      this.registryLoadFailed = true;
+      this.removeGeneratedSkills();
+      return;
+    }
+
+    if (!this.registryLoadFailed && latest.catalogRevision === this.catalogRevision) {
+      this.registry = latest;
+      return;
+    }
+
+    this.registry = latest;
+    this.catalogRevision = latest.catalogRevision;
+    this.registryLoadFailed = false;
+    this.removeGeneratedSkills();
+
+    for (const record of Object.values(latest.capabilities)) {
+      if (!isGeneratedSkillPath(record.skillFilePath)) continue;
+      try {
+        const skill = SkillParser.parse(record.skillFilePath);
+        // A stale or manually edited generated file must not reintroduce an
+        // old public route. Only the route named by the current Registry is
+        // admitted synchronously.
+        if (skill.metadata.name !== record.routingName) {
+          Logger.warning(`Generated skill route does not match Registry: ${record.skillFilePath}`);
+          continue;
+        }
+        this.skills.set(skill.metadata.name, skill);
+      } catch (error: any) {
+        Logger.warning(`Failed to load active generated skill from ${record.skillFilePath}: ${error.message}`);
+      }
+    }
   }
 
   /**

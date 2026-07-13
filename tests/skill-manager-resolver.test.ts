@@ -100,6 +100,65 @@ describe('SkillManager canonical route resolution', () => {
     assert.equal(resolution?.resolvedName, 'flashcard-image-generation');
   });
 
+  test('synchronous discovery refreshes active generated routes after catalog changes', async () => {
+    const manualPath = path.join(root, 'skills', 'manual-workflow', 'SKILL.md');
+    const retiredPath = path.join(root, 'skills', 'generated-distilled', 'cap_retired', 'SKILL.md');
+    const activePath = path.join(root, 'skills', 'generated-distilled', 'cap_active', 'SKILL.md');
+    writeSkill(manualPath, 'manual-workflow');
+    writeSkill(retiredPath, 'old-generated-route');
+    writeSkill(activePath, 'current-generated-route');
+
+    const registry = emptyCurrentSkillRegistryState();
+    registry.catalogRevision = 1;
+    registry.capabilities.cap_retired = {
+      handle: 'cap_retired',
+      revision: 1,
+      routingName: 'old-generated-route',
+      description: 'Retired generated route.',
+      skillFilePath: retiredPath,
+      guidanceHash: 'hash-old',
+      evidenceRefs: [],
+      referencedSkills: [],
+      createdAt: new Date(0).toISOString(),
+      updatedAt: new Date(0).toISOString(),
+    };
+    saveCurrentSkillRegistry(process.env.XIAOBA_SKILL_EVOLUTION_REGISTRY_FILE!, registry);
+
+    const manager = new SkillManager();
+    await manager.loadSkills();
+    assert.deepEqual(
+      manager.getAllSkills().map(skill => skill.metadata.name).sort(),
+      ['manual-workflow', 'old-generated-route'],
+    );
+
+    delete registry.capabilities.cap_retired;
+    registry.catalogRevision = 2;
+    registry.capabilities.cap_active = {
+      handle: 'cap_active',
+      revision: 1,
+      routingName: 'current-generated-route',
+      description: 'Current generated route.',
+      skillFilePath: activePath,
+      guidanceHash: 'hash-current',
+      evidenceRefs: [],
+      referencedSkills: [],
+      createdAt: new Date(0).toISOString(),
+      updatedAt: new Date(0).toISOString(),
+    };
+    saveCurrentSkillRegistry(process.env.XIAOBA_SKILL_EVOLUTION_REGISTRY_FILE!, registry);
+
+    // Listing is synchronous; it must observe the durable catalog revision
+    // without requiring an unrelated async resolveSkill call first.
+    assert.deepEqual(
+      manager.getAllSkills().map(skill => skill.metadata.name).sort(),
+      ['current-generated-route', 'manual-workflow'],
+    );
+    assert.deepEqual(
+      manager.getUserInvocableSkills().map(skill => skill.metadata.name).sort(),
+      ['current-generated-route', 'manual-workflow'],
+    );
+  });
+
   test('resolves a retired route in one hop through the current Capability route', async () => {
     const firstHandle = 'cap_first';
     const secondHandle = 'cap_second';

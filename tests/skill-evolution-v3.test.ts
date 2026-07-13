@@ -1141,7 +1141,7 @@ describe('V3 verified semantic Current Skills', () => {
       assert.equal(append.audit.resultingGuidanceHash, first.guidanceHash);
       const afterAppend = loadCurrentSkillRegistry(env.options.registryPath).capabilities[first.handle]!;
       assert.equal(afterAppend.guidanceHash, first.guidanceHash);
-      assert.equal(afterAppend.revision, first.revision, 'evidence-only metadata does not create a guidance revision');
+      assert.equal(afterAppend.revision, first.revision + 1, 'every Registry mutation advances the optimistic-concurrency revision');
 
       const previousActiveContent = fs.readFileSync(first.skillFilePath, 'utf8');
       const replace = apply({ body: 'Replacement guidance with a validated boundary.', envelope: {

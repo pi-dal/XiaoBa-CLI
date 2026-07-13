@@ -873,6 +873,10 @@ export class SkillEvolutionRuntime {
     const target = cloneRegistry(registry);
     const updated: CurrentSkillRecord = {
       ...current,
+      // The executable guidance remains unchanged, but the Registry record
+      // changed. Advance its optimistic-concurrency revision so a reviewer
+      // holding the prior metadata read set cannot clobber this refresh.
+      revision: current.revision + 1,
       referencedSkills: normalized,
       updatedAt: now,
     };
@@ -1497,10 +1501,11 @@ export function applyCapabilityTransition(input: ApplyTransitionInput): AppliedT
     resultingGuidanceHash = existing!.guidanceHash;
     resultingRecord = {
       ...existing!,
-      // Evidence and reference metadata are not executable guidance. Keep
-      // the guidance revision stable so only material body changes create a
-      // new revisioned snapshot.
-      revision: existing!.revision,
+      // Evidence and reference metadata do not change the active guidance
+      // body, but they are still a durable Registry mutation. Advance the
+      // record revision so reviewers holding an older read set cannot
+      // overwrite the newly admitted evidence metadata.
+      revision: existing!.revision + 1,
       evidenceRefs: mergeEvidence(existing!.evidenceRefs, evidenceRefs),
       referencedSkills: input.draft.envelope.referencedSkills !== undefined
         ? referencedSkillSnapshots(input.draft, input.bundle)
