@@ -297,6 +297,131 @@ describe('V3 verified semantic Current Skills', () => {
     }
   });
 
+  test('allows Author evidence refs that come from the fixed semantic observations', async () => {
+    const env = setup();
+    try {
+      let verifierCalled = false;
+      env.options.authorFixture = () => ({
+        body: 'Use the bounded flashcard workflow.',
+        envelope: {
+          decision: 'create_current_skill',
+          routingName: 'flashcard-observation-workflow',
+          description: 'Deliver a validated flashcard artifact from the observed workflow.',
+          evidenceRefs: ['session.jsonl#12:user-intent', 'session.jsonl#12:workflow:execute_shell'],
+        },
+      });
+      env.options.verifierFixture = ({ draft }) => {
+        verifierCalled = true;
+        assert.equal(draft.envelope.evidenceRefs?.length, 2);
+        return { decision: 'accept', transition: 'create_current_skill', issues: [], rationale: 'The cited observation refs are inside the fixed bundle.' };
+      };
+
+      const result = await new SkillEvolutionRuntime(env.options).reviewAndApply(fixtureBundle());
+      assert.equal(result.transition, 'create_current_skill');
+      assert.equal(result.verified, true);
+      assert.equal(verifierCalled, true);
+      assert.deepEqual(loadTransitionAudit(env.options.auditPath)[0]?.evidenceRefs, [
+        'session.jsonl#12:user-intent',
+        'session.jsonl#12:workflow:execute_shell',
+      ]);
+    } finally {
+      env.cleanup();
+    }
+  });
+
+  test('defers a replace_current_skill draft that silently changes the public route', async () => {
+    const env = setup();
+    try {
+      const runtime = new SkillEvolutionRuntime(env.options);
+      const created = await runtime.reviewAndApply(fixtureBundle());
+      assert.ok(created.record);
+      let verifierCalled = false;
+      env.options.authorFixture = ({ bundle }) => ({
+        body: 'Use the revised workflow while preserving the bounded evidence.',
+        envelope: {
+          decision: 'replace_current_skill',
+          targetCapabilityHandle: created.record!.handle,
+          routingName: 'flashcard-observation-workflow',
+          description: 'Deliver a validated flashcard artifact from the observed workflow.',
+          evidenceRefs: ['session.jsonl#12', 'session.jsonl#13'],
+        },
+      });
+      env.options.verifierFixture = () => {
+        verifierCalled = true;
+        return { decision: 'accept', transition: 'replace_current_skill', issues: [], rationale: 'not reached' };
+      };
+
+      const result = await runtime.reviewAndApply({
+        ...fixtureBundle(),
+        bundleId: 'route-mismatch',
+        relatedCurrentSkills: [{
+          handle: created.record!.handle,
+          revision: created.record!.revision,
+          routingName: created.record!.routingName,
+          description: created.record!.description,
+          guidanceHash: created.record!.guidanceHash,
+        }],
+      });
+      assert.equal(result.transition, 'defer');
+      assert.equal(result.verified, false);
+      assert.equal(verifierCalled, false);
+      assert.match(loadTransitionAudit(env.options.auditPath).at(-1)?.rationale ?? '', /preserve.*route|migrate_skill_route/i);
+    } finally {
+      env.cleanup();
+    }
+  });
+
+  test('allows replacing a legacy current skill while preserving its generic public route', async () => {
+    const env = setup();
+    try {
+      const runtime = new SkillEvolutionRuntime(env.options);
+      const created = await runtime.reviewAndApply(fixtureBundle());
+      assert.ok(created.record);
+
+      const registry = loadCurrentSkillRegistry(env.options.registryPath);
+      registry.capabilities[created.record!.handle] = {
+        ...registry.capabilities[created.record!.handle]!,
+        routingName: 'settled-artifact-delivery',
+      };
+      saveCurrentSkillRegistry(env.options.registryPath, registry);
+
+      let verifierCalled = false;
+      env.options.authorFixture = ({ bundle }) => ({
+        body: 'Use the revised bounded workflow and verify the delivered artifact.',
+        envelope: {
+          decision: 'replace_current_skill',
+          targetCapabilityHandle: created.record!.handle,
+          routingName: 'settled-artifact-delivery',
+          description: 'Deliver and verify the bounded artifact workflow.',
+          evidenceRefs: ['session.jsonl#12', 'session.jsonl#13'],
+        },
+      });
+      env.options.verifierFixture = ({ draft }) => {
+        verifierCalled = true;
+        assert.equal(draft.envelope.routingName, 'settled-artifact-delivery');
+        return { decision: 'accept', transition: 'replace_current_skill', issues: [], rationale: 'The legacy route is preserved while the bounded guidance is revised.' };
+      };
+
+      const result = await runtime.reviewAndApply({
+        ...fixtureBundle(),
+        bundleId: 'legacy-route-replacement',
+        relatedCurrentSkills: [{
+          handle: created.record!.handle,
+          revision: registry.capabilities[created.record!.handle]!.revision,
+          routingName: 'settled-artifact-delivery',
+          description: registry.capabilities[created.record!.handle]!.description,
+          guidanceHash: registry.capabilities[created.record!.handle]!.guidanceHash,
+        }],
+      });
+      assert.equal(result.transition, 'replace_current_skill');
+      assert.equal(result.verified, true);
+      assert.equal(verifierCalled, true);
+      assert.equal(result.record?.routingName, 'settled-artifact-delivery');
+    } finally {
+      env.cleanup();
+    }
+  });
+
   test('defers an obviously lifecycle-bound routing name instead of assigning a generic replacement', async () => {
     const env = setup();
     try {
