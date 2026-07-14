@@ -290,6 +290,22 @@ describe('Legacy distilled skill bootstrap (issue #40)', () => {
     assert.ok(queued, 'operational entry is written to review queue');
     assert.equal(queued!.attempts, 1);
 
+    // Public-seam regression: the operational retry snapshot must remain a fixed
+    // Evidence Bundle whose completion/settlement refs stay consistent with the
+    // sourceEvidence roles, so revalidation does not trip the source-evidence
+    // invariant and the real bootstrap retry path can settle the entry.
+    const snapshot = queued!.bundle;
+    assert.ok(snapshot.sourceEvidence, 'operational snapshot carries bounded source evidence');
+    const sourceByRef = new Map(snapshot.sourceEvidence!.map(item => [item.ref, item]));
+    for (const ref of snapshot.completionEvidence) {
+      assert.equal(sourceByRef.get(ref.ref)?.role, 'problem-action',
+        'operational snapshot completion refs keep the problem-action source-evidence role');
+    }
+    for (const ref of snapshot.settlementEvidence) {
+      assert.equal(sourceByRef.get(ref.ref)?.role, 'verification',
+        'operational snapshot settlement refs keep the verification source-evidence role');
+    }
+
     const repeated = await bootstrapLegacyDistilledSkillsOnce({
       skillEvolution: runtime,
       generatedDistilledRoot: artifacts.generatedRoot,

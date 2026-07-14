@@ -741,12 +741,16 @@ export class SkillEvolutionRuntime {
   }
 
   private buildOperationalFailureBundleSnapshot(bundle: EvidenceBundle): EvidenceBundle {
-    const settlementRefs = [...bundle.settlementEvidence.map(item => item.ref)];
-    const completionEvidence = mergeEvidence([...bundle.completionEvidence], settlementRefs);
-    return {
-      ...bundle,
-      completionEvidence,
-    };
+    // The operational retry snapshot must remain a fixed Evidence Bundle whose
+    // completion/settlement refs stay consistent with the sourceEvidence roles.
+    // Merging settlement refs into completionEvidence (the previous behaviour)
+    // violated the source-evidence invariant: a settlement ref carries the
+    // 'verification' role, but validateEvidenceBundle requires every
+    // completionEvidence ref to map to a 'problem-action' sourceEvidence entry.
+    // On revalidation that mismatch threw a fresh operational failure, so the
+    // queue entry never cleared and bootstrap could never delete the artifact.
+    // A deep frozen clone preserves the original role-aligned refs unchanged.
+    return freezeClone(bundle);
   }
 
   private async reviewDueQueueEntriesInternal(): Promise<SkillEvolutionQueueReviewResult> {

@@ -871,7 +871,11 @@ describe('V3 verified semantic Current Skills', () => {
       assert.ok(entry);
       assert.equal(entry.failureKind, 'branch_timeout');
       assert.equal(entry.bundle.bundleId, 'episode-flashcard-1');
-      assert.equal(entry.bundle.completionEvidence.length, 2);
+      // The operational retry snapshot must remain a fixed Evidence Bundle: the
+      // original completion/settlement refs are preserved unchanged (not merged),
+      // so revalidation keeps completion/settlement consistent with sourceEvidence roles.
+      assert.equal(entry.bundle.completionEvidence.length, 1);
+      assert.equal(entry.bundle.settlementEvidence.length, 1);
       assert.deepEqual(loadCurrentSkillRegistry(env.options.registryPath).capabilities, {});
     } finally {
       env.cleanup();
