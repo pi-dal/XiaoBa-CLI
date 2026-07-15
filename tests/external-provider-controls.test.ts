@@ -18,9 +18,11 @@
 
 import { afterEach, beforeEach, describe, test } from 'node:test';
 import * as assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { pathToFileURL } from 'node:url';
 
 import { getDistillationHeartbeatConfig } from '../src/utils/distillation-heartbeat-config';
 import {
@@ -29,6 +31,8 @@ import {
   type ExternalProviderOverrideState,
 } from '../src/utils/external-provider-controls';
 
+const PROJECT_ROOT = path.resolve(__dirname, '..');
+const TSX_LOADER = pathToFileURL(require.resolve('tsx')).href;
 const tempRoots: string[] = [];
 afterEach(() => {
   for (const root of tempRoots.splice(0)) {
@@ -149,6 +153,22 @@ describe('config enabled provider set', () => {
     const config = getDistillationHeartbeatConfig(env.root);
     assert.equal(config.externalSessionLogSourcesEnabled, false);
   });
+
+  test('history mode accepts catch-up and bounds missing or invalid fallback diagnostics', () => {
+    process.env.XIAOBA_EXTERNAL_SESSION_LOG_HISTORY_MODE = 'catch-up';
+    assert.equal(getDistillationHeartbeatConfig(env.root).externalSessionLogHistoryMode, 'catch-up');
+
+    delete process.env.XIAOBA_EXTERNAL_SESSION_LOG_HISTORY_MODE;
+    const missing = getDistillationHeartbeatConfig(env.root);
+    assert.equal(missing.externalSessionLogHistoryMode, 'future-only');
+    assert.equal(missing.externalSessionLogHistoryModeDiagnostic, 'External history mode is not configured; using future-only.');
+
+    process.env.XIAOBA_EXTERNAL_SESSION_LOG_HISTORY_MODE = 'an-unbounded-invalid-value-that-must-not-be-echoed';
+    const invalid = getDistillationHeartbeatConfig(env.root);
+    assert.equal(invalid.externalSessionLogHistoryMode, 'future-only');
+    assert.equal(invalid.externalSessionLogHistoryModeDiagnostic, 'External history mode is invalid; using future-only.');
+    assert.equal(invalid.externalSessionLogHistoryModeDiagnostic!.includes('an-unbounded'), false);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -231,6 +251,23 @@ describe('ExternalProviderOverrideStore', () => {
     assert.ok(enabled.includes('codex'));
     assert.ok(!enabled.includes('claude'));
     assert.ok(enabled.includes('pi'));
+  });
+
+  test('durable history override survives restart and reset restores the environment mode', () => {
+    process.env.XIAOBA_EXTERNAL_SESSION_LOG_SOURCES_ENABLED = 'true';
+    process.env.XIAOBA_EXTERNAL_SESSION_LOG_ENABLED_PROVIDERS = 'codex';
+    process.env.XIAOBA_EXTERNAL_SESSION_LOG_HISTORY_MODE = 'future-only';
+    const config = getDistillationHeartbeatConfig(env.root);
+    const first = createStore();
+    first.setProviderHistoryMode('codex', 'catch-up');
+    assert.equal(first.getProviderStatus('codex', config).historyMode, 'catch-up');
+    assert.equal(first.getProviderStatus('codex', config).historyModeSource, 'override');
+
+    const restarted = createStore();
+    assert.equal(restarted.getProviderStatus('codex', config).historyMode, 'catch-up');
+    restarted.resetProvider('codex');
+    assert.equal(restarted.getProviderStatus('codex', config).historyMode, 'future-only');
+    assert.equal(restarted.getProviderStatus('codex', config).historyModeSource, 'environment');
   });
 
   test('enable with scope narrow sets scope on the override', () => {
@@ -366,6 +403,99 @@ describe('external-source CLI command', () => {
     const config = getDistillationHeartbeatConfig(env.root);
     const enabled = store.resolveEnabledProviders(config);
     assert.ok(enabled.includes('claude'));
+  });
+
+  test('enable --history and history switching persist the provider policy', async () => {
+    process.env.XIAOBA_EXTERNAL_SESSION_LOG_SOURCES_ENABLED = 'true';
+    process.env.XIAOBA_EXTERNAL_SESSION_LOG_ENABLED_PROVIDERS = 'codex';
+    process.env.XIAOBA_EXTERNAL_SESSION_LOG_HISTORY_MODE = 'future-only';
+    const { externalSourceCommand } = await import('../src/commands/external-source');
+
+    await externalSourceCommand({
+      subcommand: 'enable',
+      provider: 'codex',
+      history: 'catch-up',
+      workingDirectory: env.root,
+    } as Parameters<typeof externalSourceCommand>[0]);
+
+    const store = new ExternalProviderOverrideStore({
+      stateFilePath: path.join(env.root, 'data', 'external-provider-overrides.json'),
+    });
+    const config = getDistillationHeartbeatConfig(env.root);
+    assert.equal(store.getProviderStatus('codex', config).historyMode, 'catch-up');
+    const statusOutput = await captureOutput(() => externalSourceCommand({
+      subcommand: 'status',
+      json: true,
+      workingDirectory: env.root,
+    }));
+    const status = JSON.parse(statusOutput) as { providers: Array<{ provider: string; historyMode: string }> };
+    assert.equal(status.providers.find(provider => provider.provider === 'codex')?.historyMode, 'catch-up');
+
+    await externalSourceCommand({
+      subcommand: 'history',
+      provider: 'codex',
+      history: 'future-only',
+      workingDirectory: env.root,
+    } as Parameters<typeof externalSourceCommand>[0]);
+
+    const restartedStore = new ExternalProviderOverrideStore({
+      stateFilePath: path.join(env.root, 'data', 'external-provider-overrides.json'),
+    });
+    assert.equal(restartedStore.getProviderStatus('codex', config).historyMode, 'future-only');
+  });
+
+  test('Commander wiring persists history mode and returns normal process exits', () => {
+    const processEnv = {
+      ...process.env,
+      XIAOBA_RUNTIME_ROOT: env.root,
+      DISTILLATION_HEARTBEAT_ENABLED: 'true',
+      DISTILLATION_HEARTBEAT_LOG_ROOT: 'logs',
+      XIAOBA_EXTERNAL_SESSION_LOG_SOURCES_ENABLED: 'true',
+      XIAOBA_EXTERNAL_SESSION_LOG_ENABLED_PROVIDERS: 'codex',
+      XIAOBA_EXTERNAL_SESSION_LOG_HISTORY_MODE: 'future-only',
+    };
+    const valid = spawnSync(process.execPath, [
+      '--import',
+      TSX_LOADER,
+      path.join(PROJECT_ROOT, 'src/index.ts'),
+      'external-source',
+      'enable',
+      'codex',
+      '--history',
+      'catch-up',
+      '--working-directory',
+      env.root,
+    ], {
+      cwd: PROJECT_ROOT,
+      env: processEnv,
+      encoding: 'utf8',
+      timeout: 10_000,
+    });
+    assert.equal(valid.signal, null);
+    assert.equal(valid.status, 0, valid.stderr);
+
+    const store = new ExternalProviderOverrideStore({ stateFilePath: env.overridePath });
+    assert.equal(store.getProviderStatus('codex', getDistillationHeartbeatConfig(env.root)).historyMode, 'catch-up');
+
+    const invalid = spawnSync(process.execPath, [
+      '--import',
+      TSX_LOADER,
+      path.join(PROJECT_ROOT, 'src/index.ts'),
+      'external-source',
+      'history',
+      'codex',
+      'invalid-mode',
+      '--working-directory',
+      env.root,
+    ], {
+      cwd: PROJECT_ROOT,
+      env: processEnv,
+      encoding: 'utf8',
+      timeout: 10_000,
+    });
+    assert.equal(invalid.signal, null);
+    assert.equal(invalid.status, 1);
+    assert.equal(store.getProviderStatus('codex', getDistillationHeartbeatConfig(env.root)).historyMode, 'catch-up');
   });
 
   test('disable creates a durable override', async () => {

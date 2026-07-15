@@ -39,6 +39,7 @@ import {
   saveLogCursorState,
 } from './log-cursor-state';
 import { getDistillationHeartbeatConfig, DistillationHeartbeatConfig } from './distillation-heartbeat-config';
+import type { ExternalHistoryMode } from './distillation-heartbeat-config';
 import { LearningEpisodeStore, LearningEpisode, buildLearningEpisodeCandidate } from './learning-episode';
 import { SkillEvolutionRuntime, CapabilityTransitionKind } from './skill-evolution';
 import { SkillUsageCurator, CuratorRunResult } from './skill-usage-curator';
@@ -616,6 +617,10 @@ export class RuntimeLearning {
    * (issue #91), resolved from environment defaults + durable overrides.
    */
   private sessionLogSources: readonly SessionLogSourceAdapter[];
+  /** True only when RuntimeLearning owns adapters derived from production config. */
+  private readonly managesConfiguredSessionLogSources: boolean;
+  /** Runtime-local source pauses that must survive production lane refreshes. */
+  private readonly disabledExternalSourceLanes = new Set<string>();
   /**
    * Durable per-provider override store (issue #91). Owns the online
    * enable/disable/reset/rebaseline operator surface.
@@ -691,6 +696,7 @@ export class RuntimeLearning {
       stateFilePath: resolveExternalProviderOverridePath(this.config),
       now: this.clock,
     });
+    this.managesConfiguredSessionLogSources = options.sessionLogSources === undefined;
     this.sessionLogSources = options.sessionLogSources ?? [
       new InternalSessionLogSourceAdapter(this.config),
       ...this.buildConfiguredExternalSources(),
@@ -945,6 +951,7 @@ export class RuntimeLearning {
     const adapter = this.findExternalSourceAdapter(provider, sourceId);
     if (!adapter?.setEnabled) return false;
     adapter.setEnabled(false);
+    this.disabledExternalSourceLanes.add(externalSourceLaneKey({ provider, sourceId }));
     return true;
   }
 
@@ -956,6 +963,7 @@ export class RuntimeLearning {
     const adapter = this.findExternalSourceAdapter(provider, sourceId);
     if (!adapter?.setEnabled) return false;
     adapter.setEnabled(true);
+    this.disabledExternalSourceLanes.delete(externalSourceLaneKey({ provider, sourceId }));
     return true;
   }
 
@@ -978,8 +986,18 @@ export class RuntimeLearning {
   enableExternalProvider(
     provider: string,
     scope?: { scope: 'global' | 'path'; scopePath?: string },
+    historyMode?: ExternalHistoryMode,
   ): void {
-    this.providerOverrideStore.enableProvider(provider, scope);
+    this.providerOverrideStore.enableProvider(provider, scope, historyMode);
+    this.reconcileProviderLanes();
+  }
+
+  /** Switch an enabled provider's durable history policy at a wake boundary. */
+  setExternalProviderHistoryMode(provider: string, historyMode: ExternalHistoryMode): void {
+    if (!this.providerOverrideStore.isProviderEnabled(provider, this.config)) {
+      throw new Error(`external provider is not enabled: ${provider}`);
+    }
+    this.providerOverrideStore.setProviderHistoryMode(provider, historyMode);
     this.reconcileProviderLanes();
   }
 
@@ -1024,10 +1042,16 @@ export class RuntimeLearning {
    * is enabled online, and removal of disabled providers from the active set.
    */
   private reconcileProviderLanes(): void {
+    if (!this.managesConfiguredSessionLogSources) return;
     const internal = this.sessionLogSources.filter(
       adapter => adapter.identity.category === 'internal',
     );
     const external = this.buildConfiguredExternalSources();
+    for (const adapter of external) {
+      if (this.disabledExternalSourceLanes.has(externalSourceLaneKey(adapter.identity))) {
+        adapter.setEnabled?.(false);
+      }
+    }
     this.sessionLogSources = [...internal, ...external];
   }
 
@@ -1136,6 +1160,7 @@ export class RuntimeLearning {
         ? legacySelectedSourceId
         : `external-${provider}`;
       const scope = this.providerOverrideStore.getProviderScope(provider);
+      const history = this.providerOverrideStore.getProviderHistoryMode(provider, this.config);
       const reader = this.config.externalSessionLogXurlCommand
         ? new XurlExternalSourceReader({
           command: this.config.externalSessionLogXurlCommand,
@@ -1152,6 +1177,8 @@ export class RuntimeLearning {
         reader,
         enabled: true,
         scope,
+        historyMode: history.mode,
+        now: this.clock,
       }));
     }
     return adapters;
@@ -1554,6 +1581,11 @@ export class RuntimeLearning {
     this.activeWakeAbortControllers.add(wakeAbortController);
 
     try {
+      // Durable provider controls can be changed by a separate CLI process.
+      // Refresh Runtime-owned lanes at the wake boundary; injected fixtures
+      // remain owned by their caller and are never replaced here.
+      this.reconcileProviderLanes();
+
       // ---- 1. Discovery + Ingestion (source-neutral) ----
       const shouldScan = isDiscoveryWake;
 
@@ -2307,6 +2339,7 @@ export class RuntimeLearning {
     if (externalProvenanceUpdated || this.externalEpisodeProvenanceDirty) {
       this.saveExternalEpisodeProvenanceState();
     }
+    this.reconcileCompletedHistoricalTargets();
 
     return {
       sourceReports,
@@ -2334,6 +2367,24 @@ export class RuntimeLearning {
     const cancelTimer = setTimeout(() => controller.abort(), remainingMs);
     cancelTimer.unref?.();
     return { controller, cancelTimer };
+  }
+
+  private reconcileCompletedHistoricalTargets(): void {
+    const completedTargetIds = new Set<string>();
+    for (const adapter of this.sessionLogSources) {
+      if (adapter.identity.category !== 'external') continue;
+      const storePath = adapter.getCursorStorePath?.();
+      if (!storePath) continue;
+      const state = loadExternalCursorState(storePath);
+      for (const [resourceRef, progress] of Object.entries(state.catchUpResources)) {
+        if (progress.status !== 'complete') continue;
+        const target = state.catchUpTargets[resourceRef];
+        if (target && !target.empty) completedTargetIds.add(target.targetId);
+      }
+    }
+    for (const targetId of completedTargetIds) {
+      this.episodeStore.reconcileHistoricalTarget(targetId);
+    }
   }
 
   private async processDiscoverySource(
@@ -2547,6 +2598,10 @@ export class RuntimeLearning {
           const elapsedMs = Math.max(0, this.clock().getTime() - sourceStartMs);
           const readContext: SessionLogSourceReadContext = {
             ...readContextBase,
+            remainingAdmissionEvents: Math.max(
+              0,
+              this.discoveryQuotas.maxAdmittedEpisodesPerWake - shared.wakeAdmittedEpisodes,
+            ),
             remainingBudget: {
               maxResourcesPerWake: Math.max(0, budget.maxResourcesPerWake - sourceResourcesExamined + 1),
               maxBytesPerWake: Math.max(0, budget.maxBytesPerWake - sourceBytesRead),
@@ -2676,7 +2731,7 @@ export class RuntimeLearning {
               distillationUnits,
               eventIdentities,
               readResult,
-              lane: 'continuous',
+              lane: adapter.getAdmissionLane?.(resource) ?? 'continuous',
             };
             const commitResult = this.externalAdmissionCoordinator.admitPage(
               page,
@@ -3470,7 +3525,7 @@ export class RuntimeLearning {
    */
   private commitExternalEvidencePage(page: ExternalEvidencePage): ExternalAdmissionCommitResult {
     const adapter = this.findExternalSourceAdapter(page.identity.provider, page.sourceId);
-    if (page.lane === 'continuous' && !adapter) {
+    if (page.lane !== 'backfill' && !adapter) {
       return {
         admittedEpisodes: 0,
         contradictionSignals: 0,
@@ -3508,21 +3563,33 @@ export class RuntimeLearning {
           sourceId: identity.sourceId,
           eventIdentity,
         });
-        const ingestionResult = this.evidenceIngestor.ingest(ingestUnit);
+        const catchUpTarget = page.lane === 'catch-up'
+          ? adapter?.getCatchUpTarget?.(resource)
+          : undefined;
+        if (page.lane === 'catch-up' && (!catchUpTarget || catchUpTarget.position === null)) {
+          throw new Error(`external catch-up target is missing for ${resource.resourceRef}`);
+        }
+        const ingestionResult = this.evidenceIngestor.ingest(
+          ingestUnit,
+          catchUpTarget && catchUpTarget.position !== null
+            ? {
+              historicalTarget: {
+                targetId: catchUpTarget.targetId,
+                provider: catchUpTarget.provider,
+                sourceId: catchUpTarget.sourceId,
+                resourceRef: catchUpTarget.resourceRef,
+                position: catchUpTarget.position,
+                prefixDigest: catchUpTarget.prefixDigest,
+              },
+            }
+            : {},
+        );
         const admissionEpisodeIds = this.resolveExternalEpisodeIds(
           identity,
           eventIdentity,
           ingestUnit,
           ingestionResult,
         );
-
-        if (admissionEpisodeIds.length > 0) {
-          externalProvenanceUpdated ||= this.recordExternalEpisodeProvenance(
-            identity,
-            eventIdentity,
-            admissionEpisodeIds,
-          );
-        }
 
         this.queueCuratorObservation(ingestionResult.admittedEpisodeIds);
 
@@ -3535,6 +3602,14 @@ export class RuntimeLearning {
           ingestionResult,
           admissionEpisodeIds,
         );
+
+        if (admissionEpisodeIds.length > 0) {
+          externalProvenanceUpdated ||= this.recordExternalEpisodeProvenance(
+            identity,
+            eventIdentity,
+            admissionEpisodeIds,
+          );
+        }
 
         admittedEpisodes += ingestionResult.admittedEpisodeIds.length;
         contradictionSignals += ingestionResult.contradictionSignalIds.length;
@@ -3550,9 +3625,9 @@ export class RuntimeLearning {
 
       // Cursor acknowledgement is lane-specific and remains the final durable
       // step owned by that lane.
-      if (page.lane === 'continuous') {
+      if (page.lane !== 'backfill') {
         adapter!.acknowledge(resource, readResult);
-        // Success resets failure count for continuous external sources.
+        // Success resets failure count for continuous and catch-up pages.
         this.resetExternalSourceFailure(identity);
       }
 
@@ -3613,6 +3688,7 @@ export class RuntimeLearning {
       if (!episode) continue;
 
       const bundleId = `v3:learning-episode:${episodeId}`;
+      if (this.evidenceCapsuleStore.findByBundleId(bundleId)) continue;
 
       // Extract evidence content from the episode's completion evidence detail.
       const completionEvidence: {
