@@ -18,9 +18,11 @@
 
 import { afterEach, beforeEach, describe, test } from 'node:test';
 import * as assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { pathToFileURL } from 'node:url';
 
 import { getDistillationHeartbeatConfig } from '../src/utils/distillation-heartbeat-config';
 import {
@@ -29,6 +31,8 @@ import {
   type ExternalProviderOverrideState,
 } from '../src/utils/external-provider-controls';
 
+const PROJECT_ROOT = path.resolve(__dirname, '..');
+const TSX_LOADER = pathToFileURL(require.resolve('tsx')).href;
 const tempRoots: string[] = [];
 afterEach(() => {
   for (const root of tempRoots.splice(0)) {
@@ -438,6 +442,60 @@ describe('external-source CLI command', () => {
       stateFilePath: path.join(env.root, 'data', 'external-provider-overrides.json'),
     });
     assert.equal(restartedStore.getProviderStatus('codex', config).historyMode, 'future-only');
+  });
+
+  test('Commander wiring persists history mode and returns normal process exits', () => {
+    const processEnv = {
+      ...process.env,
+      XIAOBA_RUNTIME_ROOT: env.root,
+      DISTILLATION_HEARTBEAT_ENABLED: 'true',
+      DISTILLATION_HEARTBEAT_LOG_ROOT: 'logs',
+      XIAOBA_EXTERNAL_SESSION_LOG_SOURCES_ENABLED: 'true',
+      XIAOBA_EXTERNAL_SESSION_LOG_ENABLED_PROVIDERS: 'codex',
+      XIAOBA_EXTERNAL_SESSION_LOG_HISTORY_MODE: 'future-only',
+    };
+    const valid = spawnSync(process.execPath, [
+      '--import',
+      TSX_LOADER,
+      path.join(PROJECT_ROOT, 'src/index.ts'),
+      'external-source',
+      'enable',
+      'codex',
+      '--history',
+      'catch-up',
+      '--working-directory',
+      env.root,
+    ], {
+      cwd: PROJECT_ROOT,
+      env: processEnv,
+      encoding: 'utf8',
+      timeout: 10_000,
+    });
+    assert.equal(valid.signal, null);
+    assert.equal(valid.status, 0, valid.stderr);
+
+    const store = new ExternalProviderOverrideStore({ stateFilePath: env.overridePath });
+    assert.equal(store.getProviderStatus('codex', getDistillationHeartbeatConfig(env.root)).historyMode, 'catch-up');
+
+    const invalid = spawnSync(process.execPath, [
+      '--import',
+      TSX_LOADER,
+      path.join(PROJECT_ROOT, 'src/index.ts'),
+      'external-source',
+      'history',
+      'codex',
+      'invalid-mode',
+      '--working-directory',
+      env.root,
+    ], {
+      cwd: PROJECT_ROOT,
+      env: processEnv,
+      encoding: 'utf8',
+      timeout: 10_000,
+    });
+    assert.equal(invalid.signal, null);
+    assert.equal(invalid.status, 1);
+    assert.equal(store.getProviderStatus('codex', getDistillationHeartbeatConfig(env.root)).historyMode, 'catch-up');
   });
 
   test('disable creates a durable override', async () => {

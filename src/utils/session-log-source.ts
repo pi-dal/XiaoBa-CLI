@@ -163,6 +163,8 @@ export interface SessionLogSourceReadContext {
   readonly orderedResources: readonly SessionLogSourceResource[];
   /** Remaining per-source allowance for this specific read. */
   readonly remainingBudget?: SourceWorkBudget;
+  /** Remaining wake admission allowance, expressed as source events. */
+  readonly remainingAdmissionEvents?: number;
 }
 
 export interface SessionLogSourceDiscoveryContext {
@@ -1416,7 +1418,7 @@ export class ExternalSessionLogSourceAdapter implements SessionLogSourceAdapter 
 
   read(
     resource: SessionLogSourceResource,
-    _context: SessionLogSourceReadContext,
+    context: SessionLogSourceReadContext,
   ): SessionLogSourceReadResult {
     if (!this.enabled || !this.reader) {
       return {
@@ -1455,7 +1457,7 @@ export class ExternalSessionLogSourceAdapter implements SessionLogSourceAdapter 
         ? this.reader.sampleHistory(resource)
         : this.reader.read(resource, resourceCursor);
       if (historicalRead) {
-        readerResult = this.limitHistoricalReadToTarget(resource, state, resourceCursor, readerResult);
+        readerResult = this.limitHistoricalReadToTarget(resource, state, resourceCursor, readerResult, context);
       }
     } catch (error) {
       const message = redactExternalSourceDiagnostic(error);
@@ -1478,7 +1480,7 @@ export class ExternalSessionLogSourceAdapter implements SessionLogSourceAdapter 
 
   async readAsync(
     resource: SessionLogSourceResource,
-    _context: SessionLogSourceReadContext,
+    context: SessionLogSourceReadContext,
     signal: AbortSignal,
   ): Promise<SessionLogSourceReadResult> {
     if (!this.enabled || !this.reader) {
@@ -1524,7 +1526,7 @@ export class ExternalSessionLogSourceAdapter implements SessionLogSourceAdapter 
           : await Promise.resolve().then(() => this.reader!.read(resource, resourceCursor));
       }
       if (historicalRead) {
-        readerResult = this.limitHistoricalReadToTarget(resource, state, resourceCursor, readerResult);
+        readerResult = this.limitHistoricalReadToTarget(resource, state, resourceCursor, readerResult, context);
       }
     } catch (error) {
       const message = redactExternalSourceDiagnostic(error);
@@ -1550,6 +1552,7 @@ export class ExternalSessionLogSourceAdapter implements SessionLogSourceAdapter 
     state: ExternalCursorState,
     resourceCursor: SourceCursor,
     readerResult: ExternalSourceReaderResult,
+    context: SessionLogSourceReadContext,
   ): ExternalSourceReaderResult {
     const target = state.catchUpTargets[resource.resourceRef];
     if (!target || target.position === null) {
@@ -1563,18 +1566,31 @@ export class ExternalSessionLogSourceAdapter implements SessionLogSourceAdapter 
       throw new Error(`external catch-up prefix changed for ${resource.resourceRef}`);
     }
     const unread = prefix.filter(event => event.position > resourceCursor.position);
-    const newPosition = unread.length > 0
-      ? unread[unread.length - 1]!.position
-      : Math.max(resourceCursor.position, target.position);
+    const maxEvents = context.remainingAdmissionEvents === undefined
+      ? Number.POSITIVE_INFINITY
+      : Math.max(0, Math.floor(context.remainingAdmissionEvents));
+    const remainingBytes = context.remainingBudget?.maxBytesPerWake;
+    const maxBytes = remainingBytes === undefined || remainingBytes <= 0
+      ? Number.POSITIVE_INFINITY
+      : Math.max(0, Math.floor(remainingBytes));
+    const admitted: ExternalSourceRawEvent[] = [];
+    let admittedBytes = 0;
+    for (const event of unread) {
+      if (admitted.length >= maxEvents) break;
+      const eventBytes = Buffer.byteLength(JSON.stringify(event.distillationUnit ?? event), 'utf8');
+      if (admittedBytes + eventBytes > maxBytes) break;
+      admitted.push(event);
+      admittedBytes += eventBytes;
+    }
+    const newPosition = admitted.length > 0
+      ? admitted[admitted.length - 1]!.position
+      : resourceCursor.position;
     return {
       ...readerResult,
-      events: unread,
+      events: admitted,
       newPosition: Math.min(newPosition, target.position),
-      exhausted: newPosition >= target.position,
-      byteLength: unread.reduce(
-        (sum, event) => sum + Buffer.byteLength(JSON.stringify(event.distillationUnit ?? event), 'utf8'),
-        0,
-      ),
+      exhausted: admitted.length === unread.length && newPosition >= target.position,
+      byteLength: admittedBytes,
     };
   }
 

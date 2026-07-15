@@ -617,6 +617,10 @@ export class RuntimeLearning {
    * (issue #91), resolved from environment defaults + durable overrides.
    */
   private sessionLogSources: readonly SessionLogSourceAdapter[];
+  /** True only when RuntimeLearning owns adapters derived from production config. */
+  private readonly managesConfiguredSessionLogSources: boolean;
+  /** Runtime-local source pauses that must survive production lane refreshes. */
+  private readonly disabledExternalSourceLanes = new Set<string>();
   /**
    * Durable per-provider override store (issue #91). Owns the online
    * enable/disable/reset/rebaseline operator surface.
@@ -692,6 +696,7 @@ export class RuntimeLearning {
       stateFilePath: resolveExternalProviderOverridePath(this.config),
       now: this.clock,
     });
+    this.managesConfiguredSessionLogSources = options.sessionLogSources === undefined;
     this.sessionLogSources = options.sessionLogSources ?? [
       new InternalSessionLogSourceAdapter(this.config),
       ...this.buildConfiguredExternalSources(),
@@ -946,6 +951,7 @@ export class RuntimeLearning {
     const adapter = this.findExternalSourceAdapter(provider, sourceId);
     if (!adapter?.setEnabled) return false;
     adapter.setEnabled(false);
+    this.disabledExternalSourceLanes.add(externalSourceLaneKey({ provider, sourceId }));
     return true;
   }
 
@@ -957,6 +963,7 @@ export class RuntimeLearning {
     const adapter = this.findExternalSourceAdapter(provider, sourceId);
     if (!adapter?.setEnabled) return false;
     adapter.setEnabled(true);
+    this.disabledExternalSourceLanes.delete(externalSourceLaneKey({ provider, sourceId }));
     return true;
   }
 
@@ -1035,10 +1042,16 @@ export class RuntimeLearning {
    * is enabled online, and removal of disabled providers from the active set.
    */
   private reconcileProviderLanes(): void {
+    if (!this.managesConfiguredSessionLogSources) return;
     const internal = this.sessionLogSources.filter(
       adapter => adapter.identity.category === 'internal',
     );
     const external = this.buildConfiguredExternalSources();
+    for (const adapter of external) {
+      if (this.disabledExternalSourceLanes.has(externalSourceLaneKey(adapter.identity))) {
+        adapter.setEnabled?.(false);
+      }
+    }
     this.sessionLogSources = [...internal, ...external];
   }
 
@@ -1568,6 +1581,11 @@ export class RuntimeLearning {
     this.activeWakeAbortControllers.add(wakeAbortController);
 
     try {
+      // Durable provider controls can be changed by a separate CLI process.
+      // Refresh Runtime-owned lanes at the wake boundary; injected fixtures
+      // remain owned by their caller and are never replaced here.
+      this.reconcileProviderLanes();
+
       // ---- 1. Discovery + Ingestion (source-neutral) ----
       const shouldScan = isDiscoveryWake;
 
@@ -2580,6 +2598,10 @@ export class RuntimeLearning {
           const elapsedMs = Math.max(0, this.clock().getTime() - sourceStartMs);
           const readContext: SessionLogSourceReadContext = {
             ...readContextBase,
+            remainingAdmissionEvents: Math.max(
+              0,
+              this.discoveryQuotas.maxAdmittedEpisodesPerWake - shared.wakeAdmittedEpisodes,
+            ),
             remainingBudget: {
               maxResourcesPerWake: Math.max(0, budget.maxResourcesPerWake - sourceResourcesExamined + 1),
               maxBytesPerWake: Math.max(0, budget.maxBytesPerWake - sourceBytesRead),
@@ -3569,14 +3591,6 @@ export class RuntimeLearning {
           ingestionResult,
         );
 
-        if (admissionEpisodeIds.length > 0) {
-          externalProvenanceUpdated ||= this.recordExternalEpisodeProvenance(
-            identity,
-            eventIdentity,
-            admissionEpisodeIds,
-          );
-        }
-
         this.queueCuratorObservation(ingestionResult.admittedEpisodeIds);
 
         // Persist the redacted Evidence Capsule BEFORE acknowledging the
@@ -3588,6 +3602,14 @@ export class RuntimeLearning {
           ingestionResult,
           admissionEpisodeIds,
         );
+
+        if (admissionEpisodeIds.length > 0) {
+          externalProvenanceUpdated ||= this.recordExternalEpisodeProvenance(
+            identity,
+            eventIdentity,
+            admissionEpisodeIds,
+          );
+        }
 
         admittedEpisodes += ingestionResult.admittedEpisodeIds.length;
         contradictionSignals += ingestionResult.contradictionSignalIds.length;

@@ -12,13 +12,26 @@ import {
   type LearningEpisodeStoreState,
 } from '../src/utils/learning-episode';
 import { defaultDistilledOutputDir } from '../src/utils/distillation-pipeline';
-import { RuntimeLearning } from '../src/utils/runtime-learning';
-import { loadExternalCursorState } from '../src/utils/session-log-source';
+import {
+  RuntimeLearning,
+  type DiscoveryWakeQuotas,
+} from '../src/utils/runtime-learning';
+import {
+  ExternalSessionLogSourceAdapter,
+  loadExternalCursorState,
+  type SessionLogSourceAdapter,
+  type SessionLogSourceReadResult,
+  type SessionLogSourceResource,
+  type SourceWorkBudget,
+} from '../src/utils/session-log-source';
 import type { ExternalSessionLogBackfillRequest } from '../src/utils/session-log-backfill';
 import { SkillEvolutionRuntime } from '../src/utils/skill-evolution';
 import { SkillUsageCurator } from '../src/utils/skill-usage-curator';
 import { SkillUsageLedger } from '../src/utils/skill-usage-ledger';
-import { XurlExternalBackfillSource } from '../src/utils/xurl-session-log-source';
+import {
+  XurlExternalBackfillSource,
+  XurlExternalSourceReader,
+} from '../src/utils/xurl-session-log-source';
 import {
   ExternalProviderOverrideStore,
   resolveExternalProviderOverridePath,
@@ -36,6 +49,23 @@ const PROVIDER = 'codex';
 const SOURCE_ID = 'external-codex';
 const THREAD_ID = 'conversation-history';
 const tempRoots: string[] = [];
+
+interface ExternalEpisodeProvenanceFixture {
+  readonly episodeToEvent: Record<string, string>;
+  readonly eventToEpisodes: Record<string, string[]>;
+}
+
+class CrashOnceOnAcknowledgeAdapter extends ExternalSessionLogSourceAdapter {
+  private shouldCrash = true;
+
+  override acknowledge(resource: SessionLogSourceResource, result: SessionLogSourceReadResult): void {
+    if (this.shouldCrash) {
+      this.shouldCrash = false;
+      throw new Error('simulated crash before cursor acknowledgement');
+    }
+    super.acknowledge(resource, result);
+  }
+}
 
 afterEach(() => {
   for (const root of tempRoots.splice(0)) {
@@ -156,6 +186,437 @@ test('ordinary RuntimeLearning wake admits one stable xURL history through an im
     const afterAppend = loadExternalCursorState(cursorStorePath(env.root));
     assert.deepEqual(afterAppend.catchUpTargets[THREAD_ID], immutableTarget);
     assert.equal(afterAppend.cursors[THREAD_ID]?.cursor.position, 6);
+  } finally {
+    env.restore();
+  }
+});
+
+test('a long single-thread history advances in bounded pages across ordinary wakes', async () => {
+  const env = setupEnv();
+  try {
+    writeScenario(env.scenarioPath, {
+      discover: {
+        pages: {
+          start: catalogPage([thread(THREAD_ID, 'branch-main', 10, 'fp-long-history-10')]),
+        },
+      },
+      read: {
+        [THREAD_ID]: {
+          timeline: timeline(THREAD_ID, 'branch-main', 10, 'fp-long-history-10', [
+            entry(1, 'User', 'Implement parser one and verify its output.'),
+            entry(2, 'Assistant', 'Done. Parser one is implemented and verified.'),
+            entry(3, 'User', 'Implement parser two and verify its output.'),
+            entry(4, 'Assistant', 'Done. Parser two is implemented and verified.'),
+            entry(5, 'User', 'Implement parser three and verify its output.'),
+            entry(6, 'Assistant', 'Done. Parser three is implemented and verified.'),
+            entry(7, 'User', 'Implement parser four and verify its output.'),
+            entry(8, 'Assistant', 'Done. Parser four is implemented and verified.'),
+            entry(9, 'User', 'Implement parser five and verify its output.'),
+            entry(10, 'Assistant', 'Done. Parser five is implemented and verified.'),
+          ]),
+        },
+      },
+    });
+
+    const fixture = env.createRuntime({
+      discoveryQuotas: { maxAdmittedEpisodesPerWake: 2 },
+      externalSourceBudget: {
+        maxResourcesPerWake: 1,
+        maxBytesPerWake: 4_096,
+        maxElapsedMsPerWake: 30_000,
+      },
+    });
+
+    const cursorPositions: number[] = [];
+    const processedPerWake: number[] = [];
+    for (let wakeNumber = 0; wakeNumber < 3; wakeNumber++) {
+      const wake = await fixture.runtime.wake(wakeNumber === 0 ? 'startup' : 'scheduled');
+      const external = wake.discovery.sources.find(source => source.sourceId === SOURCE_ID);
+      assert.ok(external);
+      assert.ok(external.unitsProcessed <= 2, 'one wake never admits more than its remaining event quota');
+      assert.ok(wake.ingestion.admittedEpisodes <= 2, 'one wake never exceeds its admission quota');
+      assert.ok((external.accounting?.bytes ?? 0) <= 4_096, 'one wake never exceeds its byte quota');
+      processedPerWake.push(external.unitsProcessed);
+      cursorPositions.push(
+        loadExternalCursorState(cursorStorePath(env.root))
+          .catchUpResources[THREAD_ID]?.historicalCursor.position ?? -1,
+      );
+    }
+
+    assert.deepEqual(processedPerWake, [2, 2, 1]);
+    assert.deepEqual(cursorPositions, [4, 8, 10]);
+    const completed = loadExternalCursorState(cursorStorePath(env.root));
+    assert.equal(completed.catchUpResources[THREAD_ID]?.status, 'complete');
+    assert.equal(Object.keys(completed.processedEventIds).length, 5, 'each historical event is acknowledged once');
+  } finally {
+    env.restore();
+  }
+});
+
+test('catch-up slices a single thread by the remaining external byte budget', async () => {
+  const env = setupEnv();
+  try {
+    const request = 'Implement and verify the bounded parser behavior. '.repeat(8);
+    const response = 'Done. The bounded parser behavior is implemented and verified. '.repeat(8);
+    writeScenario(env.scenarioPath, {
+      discover: {
+        pages: {
+          start: catalogPage([thread(THREAD_ID, 'branch-main', 8, 'fp-byte-pages-8')]),
+        },
+      },
+      read: {
+        [THREAD_ID]: {
+          timeline: timeline(THREAD_ID, 'branch-main', 8, 'fp-byte-pages-8', [
+            entry(1, 'User', request),
+            entry(2, 'Assistant', response),
+            entry(3, 'User', request),
+            entry(4, 'Assistant', response),
+            entry(5, 'User', request),
+            entry(6, 'Assistant', response),
+            entry(7, 'User', request),
+            entry(8, 'Assistant', response),
+          ]),
+        },
+      },
+    });
+
+    const maxBytesPerWake = 2_048;
+    const fixture = env.createRuntime({
+      discoveryQuotas: { maxAdmittedEpisodesPerWake: 10 },
+      externalSourceBudget: {
+        maxResourcesPerWake: 1,
+        maxBytesPerWake,
+        maxElapsedMsPerWake: 30_000,
+      },
+    });
+
+    const cursorPositions: number[] = [];
+    for (let wakeNumber = 0; wakeNumber < 8; wakeNumber++) {
+      const wake = await fixture.runtime.wake(wakeNumber === 0 ? 'startup' : 'scheduled');
+      const external = wake.discovery.sources.find(source => source.sourceId === SOURCE_ID);
+      assert.ok(external);
+      assert.ok((external.accounting?.bytes ?? 0) <= maxBytesPerWake);
+      const state = loadExternalCursorState(cursorStorePath(env.root));
+      const position = state.catchUpResources[THREAD_ID]?.historicalCursor.position ?? -1;
+      if (position > (cursorPositions.at(-1) ?? -1)) cursorPositions.push(position);
+      if (state.catchUpResources[THREAD_ID]?.status === 'complete') break;
+    }
+
+    assert.ok(cursorPositions.length > 1, 'the byte budget requires more than one resumable page');
+    assert.equal(cursorPositions.at(-1), 8);
+  } finally {
+    env.restore();
+  }
+});
+
+test('one running Runtime pauses and resumes catch-up from durable history-mode changes', async () => {
+  const env = setupEnv();
+  try {
+    writeScenario(env.scenarioPath, {
+      discover: {
+        pages: {
+          start: catalogPage([thread(THREAD_ID, 'branch-main', 4, 'fp-mode-refresh-4')]),
+        },
+      },
+      read: {
+        [THREAD_ID]: {
+          timeline: timeline(THREAD_ID, 'branch-main', 4, 'fp-mode-refresh-4', [
+            entry(1, 'User', 'How do I parse JSONL incrementally?'),
+            entry(2, 'Assistant', 'Use readline and validate each record.'),
+            entry(3, 'User', 'Thanks, that works perfectly!'),
+            entry(4, 'Assistant', 'Glad it helped.'),
+          ]),
+        },
+      },
+    });
+
+    const fixture = env.createRuntime({
+      discoveryQuotas: { maxAdmittedEpisodesPerWake: 1 },
+    });
+    await fixture.runtime.wake('startup');
+    const afterFirstPage = loadExternalCursorState(cursorStorePath(env.root));
+    assert.equal(afterFirstPage.catchUpResources[THREAD_ID]?.historicalCursor.position, 2);
+    assert.equal(afterFirstPage.catchUpResources[THREAD_ID]?.status, 'historical-pending');
+
+    const config = getDistillationHeartbeatConfig(env.root);
+    const overrides = new ExternalProviderOverrideStore({
+      stateFilePath: resolveExternalProviderOverridePath(config),
+    });
+    overrides.setProviderHistoryMode(PROVIDER, 'future-only');
+
+    const pausedWake = await fixture.runtime.wake('scheduled');
+    assert.equal(pausedWake.discovery.sources.find(source => source.sourceId === SOURCE_ID)?.unitsProcessed, 0);
+    const paused = loadExternalCursorState(cursorStorePath(env.root));
+    assert.equal(paused.catchUpResources[THREAD_ID]?.historicalCursor.position, 2);
+    assert.equal(paused.catchUpResources[THREAD_ID]?.status, 'historical-pending');
+
+    overrides.setProviderHistoryMode(PROVIDER, 'catch-up');
+    const resumedWake = await fixture.runtime.wake('scheduled');
+    assert.equal(resumedWake.discovery.sources.find(source => source.sourceId === SOURCE_ID)?.unitsProcessed, 1);
+    const resumed = loadExternalCursorState(cursorStorePath(env.root));
+    assert.equal(resumed.catchUpResources[THREAD_ID]?.historicalCursor.position, 4);
+    assert.equal(resumed.catchUpResources[THREAD_ID]?.status, 'complete');
+  } finally {
+    env.restore();
+  }
+});
+
+test('wake-boundary provider refresh does not replace injected source adapters', async () => {
+  const env = setupEnv();
+  try {
+    let discoveries = 0;
+    const injected: SessionLogSourceAdapter = {
+      identity: {
+        sourceId: 'fixture-external',
+        label: 'Fixture External Source',
+        category: 'external',
+        provider: 'fixture-provider',
+        reader: 'fixture',
+      },
+      isEnabled: () => true,
+      discoverResources: () => {
+        discoveries += 1;
+        return [];
+      },
+      read: () => {
+        throw new Error('fixture has no resources to read');
+      },
+      acknowledge: () => undefined,
+      markFailed: () => undefined,
+    };
+    const fixture = env.createRuntime({ sessionLogSources: [injected] });
+
+    const config = getDistillationHeartbeatConfig(env.root);
+    new ExternalProviderOverrideStore({
+      stateFilePath: resolveExternalProviderOverridePath(config),
+    }).setProviderHistoryMode(PROVIDER, 'future-only');
+
+    await fixture.runtime.wake('scheduled');
+    assert.equal(discoveries, 1);
+    assert.deepEqual(fixture.runtime.getSessionLogSources(), [injected]);
+  } finally {
+    env.restore();
+  }
+});
+
+test('a restart after target persistence resumes admission from the fixed target', async () => {
+  const env = setupEnv();
+  try {
+    writeScenario(env.scenarioPath, {
+      discover: {
+        pages: {
+          start: catalogPage([thread(THREAD_ID, 'branch-main', 4, 'fp-target-restart-4')]),
+        },
+      },
+      read: {
+        [THREAD_ID]: {
+          timeline: timeline(THREAD_ID, 'branch-main', 4, 'fp-target-restart-4', [
+            entry(1, 'User', 'How do I parse JSONL incrementally?'),
+            entry(2, 'Assistant', 'Use readline and validate each record.'),
+            entry(3, 'User', 'Thanks, that works perfectly!'),
+            entry(4, 'Assistant', 'Glad it helped.'),
+          ]),
+        },
+      },
+    });
+
+    const interrupted = env.createRuntime({
+      discoveryQuotas: { maxAdmittedEpisodesPerWake: 0 },
+    });
+    const firstWake = await interrupted.runtime.wake('startup');
+    assert.equal(firstWake.discovery.sources.find(source => source.sourceId === SOURCE_ID)?.unitsProcessed, 0);
+    const targetOnly = loadExternalCursorState(cursorStorePath(env.root));
+    assert.equal(targetOnly.catchUpTargets[THREAD_ID]?.position, 4);
+    assert.equal(targetOnly.catchUpResources[THREAD_ID]?.historicalCursor.position, -1);
+    assert.equal(targetOnly.catchUpResources[THREAD_ID]?.status, 'historical-pending');
+    assert.equal(Object.keys(interrupted.episodeStore.load().episodes).length, 0);
+
+    const restarted = env.createRuntime();
+    const resumedWake = await restarted.runtime.wake('scheduled');
+    assert.equal(resumedWake.discovery.sources.find(source => source.sourceId === SOURCE_ID)?.unitsProcessed, 2);
+    const completed = loadExternalCursorState(cursorStorePath(env.root));
+    assert.equal(completed.catchUpTargets[THREAD_ID]?.targetId, targetOnly.catchUpTargets[THREAD_ID]?.targetId);
+    assert.equal(completed.catchUpResources[THREAD_ID]?.historicalCursor.position, 4);
+    assert.equal(completed.catchUpResources[THREAD_ID]?.status, 'complete');
+  } finally {
+    env.restore();
+  }
+});
+
+test('a Capsule persistence failure replays without provenance or cursor acknowledgement', async () => {
+  const env = setupEnv();
+  try {
+    writeScenario(env.scenarioPath, {
+      discover: {
+        pages: {
+          start: catalogPage([thread(THREAD_ID, 'branch-main', 4, 'fp-capsule-replay-4')]),
+        },
+      },
+      read: {
+        [THREAD_ID]: {
+          timeline: timeline(THREAD_ID, 'branch-main', 4, 'fp-capsule-replay-4', [
+            entry(1, 'User', 'How do I parse JSONL incrementally?'),
+            entry(2, 'Assistant', 'Use readline and validate each record.'),
+            entry(3, 'User', 'Thanks, that works perfectly!'),
+            entry(4, 'Assistant', 'Glad it helped.'),
+          ]),
+        },
+      },
+    });
+
+    const crashing = env.createRuntime({
+      clock: () => new Date('2026-01-01T00:00:00.000Z'),
+    });
+    const config = getDistillationHeartbeatConfig(env.root);
+    const provenancePath = path.join(path.dirname(config.learningEpisodeStorePath), 'external-source-provenance.json');
+    fs.mkdirSync(config.evidenceCapsulePath, { recursive: true });
+
+    const failedWake = await crashing.runtime.wake('startup');
+    assert.equal(failedWake.discovery.sources.find(source => source.sourceId === SOURCE_ID)?.status, 'failed');
+    const episodeIds = Object.keys(crashing.episodeStore.load().episodes);
+    assert.equal(episodeIds.length, 1, 'Episode is durable before Capsule persistence');
+    fs.rmSync(config.evidenceCapsulePath, { recursive: true, force: true });
+    assert.equal(crashing.runtime.getEvidenceCapsuleStore().count(), 0);
+    assert.equal(fs.existsSync(provenancePath), false, 'provenance cannot become durable before its Capsule');
+    assert.equal(
+      loadExternalCursorState(cursorStorePath(env.root)).catchUpResources[THREAD_ID]?.historicalCursor.position,
+      -1,
+    );
+
+    const restarted = env.createRuntime({
+      clock: () => new Date('2026-01-01T01:00:00.000Z'),
+    });
+    assert.equal(restarted.runtime.retryExternalSourceFailure(PROVIDER, SOURCE_ID), true);
+    const replayedWake = await restarted.runtime.wake('scheduled');
+    assert.equal(replayedWake.discovery.sources.find(source => source.sourceId === SOURCE_ID)?.unitsProcessed, 2);
+    assert.deepEqual(Object.keys(restarted.episodeStore.load().episodes), episodeIds);
+    assert.equal(restarted.runtime.getEvidenceCapsuleStore().count(), 1);
+    const provenance = JSON.parse(fs.readFileSync(provenancePath, 'utf8')) as ExternalEpisodeProvenanceFixture;
+    assert.deepEqual(Object.keys(provenance.episodeToEvent), episodeIds);
+    assert.equal(loadExternalCursorState(cursorStorePath(env.root)).catchUpResources[THREAD_ID]?.status, 'complete');
+  } finally {
+    env.restore();
+  }
+});
+
+test('a provenance persistence crash replays the durable Episode and Capsule before cursor acknowledgement', async () => {
+  const env = setupEnv();
+  try {
+    writeScenario(env.scenarioPath, {
+      discover: {
+        pages: {
+          start: catalogPage([thread(THREAD_ID, 'branch-main', 4, 'fp-provenance-replay-4')]),
+        },
+      },
+      read: {
+        [THREAD_ID]: {
+          timeline: timeline(THREAD_ID, 'branch-main', 4, 'fp-provenance-replay-4', [
+            entry(1, 'User', 'How do I parse JSONL incrementally?'),
+            entry(2, 'Assistant', 'Use readline and validate each record.'),
+            entry(3, 'User', 'Thanks, that works perfectly!'),
+            entry(4, 'Assistant', 'Glad it helped.'),
+          ]),
+        },
+      },
+    });
+
+    const crashing = env.createRuntime({
+      clock: () => new Date('2026-01-01T00:00:00.000Z'),
+    });
+    const config = getDistillationHeartbeatConfig(env.root);
+    const provenancePath = path.join(path.dirname(config.learningEpisodeStorePath), 'external-source-provenance.json');
+    fs.mkdirSync(provenancePath, { recursive: true });
+
+    await crashing.runtime.wake('startup');
+    const episodeIds = Object.keys(crashing.episodeStore.load().episodes);
+    assert.equal(episodeIds.length, 1);
+    assert.equal(crashing.runtime.getEvidenceCapsuleStore().count(), 1);
+    assert.equal(
+      loadExternalCursorState(cursorStorePath(env.root)).catchUpResources[THREAD_ID]?.historicalCursor.position,
+      -1,
+    );
+    fs.rmSync(provenancePath, { recursive: true, force: true });
+
+    const restarted = env.createRuntime({
+      clock: () => new Date('2026-01-01T01:00:00.000Z'),
+    });
+    assert.equal(restarted.runtime.retryExternalSourceFailure(PROVIDER, SOURCE_ID), true);
+    const replayedWake = await restarted.runtime.wake('scheduled');
+    assert.equal(replayedWake.discovery.sources.find(source => source.sourceId === SOURCE_ID)?.unitsProcessed, 2);
+    assert.deepEqual(Object.keys(restarted.episodeStore.load().episodes), episodeIds);
+    assert.equal(restarted.runtime.getEvidenceCapsuleStore().count(), 1);
+    const provenance = JSON.parse(fs.readFileSync(provenancePath, 'utf8')) as ExternalEpisodeProvenanceFixture;
+    assert.deepEqual(Object.keys(provenance.episodeToEvent), episodeIds);
+    assert.equal(loadExternalCursorState(cursorStorePath(env.root)).catchUpResources[THREAD_ID]?.status, 'complete');
+  } finally {
+    env.restore();
+  }
+});
+
+test('a cursor acknowledgement crash replays without duplicating Episode, Capsule, or provenance', async () => {
+  const env = setupEnv();
+  try {
+    writeScenario(env.scenarioPath, {
+      discover: {
+        pages: {
+          start: catalogPage([thread(THREAD_ID, 'branch-main', 4, 'fp-cursor-replay-4')]),
+        },
+      },
+      read: {
+        [THREAD_ID]: {
+          timeline: timeline(THREAD_ID, 'branch-main', 4, 'fp-cursor-replay-4', [
+            entry(1, 'User', 'How do I parse JSONL incrementally?'),
+            entry(2, 'Assistant', 'Use readline and validate each record.'),
+            entry(3, 'User', 'Thanks, that works perfectly!'),
+            entry(4, 'Assistant', 'Glad it helped.'),
+          ]),
+        },
+      },
+    });
+
+    let now = new Date('2026-01-01T00:00:00.000Z');
+    const adapter = new CrashOnceOnAcknowledgeAdapter({
+      sourceId: SOURCE_ID,
+      provider: PROVIDER,
+      reader: new XurlExternalSourceReader({
+        command: env.commandPath,
+        provider: PROVIDER,
+        sourceId: SOURCE_ID,
+      }),
+      cursorStorePath: cursorStorePath(env.root),
+      enabled: true,
+      historyMode: 'catch-up',
+      now: () => now,
+    });
+    const fixture = env.createRuntime({
+      clock: () => now,
+      sessionLogSources: [adapter],
+    });
+
+    const failedWake = await fixture.runtime.wake('startup');
+    assert.equal(failedWake.discovery.sources.find(source => source.sourceId === SOURCE_ID)?.status, 'failed');
+    const episodeIds = Object.keys(fixture.episodeStore.load().episodes);
+    assert.equal(episodeIds.length, 1);
+    assert.equal(fixture.runtime.getEvidenceCapsuleStore().count(), 1);
+    const config = getDistillationHeartbeatConfig(env.root);
+    const provenancePath = path.join(path.dirname(config.learningEpisodeStorePath), 'external-source-provenance.json');
+    const beforeReplay = JSON.parse(fs.readFileSync(provenancePath, 'utf8')) as ExternalEpisodeProvenanceFixture;
+    assert.deepEqual(Object.keys(beforeReplay.episodeToEvent), episodeIds);
+    assert.equal(
+      loadExternalCursorState(cursorStorePath(env.root)).catchUpResources[THREAD_ID]?.historicalCursor.position,
+      -1,
+    );
+
+    now = new Date('2026-01-01T01:00:00.000Z');
+    const replayedWake = await fixture.runtime.wake('scheduled');
+    assert.equal(replayedWake.discovery.sources.find(source => source.sourceId === SOURCE_ID)?.unitsProcessed, 2);
+    assert.deepEqual(Object.keys(fixture.episodeStore.load().episodes), episodeIds);
+    assert.equal(fixture.runtime.getEvidenceCapsuleStore().count(), 1);
+    const afterReplay = JSON.parse(fs.readFileSync(provenancePath, 'utf8')) as ExternalEpisodeProvenanceFixture;
+    assert.deepEqual(afterReplay, beforeReplay);
+    const completed = loadExternalCursorState(cursorStorePath(env.root));
+    assert.equal(completed.catchUpResources[THREAD_ID]?.historicalCursor.position, 4);
+    assert.equal(completed.catchUpResources[THREAD_ID]?.status, 'complete');
   } finally {
     env.restore();
   }
@@ -515,6 +976,9 @@ interface TestEnv {
   createRuntime(options?: {
     clock?: () => Date;
     episodeStoreOptions?: LearningEpisodeStoreOptions;
+    discoveryQuotas?: Partial<DiscoveryWakeQuotas>;
+    externalSourceBudget?: SourceWorkBudget;
+    sessionLogSources?: readonly SessionLogSourceAdapter[];
   }): { runtime: RuntimeLearning; episodeStore: LearningEpisodeStore };
   restore(): void;
 }
@@ -628,6 +1092,9 @@ function setupEnv(options: { historyMode?: 'future-only' | 'catch-up' | null } =
           curator,
           planner,
           clock: options.clock,
+          discoveryQuotas: options.discoveryQuotas,
+          externalSourceBudget: options.externalSourceBudget,
+          sessionLogSources: options.sessionLogSources,
         }),
         episodeStore,
       };
