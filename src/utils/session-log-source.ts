@@ -20,6 +20,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
+import { sanitizeProviderErrorMessageForLog } from './provider-error-log-sanitizer';
 
 import {
   DistillationUnit,
@@ -174,6 +175,8 @@ export interface SessionLogSourceAdapter {
   isEnabled(): boolean;
   /** Reversibly enable/disable without deleting durable source state (issue #87). */
   setEnabled?(nextEnabled: boolean): void;
+  /** Durable cursor-state location owned by an external adapter. */
+  getCursorStorePath?(): string | undefined;
   /** Explicitly reports whether this adapter has a documented stable reader. */
   getSupportStatus?(): ExternalSourceFormatStatus;
   getUnsupportedReason?(): string | undefined;
@@ -641,6 +644,7 @@ export interface ExternalDiscoveredResourceState {
 export interface ExternalSourceQuarantineEntry {
   readonly quarantineId: string;
   readonly resourceRef: string;
+  readonly sourceIdentity?: SessionLogSourceIdentity;
   readonly identity: SourceEventIdentity;
   readonly failureClass: Extract<ExternalSourceFailureClass, 'quarantine' | 'integrity_conflict'>;
   readonly message: string;
@@ -780,6 +784,9 @@ export function loadExternalCursorState(storePath: string): ExternalCursorState 
     normalizedQuarantine[quarantineId] = {
       quarantineId,
       resourceRef: typeof record.resourceRef === 'string' ? record.resourceRef : 'unknown-resource',
+      ...(record.sourceIdentity && typeof record.sourceIdentity === 'object'
+        ? { sourceIdentity: record.sourceIdentity as SessionLogSourceIdentity }
+        : {}),
       identity: record.identity as SourceEventIdentity,
       failureClass: record.failureClass === 'integrity_conflict' ? 'integrity_conflict' : 'quarantine',
       message: typeof record.message === 'string' ? record.message : 'quarantined external event',
@@ -794,7 +801,7 @@ export function loadExternalCursorState(storePath: string): ExternalCursorState 
     const record = value as Partial<ExternalSourceTombstoneEntry> | null;
     if (!record || typeof record !== 'object' || !record.identity || typeof record.identity !== 'object') continue;
     normalizedTombstones[tombstoneId] = {
-      tombstoneId,
+      tombstoneId: typeof record.tombstoneId === 'string' ? record.tombstoneId : tombstoneId,
       resourceRef: typeof record.resourceRef === 'string' ? record.resourceRef : 'unknown-resource',
       identity: record.identity as SourceEventIdentity,
       createdAt: typeof record.createdAt === 'string' ? record.createdAt : new Date().toISOString(),
@@ -1070,6 +1077,10 @@ export class ExternalSessionLogSourceAdapter implements SessionLogSourceAdapter 
     }
   }
 
+  getCursorStorePath(): string | undefined {
+    return this.cursorStorePath || undefined;
+  }
+
   discoverResources(context: SessionLogSourceDiscoveryContext = {}): readonly SessionLogSourceResource[] {
     if (!this.enabled) return [];
     if (!this.reader) return [];
@@ -1145,7 +1156,7 @@ export class ExternalSessionLogSourceAdapter implements SessionLogSourceAdapter 
     try {
       readerResult = this.reader.read(resource, resourceCursor);
     } catch (error) {
-      const message = redactOperationalMessage(toErrorMessage(error));
+      const message = redactExternalSourceDiagnostic(error);
       this.markFailed(resource, error);
       return {
         distillationUnit: null,
@@ -1153,7 +1164,7 @@ export class ExternalSessionLogSourceAdapter implements SessionLogSourceAdapter 
         status: 'failed',
         newCursor: resourceCursor,
         failure: {
-          failureClass: classifyExternalReaderError(message),
+          failureClass: classifyExternalSourceFailureMessage(message),
           message,
           resourceRef: resource.resourceRef,
         },
@@ -1169,7 +1180,14 @@ export class ExternalSessionLogSourceAdapter implements SessionLogSourceAdapter 
       };
     }
 
-    const conflict = readerResult.events.find(event => hasExternalEventConflict(state, this.identity, event));
+    // A durable operator tombstone authorizes crossing this stable event
+    // identity even if the provider later changes its revision/hash. Apply it
+    // before mutation checks; otherwise a skipped event can never unblock the
+    // cursor after an integrity-conflict quarantine.
+    const unskippedEvents = readerResult.events.filter(
+      event => !isSkippedExternalEvent(state, this.identity, event),
+    );
+    const conflict = unskippedEvents.find(event => hasExternalEventConflict(state, this.identity, event));
     if (conflict) {
       return {
         distillationUnit: null,
@@ -1179,14 +1197,14 @@ export class ExternalSessionLogSourceAdapter implements SessionLogSourceAdapter 
         newCursor: resourceCursor,
         failure: {
           failureClass: 'integrity_conflict',
-          message: redactOperationalMessage(`external event changed under the same identity: ${conflict.eventId}`),
+          message: redactExternalSourceDiagnostic(`external event changed under the same identity: ${conflict.eventId}`),
           resourceRef: resource.resourceRef,
           eventIdentities: [toEventIdentity(conflict)],
         },
       };
     }
 
-    if (resourceState?.resource.firstEventIdentity?.branchId && readerResult.events.some(event =>
+    if (resourceState?.resource.firstEventIdentity?.branchId && unskippedEvents.some(event =>
       event.branchId
       && event.branchId !== resourceState.resource.firstEventIdentity?.branchId)) {
       return {
@@ -1197,16 +1215,16 @@ export class ExternalSessionLogSourceAdapter implements SessionLogSourceAdapter 
         newCursor: resourceCursor,
         failure: {
           failureClass: 'integrity_conflict',
-          message: redactOperationalMessage(`external branch identity changed for ${resource.resourceRef}`),
+          message: redactExternalSourceDiagnostic(`external branch identity changed for ${resource.resourceRef}`),
           resourceRef: resource.resourceRef,
           eventIdentities: readerResult.events.map(toEventIdentity),
         },
       };
     }
 
-    const nonDuplicateEvents = readerResult.events.filter(
+    const nonDuplicateEvents = unskippedEvents.filter(
       event => !isDuplicateExternalEvent(state, this.identity, event),
-    ).filter(event => !isSkippedExternalEvent(state, this.identity, event));
+    );
     const accounting: SourceWorkAccounting = {
       events: readerResult.events.length,
       bytes: readerResult.byteLength ?? readerResult.events.reduce(
@@ -1244,7 +1262,7 @@ export class ExternalSessionLogSourceAdapter implements SessionLogSourceAdapter 
         eventIdentities: nonDuplicateEvents.map(toEventIdentity),
         failure: {
           failureClass: 'quarantine',
-          message: redactOperationalMessage(`stable external event is missing a verified DistillationUnit: ${missingUnit.eventId}`),
+          message: redactExternalSourceDiagnostic(`stable external event is missing a verified DistillationUnit: ${missingUnit.eventId}`),
           resourceRef: resource.resourceRef,
           eventIdentities: [toEventIdentity(missingUnit)],
         },
@@ -1341,9 +1359,8 @@ export class ExternalSessionLogSourceAdapter implements SessionLogSourceAdapter 
 
   markFailed(resource: SessionLogSourceResource, error: unknown): void {
     void resource;
-    void error;
     Logger.warning(
-      `[ExternalSessionLogSourceAdapter] ${this.identity.sourceId} resource failed: ${toErrorMessage(error)}`,
+      `[ExternalSessionLogSourceAdapter] ${this.identity.sourceId} resource failed: ${redactExternalSourceDiagnostic(error)}`,
     );
   }
 
@@ -1564,6 +1581,9 @@ export interface SessionLogSourceReport {
   readonly lastSuccessfulReadAt?: string;
   readonly nextRetryAt?: string | null;
   readonly lastError?: string;
+  readonly failureClass?: ExternalSourceFailureClass;
+  readonly requiresOperatorAction?: boolean;
+  readonly nextAction?: 'wait_for_retry' | 'retry_next_wake' | 'repair_source_then_retry' | 'retry_or_skip_quarantine';
   readonly drainState?: 'idle' | 'draining';
 }
 
@@ -1571,26 +1591,22 @@ export interface SessionLogSourceReport {
 // Helpers
 // ---------------------------------------------------------------------------
 
-function toErrorMessage(error: unknown): string {
-  if (error instanceof Error) return error.message;
-  return String(error);
-}
-
-function redactOperationalMessage(message: string, maxLength = 240): string {
-  const normalized = String(message || '')
-    .replace(/\s+/g, ' ')
-    .replace(/\/[^\s)]+/g, '<path>')
+export function redactExternalSourceDiagnostic(error: unknown, maxLength = 240): string {
+  const normalized = sanitizeProviderErrorMessageForLog(error)
+    .replace(/\b[A-Za-z]:\\(?:[^\\\s]+\\)*[^\s]*/g, '<path>')
+    .replace(/\/(?:Users|home|tmp|private|var\/log)\/[^\s)]+/g, '<path>')
     .trim();
   if (normalized.length <= maxLength) return normalized;
   return `${normalized.slice(0, Math.max(0, maxLength - 1))}…`;
 }
 
-function classifyExternalReaderError(message: string): ExternalSourceFailureClass {
+export function classifyExternalSourceFailureMessage(message: string): ExternalSourceFailureClass {
   const normalized = message.toLowerCase();
   if (/quarantine|external evidence limit|oversized|unsafe/.test(normalized)) return 'quarantine';
   if (/integrity|changed under the same identity|branch identity changed/.test(normalized)) return 'integrity_conflict';
   if (/protocol|json|schema|provider mismatch|unsupported/.test(normalized)) return 'protocol';
   if (/auth|unauthori|forbidden|permission denied|access denied/.test(normalized)) return 'permission';
+  if (/pending/.test(normalized)) return 'pending';
   return 'transient';
 }
 
@@ -1761,12 +1777,14 @@ function applyExternalDiscoveryPage(
       continuityTail: existing?.continuityTail ?? [],
       continuityIncomplete: existing?.continuityIncomplete ?? (item.activationPosition > -1),
       updatedAt: now,
-      lifecycleStatus: 'active',
+      lifecycleStatus: existing?.lifecycleStatus ?? 'active',
       lastSeenAt: now,
       lastSeenDiscoveryCycle: cycle,
       missingDiscoveryCycles: 0,
       missingSince: null,
       ...(existing?.lastSuccessfulReadAt ? { lastSuccessfulReadAt: existing.lastSuccessfulReadAt } : {}),
+      ...(existing?.closedAt ? { closedAt: existing.closedAt } : {}),
+      ...(existing?.closedReason ? { closedReason: existing.closedReason } : {}),
     };
     const existingCursor = readCursorWithSourceIdentityValidation(nextState, identity, item.resource.resourceRef);
     if (!existingCursor) {
@@ -1961,6 +1979,9 @@ function isSkippedExternalEvent(
   const identity = toEventIdentity(event);
   return Object.prototype.hasOwnProperty.call(
     state.tombstones,
+    buildExternalStableEventKey(sourceIdentity, identity),
+  ) || Object.prototype.hasOwnProperty.call(
+    state.tombstones,
     buildExternalEventDedupKey(sourceIdentity, identity),
   );
 }
@@ -2003,19 +2024,24 @@ export function skipExternalSourceQuarantine(
   const state = loadExternalCursorState(storePath);
   const entry = state.quarantinedEvents[quarantineId];
   if (!entry) return false;
+  const sourceIdentity = entry.sourceIdentity ?? Object.values(state.sourceIdentities).find(identity => (
+    quarantineId.startsWith(`${identity.sourceId}::${identity.provider}::`)
+  ));
+  if (!sourceIdentity) return false;
   const nextQuarantine = { ...state.quarantinedEvents };
   delete nextQuarantine[quarantineId];
+  const tombstoneKey = buildExternalStableEventKey(sourceIdentity, entry.identity);
   saveExternalCursorState(storePath, {
     ...state,
     quarantinedEvents: nextQuarantine,
     tombstones: {
       ...state.tombstones,
-      [quarantineId]: {
+      [tombstoneKey]: {
         tombstoneId: quarantineId,
         resourceRef: entry.resourceRef,
         identity: entry.identity,
         createdAt: new Date().toISOString(),
-        reason: redactOperationalMessage(reason || 'operator skip'),
+        reason: redactExternalSourceDiagnostic(reason || 'operator skip'),
       },
     },
     updatedAt: new Date().toISOString(),

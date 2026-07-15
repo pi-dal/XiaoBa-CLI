@@ -442,6 +442,95 @@ test('lock contention: different providers remain isolated', async () => {
   }
 });
 
+test('lock contention: distinct provider identities cannot collide after path sanitization', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'xiaoba-provider-lock-identity-'));
+  tempRoots.push(root);
+  const first = acquireExternalSourceProviderLock({
+    runtimeRoot: root,
+    provider: 'codex/team',
+    operation: 'first-provider',
+  });
+  assert.ok(first.acquired);
+  const second = acquireExternalSourceProviderLock({
+    runtimeRoot: root,
+    provider: 'codex-team',
+    operation: 'second-provider',
+  });
+  try {
+    assert.ok(second.acquired, 'different provider identities own different lock paths');
+  } finally {
+    if (second.acquired) second.release();
+    first.release();
+  }
+});
+
+test('lock contention: a live in-progress stale-lock claimer is never deleted', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'xiaoba-provider-live-claim-'));
+  tempRoots.push(root);
+  const probe = acquireExternalSourceProviderLock({
+    runtimeRoot: root,
+    provider: 'codex',
+    operation: 'probe',
+  });
+  assert.ok(probe.acquired);
+  const lockDir = path.dirname(probe.lockPath);
+  probe.release();
+
+  const claimDir = path.join(lockDir, '.claim');
+  fs.mkdirSync(claimDir, { recursive: true });
+  fs.writeFileSync(path.join(claimDir, 'claimer.json'), JSON.stringify({
+    pid: process.pid,
+    startedAt: new Date().toISOString(),
+    token: 'live-claimer',
+  }), 'utf8');
+
+  const contender = acquireExternalSourceProviderLock({
+    runtimeRoot: root,
+    provider: 'codex',
+    operation: 'contender',
+  });
+  assert.equal(contender.acquired, false, 'live claimer fences contenders during stale recovery');
+  assert.equal(fs.existsSync(path.join(claimDir, 'claimer.json')), true, 'contender preserves live claim');
+});
+
+test('lock contention: a dead owner and dead reclaim claim recover without operator cleanup', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'xiaoba-provider-stale-claim-'));
+  tempRoots.push(root);
+  const probe = acquireExternalSourceProviderLock({
+    runtimeRoot: root,
+    provider: 'codex',
+    operation: 'probe',
+  });
+  assert.ok(probe.acquired);
+  const lockDir = path.dirname(probe.lockPath);
+  probe.release();
+
+  fs.mkdirSync(path.join(lockDir, '.claim'), { recursive: true });
+  fs.writeFileSync(probe.lockPath, JSON.stringify({
+    provider: 'codex',
+    pid: -1,
+    startedAt: new Date(0).toISOString(),
+    operation: 'stale-owner',
+    token: 'stale-owner',
+  }), 'utf8');
+  fs.writeFileSync(path.join(lockDir, '.claim', 'claimer.json'), JSON.stringify({
+    pid: -1,
+    startedAt: new Date(0).toISOString(),
+    token: 'stale-claimer',
+  }), 'utf8');
+
+  const recovered = acquireExternalSourceProviderLock({
+    runtimeRoot: root,
+    provider: 'codex',
+    operation: 'recovered-owner',
+  });
+  assert.ok(recovered.acquired, 'dead owner and claim are reclaimed');
+  if (recovered.acquired) {
+    assert.equal(recovered.record.operation, 'recovered-owner');
+    recovered.release();
+  }
+});
+
 test('failure classification: permission failure records class and suspends with backoff', async () => {
   const env = setupEnv({ provider: 'codex', sourceId: 'external-codex' });
   try {
@@ -485,7 +574,7 @@ test('failure classification: permission failure records class and suspends with
           byCursor: {
             '0': {
               exitCode: 1,
-              stderr: 'Error: permission denied for resource conversation-main',
+              stderr: 'Error: permission denied Bearer secret-token api_key=abc123 C:\\Users\\alice\\secret /Users/alice/secret',
             },
           },
         },
@@ -501,6 +590,7 @@ test('failure classification: permission failure records class and suspends with
     assert.ok(state!.nextRetryAt, 'next retry timestamp set');
     assert.ok(state!.lastError, 'last error message recorded');
     assert.equal(state!.lastError.includes('permission'), true, 'error message is redacted but retains signal');
+    assert.doesNotMatch(state!.lastError!, /secret-token|abc123|alice/i, 'credentials and local paths are redacted');
 
     // A third wake while suspended should skip (backoff) — not retry immediately.
     const result2 = await fixture.runtime.wake('scheduled');
@@ -573,6 +663,21 @@ test('failure classification: protocol failure requires operator action (no auto
     const report2 = result2.discovery.sources.find(s => s.sourceId === 'external-codex');
     assert.ok(report2);
     assert.equal(report2!.status, 'backoff', 'source skipped (requires operator action)');
+    assert.equal(report2!.failureClass, 'protocol');
+    assert.equal(report2!.requiresOperatorAction, true);
+    assert.equal(report2!.nextAction, 'repair_source_then_retry');
+
+    // After the operator fixes the reader/protocol, an explicit source retry
+    // must clear the durable manual-action gate rather than strand the lane.
+    assert.equal(
+      fixture.runtime.retryExternalSourceFailure('codex', 'external-codex'),
+      true,
+      'operator can retry a source-level protocol failure',
+    );
+    const result3 = await fixture.runtime.wake('scheduled');
+    const report3 = result3.discovery.sources.find(s => s.sourceId === 'external-codex');
+    assert.ok(report3);
+    assert.notEqual(report3!.status, 'backoff', 'explicit retry makes the source runnable again');
   } finally {
     env.restore();
   }
@@ -638,6 +743,22 @@ test('quarantine recovery: retry reprocesses the same event without a tombstone'
 
     const quarantineId = quarantinesAfter[0]!.quarantineId;
 
+    const lock = acquireExternalSourceProviderLock({
+      runtimeRoot: path.join(env.root, 'data'),
+      provider: 'codex',
+      operation: 'competing-operator',
+    });
+    assert.ok(lock.acquired);
+    assert.equal(
+      fixture.runtime.retryExternalSourceQuarantine('codex', 'external-codex', quarantineId),
+      false,
+      'operator recovery respects the provider single-writer lock',
+    );
+    const stateWhileLocked = fixture.runtime.getExternalSourceFailureState().get('external-codex');
+    assert.equal(stateWhileLocked?.failureClass, 'quarantine', 'lock contention preserves the recovery diagnosis');
+    assert.equal(stateWhileLocked?.requiresOperatorAction, true);
+    lock.release();
+
     // Retry: removes the quarantine so the event can be reprocessed.
     const retryResult = fixture.runtime.retryExternalSourceQuarantine('codex', 'external-codex', quarantineId);
     assert.equal(retryResult, true, 'retry removes quarantine');
@@ -646,6 +767,37 @@ test('quarantine recovery: retry reprocesses the same event without a tombstone'
     assert.ok(!stateAfterRetry.quarantinedEvents[quarantineId], 'quarantine entry removed');
     // No tombstone written for retry — the event will be reprocessed.
     assert.equal(Object.keys(stateAfterRetry.tombstones).length, 0, 'no tombstone written on retry');
+
+    writeScenario(env.scenarioPath, {
+      discover: {
+        pages: {
+          start: {
+            protocolVersion: 1,
+            provider: 'codex',
+            resources: [
+              resource('conversation-main', 'event://codex/main-0', 0, 'conv-1', 'branch-main', { activationPosition: 0 }),
+            ],
+          },
+        },
+      },
+      read: {
+        'conversation-main': {
+          byCursor: {
+            '0': stableRead('codex', 'conversation-main', [
+              protocolEvent('event://codex/main-1', 1, 'conv-1', 'branch-main', 'Retry task', 'Retry done.', {
+                revision: 'retry-rev-1',
+                contentHash: 'retry-hash-1',
+              }),
+            ], 1),
+          },
+        },
+      },
+    });
+    const retryWake = await fixture.runtime.wake('scheduled');
+    const retryReport = retryWake.discovery.sources.find(s => s.sourceId === 'external-codex');
+    assert.ok(retryReport);
+    assert.notEqual(retryReport!.status, 'backoff', 'retry clears the durable operator-action gate');
+    assert.equal(retryReport!.unitsProcessed, 1, 'the same blocked resource is reprocessed');
   } finally {
     env.restore();
   }
@@ -718,8 +870,44 @@ test('quarantine recovery: skip writes a durable tombstone before allowing the c
 
     const state = loadExternalCursorState(storePath);
     assert.ok(!state.quarantinedEvents[quarantineId], 'quarantine removed after skip');
-    assert.ok(state.tombstones[quarantineId], 'durable tombstone written');
-    assert.ok(state.tombstones[quarantineId]!.reason.includes('operator skip'), 'tombstone carries redacted reason');
+    const tombstone = Object.values(state.tombstones).find(entry => entry.tombstoneId === quarantineId);
+    assert.ok(tombstone, 'durable tombstone written');
+    assert.ok(tombstone!.reason.includes('operator skip'), 'tombstone carries redacted reason');
+
+    // The provider may replay the skipped stable identity with a different
+    // revision/hash. The tombstone binds to stable identity, so the event is
+    // still skipped and the cursor crosses it without creating evidence.
+    writeScenario(env.scenarioPath, {
+      discover: {
+        pages: {
+          start: {
+            protocolVersion: 1,
+            provider: 'codex',
+            resources: [
+              resource('conversation-main', 'event://codex/main-0', 0, 'conv-1', 'branch-main', { activationPosition: 0 }),
+            ],
+          },
+        },
+      },
+      read: {
+        'conversation-main': {
+          byCursor: {
+            '0': stableRead('codex', 'conversation-main', [
+              protocolEvent('event://codex/main-0', 0, 'conv-1', 'branch-main', 'Skipped task', 'Skipped result.', {
+                revision: 'mutated-after-skip',
+                contentHash: 'mutated-after-skip',
+              }),
+            ], 0),
+          },
+        },
+      },
+    });
+    const skipWake = await fixture.runtime.wake('scheduled');
+    const skipReport = skipWake.discovery.sources.find(s => s.sourceId === 'external-codex');
+    assert.ok(skipReport);
+    assert.notEqual(skipReport!.status, 'backoff', 'skip clears the durable operator-action gate');
+    assert.equal(skipReport!.unitsProcessed, 0, 'skipped identity never becomes learning evidence');
+    assert.equal(loadExternalCursorState(storePath).cursors['conversation-main']?.cursor.position, 0);
   } finally {
     env.restore();
   }
@@ -777,6 +965,14 @@ test('resource closure: delete closes locally while preserving cursor, capsules,
 
     // Cursor is preserved — not wiped.
     assert.ok(stateAfter.cursors['conversation-main'], 'cursor preserved for closed resource');
+
+    await fixture.runtime.wake('scheduled');
+    const rediscoveredState = loadExternalCursorState(storePath);
+    assert.equal(
+      rediscoveredState.resources['conversation-main']?.lifecycleStatus,
+      'closed',
+      'ordinary rediscovery cannot silently reopen an operator-closed resource',
+    );
   } finally {
     env.restore();
   }
@@ -930,6 +1126,53 @@ test('graceful drain: stops new external reads and leaves unacknowledged work re
     const report2 = result2.discovery.sources.find(s => s.sourceId === 'external-codex');
     assert.ok(report2);
     assert.notEqual(report2!.status, 'drained', 'source resumes after drain cleared');
+  } finally {
+    env.restore();
+  }
+});
+
+test('external drain does not suppress due internal settlement and review work', async () => {
+  const env = setupEnv({ provider: 'codex', sourceId: 'external-codex' });
+  try {
+    writeScenario(env.scenarioPath, {
+      discover: { pages: { start: { protocolVersion: 1, provider: 'codex', resources: [] } } },
+      read: {},
+    });
+    const fixture = env.createRuntime();
+    fixture.episodeStore.save({
+      schemaVersion: 3,
+      episodes: {
+        'internal-drain-review': {
+          schemaVersion: 3,
+          episodeId: 'internal-drain-review',
+          runtimeSessionId: 'internal-drain-review',
+          sourceFilePath: 'internal-drain-review.jsonl',
+          deliveryTurn: 1,
+          completionEvidence: [{
+            ref: 'internal-drain-review.jsonl#turn-1:delivery',
+            sourceFilePath: 'internal-drain-review.jsonl',
+            turn: 1,
+            kind: 'artifact-delivery',
+            detail: 'delivered the internal report',
+          }],
+          contradictionSignals: [],
+          semanticObservations: [{
+            kind: 'user-intent',
+            value: 'Deliver the internal report.',
+            sourceRefs: ['internal-drain-review.jsonl#turn-1:user-intent'],
+          }],
+          settlementDeadline: new Date(0).toISOString(),
+          status: 'eligible',
+        },
+      },
+    });
+
+    fixture.runtime.requestExternalSourceDrain();
+    const result = await fixture.runtime.wake('startup');
+    assert.ok(
+      result.review.reviewedEpisodes >= 1,
+      `external drain leaves internal review admission live: ${JSON.stringify(result.review)}`,
+    );
   } finally {
     env.restore();
   }

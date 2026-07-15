@@ -150,6 +150,9 @@ test('xurl invalid protocol fails closed without operational retry entries', asy
     const state = loadExternalSessionLogBackfillState(result.paths.stateFilePath)!;
     assert.equal(state.failures.length, 1);
     assert.match(state.failures[0]!.message, /not valid protocol-v1 JSON/i);
+    const sourceFailure = fixture.runtime.getExternalSourceFailureState().get('codex-xurl-source');
+    assert.equal(sourceFailure?.failureClass, 'protocol');
+    assert.equal(sourceFailure?.requiresOperatorAction, true);
   } finally {
     env.restore();
   }
@@ -170,6 +173,9 @@ test('xurl timeout fails as a source failure without review retry pollution', as
     assert.equal(loadReviewQueueState(env.reviewQueuePath).operational.length, 0);
     const state = loadExternalSessionLogBackfillState(result.paths.stateFilePath)!;
     assert.match(state.failures[0]!.message, /timed out/i);
+    const sourceFailure = fixture.runtime.getExternalSourceFailureState().get('codex-xurl-source');
+    assert.equal(sourceFailure?.failureClass, 'transient');
+    assert.ok(sourceFailure?.nextRetryAt);
   } finally {
     env.restore();
   }

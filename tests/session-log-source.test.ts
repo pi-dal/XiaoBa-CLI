@@ -599,6 +599,55 @@ describe('Issue #75 — Source-neutral Heartbeat input seam', () => {
       assert.ok(!durableText.includes('external system prompt'));
     });
 
+    test('external batch quarantine identifies the event that actually failed', async () => {
+      const fixtureFile1 = path.join(env.root, 'fixture', 'chat', 'external-batch-good.jsonl');
+      const fixtureFile2 = path.join(env.root, 'fixture', 'chat', 'external-batch-oversized.jsonl');
+      const [delivery1, acceptance1] = deliveryPair();
+      const [delivery2, acceptance2] = deliveryPair();
+      delivery2.assistant.tool_calls[0]!.arguments = { payload: 'x'.repeat(4 * 1024) };
+      const units = [
+        buildDistillationUnitFromFile([delivery1, acceptance1], fixtureFile1),
+        buildDistillationUnitFromFile([delivery2, acceptance2], fixtureFile2),
+      ];
+      const resource: SessionLogSourceResource = {
+        resourceRef: 'external://batch-failure/resource',
+        firstEventIdentity: { eventId: 'batch-good', position: 0 },
+      };
+      const source: SessionLogSourceAdapter = {
+        identity: {
+          sourceId: 'external-batch-failure',
+          label: 'External Batch Failure Fixture',
+          category: 'external',
+          provider: 'fixture',
+          reader: 'batch',
+        },
+        isEnabled: () => true,
+        discoverResources: () => [resource],
+        read: () => ({
+          distillationUnit: units[0]!,
+          distillationUnits: units,
+          eventIdentities: [
+            { eventId: 'batch-good', position: 0, contentHash: 'batch-good-hash' },
+            { eventId: 'batch-oversized', position: 1, contentHash: 'batch-oversized-hash' },
+          ],
+          advanced: true,
+          status: 'advanced',
+          newCursor: { resourceRef: resource.resourceRef, position: 2, processedCount: 2 },
+        }),
+        acknowledge: () => assert.fail('failed batch must remain unacknowledged'),
+        markFailed: () => {},
+      };
+
+      const runtimeLearning = createRuntimeLearning(env, [source]);
+      const result = await runtimeLearning.wake('startup');
+      const quarantines = runtimeLearning.listExternalSourceQuarantines('fixture', 'external-batch-failure');
+
+      assert.equal(result.discovery.sources[0]!.status, 'failed');
+      assert.equal(quarantines.length, 1);
+      assert.equal(quarantines[0]!.identity.eventId, 'batch-oversized');
+      assert.equal(quarantines[0]!.identity.position, 1);
+    });
+
     test('replay repairs provenance before cursor advancement after a persistence interruption', async () => {
       const fixtureFile = path.join(env.root, 'fixture', 'chat', 'external-replay.jsonl');
       const [delivery, acceptance] = deliveryPair();

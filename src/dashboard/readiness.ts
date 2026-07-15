@@ -103,6 +103,9 @@ export interface DashboardRuntimeLearningStatus {
     lastSuccessfulReadAt?: string;
     nextRetryAt?: string;
     lastError?: string;
+    failureClass?: string;
+    requiresOperatorAction?: boolean;
+    nextAction?: string;
     drainState?: string;
   }>;
 }
@@ -236,6 +239,11 @@ function readRuntimeLearningStatus(
           ...(typeof report.lastSuccessfulReadAt === 'string' ? { lastSuccessfulReadAt: report.lastSuccessfulReadAt } : {}),
           ...(typeof report.nextRetryAt === 'string' ? { nextRetryAt: report.nextRetryAt } : {}),
           ...(typeof report.lastError === 'string' ? { lastError: report.lastError } : {}),
+          ...(typeof report.failureClass === 'string' ? { failureClass: report.failureClass } : {}),
+          ...(typeof report.requiresOperatorAction === 'boolean'
+            ? { requiresOperatorAction: report.requiresOperatorAction }
+            : {}),
+          ...(typeof report.nextAction === 'string' ? { nextAction: report.nextAction } : {}),
           ...(typeof report.drainState === 'string' ? { drainState: report.drainState } : {}),
         }));
     }
