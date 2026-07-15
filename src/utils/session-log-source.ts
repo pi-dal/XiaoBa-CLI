@@ -615,6 +615,16 @@ export interface ExternalSourceActivationState {
   readonly mode: 'future-only-resource-baseline';
   readonly watermarkPosition?: number;
   readonly initialDiscoveryCompleted: boolean;
+  /**
+   * Durable activation-blocked flag. When true the provider exceeded an
+   * activation limit (catalog size, rendered output, or duration) and the
+   * lane admits nothing until an operator narrows scope or raises the cap.
+   * Existing baseline progress is retained; the flag is resumable across
+   * restarts and never partially admits.
+   */
+  readonly activationBlocked?: boolean;
+  readonly activationBlockedReason?: string;
+  readonly activationBlockedAt?: string;
 }
 
 export interface ExternalSourceDiscoveryState {
@@ -829,6 +839,13 @@ export function loadExternalCursorState(storePath: string): ExternalCursorState 
         mode: 'future-only-resource-baseline',
         ...(typeof activation.watermarkPosition === 'number' ? { watermarkPosition: Math.floor(activation.watermarkPosition) } : {}),
         initialDiscoveryCompleted: activation.initialDiscoveryCompleted === true,
+        ...(activation.activationBlocked === true ? { activationBlocked: true } : {}),
+        ...(typeof activation.activationBlockedReason === 'string' && activation.activationBlockedReason
+          ? { activationBlockedReason: activation.activationBlockedReason }
+          : {}),
+        ...(typeof activation.activationBlockedAt === 'string' && activation.activationBlockedAt
+          ? { activationBlockedAt: activation.activationBlockedAt }
+          : {}),
       }
       : null,
     discovery: discovery
@@ -1090,6 +1107,14 @@ export class ExternalSessionLogSourceAdapter implements SessionLogSourceAdapter 
       ? loadExternalCursorState(this.cursorStorePath)
       : emptyExternalCursorState();
     const withIdentity = registerExternalSourceIdentity(state, this.identity);
+
+    // A durably activation-blocked provider admits nothing until an operator
+    // narrows scope or raises the cap. The flag is resumable and never partially
+    // admits; existing baseline progress and evidence are retained.
+    if (withIdentity.activation?.activationBlocked === true) {
+      this.persistExternalState(withIdentity);
+      return [];
+    }
 
     if (!withIdentity.activation) {
       if (!hasAnyPersistedExternalProgress(withIdentity, this.identity)) {
@@ -1369,7 +1394,32 @@ export class ExternalSessionLogSourceAdapter implements SessionLogSourceAdapter 
     maxResources: number,
   ): ExternalCursorState {
     const cycle = 1;
-    const discovery = this.discoverIncrementalPage(state, null, null, maxResources);
+    let discovery: ExternalSourceIncrementalDiscoveryResult;
+    try {
+      discovery = this.discoverIncrementalPage(state, null, null, maxResources);
+    } catch (error) {
+      if (isActivationBlockedError(error)) {
+        const now = new Date().toISOString();
+        return {
+          ...state,
+          activation: {
+            initializedAt: now,
+            mode: 'future-only-resource-baseline',
+            initialDiscoveryCompleted: false,
+            activationBlocked: true,
+            activationBlockedReason: redactExternalSourceDiagnostic(error),
+            activationBlockedAt: now,
+          },
+          discovery: {
+            nextPageToken: null,
+            nextResourceIndex: 0,
+            updatedAt: now,
+            cycle,
+          },
+        };
+      }
+      throw error;
+    }
     let withResources = applyExternalDiscoveryPage(state, this.identity, discovery, cycle);
     if (discovery.nextPageToken == null) {
       withResources = finalizeExternalDiscoveryCycle(withResources, cycle);
@@ -1591,6 +1641,15 @@ export interface SessionLogSourceReport {
 // Helpers
 // ---------------------------------------------------------------------------
 
+/**
+ * Detects an xURL activation-blocked error by its marker property without
+ * importing the reader module (avoids a circular dependency).
+ */
+function isActivationBlockedError(error: unknown): boolean {
+  return error != null && typeof error === 'object'
+    && (error as Record<string, unknown>).xurlActivationBlocked === true;
+}
+
 export function redactExternalSourceDiagnostic(error: unknown, maxLength = 240): string {
   const normalized = sanitizeProviderErrorMessageForLog(error)
     .replace(/\b[A-Za-z]:\\(?:[^\\\s]+\\)*[^\s]*/g, '<path>')
@@ -1604,8 +1663,8 @@ export function classifyExternalSourceFailureMessage(message: string): ExternalS
   const normalized = message.toLowerCase();
   if (/quarantine|external evidence limit|oversized|unsafe/.test(normalized)) return 'quarantine';
   if (/integrity|changed under the same identity|branch identity changed/.test(normalized)) return 'integrity_conflict';
-  if (/protocol|json|schema|provider mismatch|unsupported/.test(normalized)) return 'protocol';
   if (/auth|unauthori|forbidden|permission denied|access denied/.test(normalized)) return 'permission';
+  if (/protocol|json|schema|provider mismatch|unsupported|frontmatter|timeline|ordinal|rendered|heading|uri mismatch|thread mismatch|catalog/.test(normalized)) return 'protocol';
   if (/pending/.test(normalized)) return 'pending';
   return 'transient';
 }
