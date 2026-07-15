@@ -9,6 +9,8 @@ The architectural decisions are recorded in:
 - [ADR-0042: External Provider Reads Use Bounded Concurrency](../adr/0042-external-provider-reads-use-bounded-concurrency.md)
 - [ADR-0043: Official xURL Rendered Timeline Is the External Reader Contract](../adr/0043-official-xurl-rendered-timeline-is-the-reader-contract.md)
 
+The proposed [Automatic External History Catch-Up Through Heartbeat](./automatic-external-history-catch-up.md) extension and [ADR-0044](../adr/0044-automatic-external-history-catch-up-uses-per-thread-targets.md) add an opt-in persistent history policy. They preserve this PRD's implemented future-only default, official xURL contract, bounded concurrency, and serialized admission architecture.
+
 ## Problem Statement
 
 The Runtime can currently construct only one configured continuous external source, and its xURL reader invokes a XiaoBa-specific `session-log-v1` command that the official xURL CLI does not provide. The deterministic tests validate the intended source protocol, but an operator cannot install unmodified xURL, enable several providers, and run the continuous path end to end.
@@ -35,7 +37,7 @@ The Runtime therefore needs multiple independently controlled provider lanes, co
 - Automatically installing or upgrading xURL.
 - Running multiple writes to Episode, Capsule, provenance, Registry, or cursor stores concurrently.
 - Turning external evidence into a separate review or promotion path.
-- Importing historical threads during ordinary provider enablement.
+- Importing historical threads during ordinary provider enablement without an explicit catch-up policy.
 - Adding Dashboard write controls in the first release; Dashboard remains a read-only status surface.
 - Cloud scheduling, remote transcript upload, or cross-machine cursor ownership.
 - Provider-specific trust weights or provider-specific Skill Evolution policy.
@@ -46,7 +48,7 @@ The Runtime therefore needs multiple independently controlled provider lanes, co
 
 Continuous external admission is controlled by a set, not a selected value. Provider IDs are normalized opaque identifiers supplied to xURL; XiaoBa does not encode an enum of known agents. Official xURL may reject an unsupported identifier, which remains a source-local support failure.
 
-Each provider has a durable External Provider Admission Gate. Closing the gate pauses new admission without deleting cursor, Capsule, Episode, quarantine, or audit state. Reopening it resumes from the preserved cursor and catches up events produced while paused.
+Each provider has a durable External Provider Admission Gate. Closing the gate pauses new admission without deleting cursor, Capsule, Episode, quarantine, or audit state. Reopening it resumes from the preserved cursor and admits events produced while paused.
 
 An explicit rebaseline is the only operation that skips unread events. It advances watermarks to the current stable Timeline without admitting the skipped interval and writes an operator audit record.
 
@@ -244,7 +246,7 @@ Missing xURL, unsupported provider, permission error, timeout, oversized output,
 6. Global deadline and disable cancel xURL reads, discard uncommitted pages, drain only an active commit, and leave cursors replayable.
 7. First enablement completes a non-admitting baseline for every existing in-scope thread before active admission.
 8. An incomplete or oversized global baseline enters activation_blocked without admitting unknown history.
-9. Re-enable catches up from the old cursor; explicit rebaseline skips to now and persists an operator audit.
+9. Re-enable resumes from the old cursor; explicit rebaseline skips to now and persists an operator audit.
 10. Scope narrowing preserves out-of-scope state; expansion baselines only newly included historical resources.
 11. The adapter invokes unmodified official xURL commands and never invokes `session-log-v1`.
 12. Strict Timeline parsing, mutation detection, stability sampling, and adversarial Markdown cases fail closed at the provider lane.
@@ -263,7 +265,7 @@ Missing xURL, unsupported provider, permission error, timeout, oversized output,
 - Test activation with bounded catalogs, interrupted resume, new threads during activation, scope expansion, blocked activation, and no historical Episode creation.
 - Test concurrency with controllable fake xURL processes that expose overlap and cancellation while instrumenting the Admission Coordinator to prove single-writer behavior.
 - Test fair provider ordering under resource, episode, and elapsed-time quotas, including a slow provider and a continuously ready provider.
-- Test disable/re-enable catch-up, audited rebaseline, same-provider backfill arbitration, and different-provider overlap.
+- Test disable/re-enable cursor continuation, audited rebaseline, same-provider backfill arbitration, and different-provider overlap.
 - Keep deterministic CI independent of local credentials and user logs.
 - Provide an opt-in official-xURL smoke that points xURL provider roots at synthetic Codex, Claude, and Pi fixtures, never at private user data by default.
 

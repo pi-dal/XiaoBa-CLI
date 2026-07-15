@@ -37,7 +37,7 @@ The Runtime operator-selected set of External Session Log Sources eligible for c
 _Avoid_: Selected provider, active provider, provider rotation target
 
 **External Source Scope**:
-The configurable set of xURL threads visible to one External Session Log Source, global by default and optionally narrowed by project path. Scope filters admission without changing provider identity; newly included historical threads must establish an External Activation Baseline before admission.
+The configurable set of xURL threads visible to one External Session Log Source, global by default and optionally narrowed by project path. Scope filters admission without changing provider identity. Newly included threads establish an External Activation Baseline in future-only mode and receive an External Catch-Up Target in catch-up mode.
 _Avoid_: Provider identity, cursor namespace, historical backfill range
 
 **External Provider Admission Gate**:
@@ -53,8 +53,28 @@ The provider-neutral, numbered User, Assistant, and Context Compacted view that 
 _Avoid_: Raw provider log, custom xURL protocol, trusted prompt
 
 **External Session Log Backfill**:
-An explicit, bounded operation that admits pre-existing conversations from an External Session Log Source. It is separate from ordinary source enablement, remains disabled by default, and must not turn on historical scanning implicitly.
-_Avoid_: Startup replay, unlimited history import, automatic provider migration
+An explicit, bounded operation that admits a precise historical range from an External Session Log Source for repair, replay, or another operator-selected exception. It remains separate from Automatic External History Catch-Up and never changes a provider's External History Mode implicitly.
+_Avoid_: Automatic catch-up, startup replay, ordinary historical learning
+
+**External History Mode**:
+A durable per-provider policy with two values: `future-only` admits only events after the External Activation Baseline, while `catch-up` lets the Distillation Heartbeat automatically drain bounded historical work. The environment supplies a future-only default, and a durable provider override may opt into catch-up without changing source identity or review authority.
+_Avoid_: Backfill operation, provider enablement, review policy
+
+**Automatic External History Catch-Up**:
+Heartbeat-owned historical admission for every canonical completed turn in the active External Source Scope. It reuses Source Work Lanes, provider locks, the External Admission Coordinator, and the ordinary learning pipeline; users select a persistent mode rather than topics, ranges, or batches.
+_Avoid_: Explicit backfill, second scheduler, startup bulk import
+
+**External Catch-Up Target**:
+An immutable per-thread historical boundary containing the highest complete stable event position, or an explicit empty position, plus a cumulative digest over canonical event identities and content hashes through that boundary. Mutable cursor, catalog-generation, retry, and lifecycle fields remain resource state. Events completed at or below the target belong to catch-up, later events belong to continuous admission, and historical episodes remain ineligible until the target is complete. Explicit abandonment leaves unresolved episodes permanently ineligible and writes range tombstones.
+_Avoid_: Provider-wide snapshot, moving watermark, current fetch head
+
+**Catch-Up Catalog Pass**:
+A bounded, resumable expanding-limit observation of one provider's active scope that discovers threads requiring External Catch-Up Targets. The Runtime persists generation, requested limit, scope fingerprint, timing, and aggregate progress; each resource records its latest observed generation, so a completed pass plus terminal targets defines `caught_up` without a full provider manifest.
+_Avoid_: Atomic provider snapshot, transcript mirror, backfill manifest
+
+**Historical-Pending Episode**:
+A Learning Episode admitted by Automatic External History Catch-Up whose source thread has not yet reached its fixed target. It remains durable but cannot enter Author or Verifier review until target reconciliation makes it eligible; old source timestamps do not bypass this gate.
+_Avoid_: Settling Candidate, deferred review, quarantined event
 
 **External Evidence Admission**:
 The admission of normalized external session entries into the ordinary Learning Episode and capability-review pipeline. External evidence preserves provider provenance and receives the same evidence, review, transcript, and promotion gates as Internal Session Log Source evidence.
@@ -77,7 +97,7 @@ A bounded, locally retained subset of an admitted source episode that is suffici
 _Avoid_: Full transcript mirror, temporary prompt context, unbounded cache
 
 **Source Work Lane**:
-A durable, independently scheduled stream of Session Log Source work within the local Heartbeat Scheduler. Each lane owns its cursor, due time, quota, adapter state, and retry/backoff; the Internal lane settles first, after which distinct External lanes may run concurrently without sharing admission state.
+A durable, independently scheduled stream of Session Log Source work within the local Heartbeat Scheduler. Each lane owns its cursor, due time, quota, adapter state, and retry/backoff; the Internal lane settles first, after which distinct External lanes may read concurrently. Continuous, catch-up, and explicit backfill pages still settle through one External Admission Coordinator.
 _Avoid_: Parallel heartbeat scheduler, in-memory queue only, global unbounded scan
 
 **External Source Stability Gate**:
@@ -89,11 +109,11 @@ The condition that a new external-reader version must preserve the normalized ti
 _Avoid_: Exact-version pin, best-effort format parsing, automatic history rewrite
 
 **External Activation Baseline**:
-A resumable, non-admitting snapshot of every existing thread in one newly enabled External Session Log Source. It records each thread's current rendered timeline position and fingerprints so only later entries can cross the External Provider Admission Gate; an incomplete baseline leaves the provider blocked rather than partially active.
-_Avoid_: Historical backfill, first heartbeat import, evidence snapshot
+A resumable, non-admitting boundary for every existing thread in one future-only External Session Log Source. It records each thread's current rendered timeline position and fingerprints so only later entries can cross the External Provider Admission Gate; catch-up mode uses External Catch-Up Targets instead of treating this boundary as skipped history.
+_Avoid_: Historical catch-up, first heartbeat import, evidence snapshot
 
 **External Rebaseline**:
-An explicit, audited operation that moves one External Session Log Source's admission watermarks to its current stable timelines without admitting the skipped interval. Ordinary disable and enable operations never perform a rebaseline; they pause and later catch up from the preserved cursor.
+An explicit, audited operation that moves one External Session Log Source's admission watermarks to its current stable timelines without admitting the skipped interval. When unfinished catch-up exists, it requires future-only mode and writes abandonment tombstones before advancing; ordinary disable, enable, or history-mode changes only pause and resume preserved work.
 _Avoid_: Enable, cursor reset, silent gap
 
 **Source-Bound Continuity**:
@@ -121,7 +141,7 @@ A chunk of one session log file made from newly appended turns plus continuity c
 _Avoid_: Daily batch, global log batch
 
 **Learning Episode**:
-A prefilter-selected completed task attempt that may be worth capability review. Each completed delivery attempt is independent; corrections and retries become separate attempts connected only through bounded source context. An episode is selected by observable delivery, composition, recovery, or complexity signals, but it makes no claim that a reusable capability exists.
+A prefilter-selected completed task attempt that may be worth capability review. Each completed delivery attempt is independent; corrections and retries become separate attempts connected only through bounded source context. An episode is selected by observable delivery, composition, recovery, or complexity signals, but it makes no claim that a reusable capability exists. A catch-up episode may remain historical-pending until its source thread reaches its fixed target.
 _Avoid_: Promoted capability, solved loop, every assistant reply, multi-attempt task graph
 
 **Capability**:
