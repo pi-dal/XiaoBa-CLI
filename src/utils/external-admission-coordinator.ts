@@ -69,6 +69,7 @@ import {
   EXTERNAL_ADMISSION_LANES,
   type ExternalAdmissionLane,
 } from './external-source-work';
+import type { HistoricalEpisodeTargetRef } from './learning-episode';
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -101,6 +102,8 @@ export interface ExternalEvidencePage {
   readonly readResult: SessionLogSourceReadResult;
   /** Which lane produced this page. */
   readonly lane: ExternalAdmissionLane;
+  /** Fixed reopened-range gate for a deliberate tombstone backfill. */
+  readonly historicalTarget?: HistoricalEpisodeTargetRef;
 }
 
 /**
