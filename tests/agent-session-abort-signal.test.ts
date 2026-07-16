@@ -117,6 +117,77 @@ test('AgentSession clear ignores stale context compaction that resolves after ab
   assert.match(historyResult.reply || '', /当前历史长度: 0 条消息/);
 });
 
+test('AgentSession clear ignores stale restore compaction during first initialization', async () => {
+  let restoreCompactionSignal: AbortSignal | undefined;
+  let releaseRestoreCompaction!: () => void;
+  let compactionCalls = 0;
+  let modelCalls = 0;
+  const restoreCompactionGate = new Promise<void>(resolve => { releaseRestoreCompaction = resolve; });
+  const session = new AgentSession('user:clear-restore-compaction', buildMockServices({
+    aiService: {
+      async chatStream() {
+        modelCalls++;
+        return { content: 'unexpected', toolCalls: [] };
+      },
+    },
+  }), 'catscompany');
+  session.setSystemPromptProvider(() => 'system prompt');
+  (session as any).lifecycleManager.consumePendingRestore = () => [
+    { role: 'user', content: '不应恢复的云端旧历史' },
+  ];
+  (session as any).contextWindowManager.compactIfNeeded = async (messages: any[], options: any) => {
+    compactionCalls++;
+    if (compactionCalls === 1) return messages;
+    restoreCompactionSignal = options.signal;
+    await restoreCompactionGate;
+    return [...messages, { role: 'assistant', content: '不应恢复的旧恢复压缩结果' }];
+  };
+
+  const runPromise = session.handleMessage('触发首次初始化');
+  await waitFor(() => Boolean(restoreCompactionSignal));
+  const clearResult = await session.handleCommand('clear', []);
+  releaseRestoreCompaction();
+  const runResult = await runPromise;
+  const historyResult = await session.handleCommand('history', []);
+
+  assert.equal(clearResult.reply, '历史已清空');
+  assert.equal(restoreCompactionSignal?.aborted, true);
+  assert.equal(runResult.text, '已停止当前请求。');
+  assert.equal(modelCalls, 0);
+  assert.match(historyResult.reply || '', /当前历史长度: 0 条消息/);
+});
+
+test('clear commands prevent an interrupted restore turn from persisting after reset', async () => {
+  for (const clearArgs of [[], ['--all']]) {
+    let restoreCompactionSignal: AbortSignal | undefined;
+    let releaseRestoreCompaction!: () => void;
+    let compactionCalls = 0;
+    let saveCalls = 0;
+    const restoreCompactionGate = new Promise<void>(resolve => { releaseRestoreCompaction = resolve; });
+    const session = new AgentSession(`user:clear-restore-persist:${clearArgs.join('-') || 'regular'}`, buildMockServices(), 'catscompany');
+    session.setSystemPromptProvider(() => 'system prompt');
+    (session as any).lifecycleManager.consumePendingRestore = () => [
+      { role: 'user', content: '不应在清空后保存的云端旧历史' },
+    ];
+    (session as any).lifecycleManager.saveContext = () => { saveCalls++; };
+    (session as any).contextWindowManager.compactIfNeeded = async (messages: any[], options: any) => {
+      compactionCalls++;
+      if (compactionCalls === 1) return messages;
+      restoreCompactionSignal = options.signal;
+      await restoreCompactionGate;
+      return messages;
+    };
+
+    const runPromise = session.handleMessage('触发首次初始化');
+    await waitFor(() => Boolean(restoreCompactionSignal));
+    await session.handleCommand('clear', clearArgs);
+    releaseRestoreCompaction();
+    await runPromise;
+
+    assert.equal(saveCalls, 0, `stale turn persisted after /clear ${clearArgs.join(' ')}`);
+  }
+});
+
 function buildMockServices(overrides: any = {}): any {
   return {
     aiService: overrides.aiService ?? {},
