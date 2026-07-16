@@ -188,6 +188,69 @@ test('clear commands prevent an interrupted restore turn from persisting after r
   }
 });
 
+test('clear commands discard a first initialization still building its system prompt', async () => {
+  for (const clearArgs of [[], ['--all']]) {
+    let promptStarted = false;
+    let releasePrompt!: () => void;
+    const promptGate = new Promise<void>(resolve => { releasePrompt = resolve; });
+    const session = new AgentSession(`user:clear-init-prompt:${clearArgs.join('-') || 'regular'}`, buildMockServices(), 'catscompany');
+    (session as any).buildCurrentSystemPrompt = async () => {
+      promptStarted = true;
+      await promptGate;
+      return { systemPrompt: '不应在清空后写回的系统提示词', promptTrace: undefined };
+    };
+
+    const runPromise = session.handleMessage('触发首次初始化');
+    await waitFor(() => promptStarted);
+    await session.handleCommand('clear', clearArgs);
+    releasePrompt();
+    const runResult = await runPromise;
+    const historyResult = await session.handleCommand('history', []);
+
+    assert.equal(runResult.text, '已停止当前请求。');
+    assert.equal((session as any).initialized, false);
+    assert.match(historyResult.reply || '', /当前历史长度: 0 条消息/);
+  }
+});
+
+test('clear commands discard an initialized session prompt hot reload', async () => {
+  for (const clearArgs of [[], ['--all']]) {
+    let promptCalls = 0;
+    let reloadStarted = false;
+    let releaseReload!: () => void;
+    let modelCalls = 0;
+    const reloadGate = new Promise<void>(resolve => { releaseReload = resolve; });
+    const session = new AgentSession(`user:clear-prompt-reload:${clearArgs.join('-') || 'regular'}`, buildMockServices({
+      aiService: {
+        async chatStream() {
+          modelCalls++;
+          return { content: 'unexpected', toolCalls: [] };
+        },
+      },
+    }), 'catscompany');
+    session.setSystemPromptProvider(async () => {
+      promptCalls++;
+      if (promptCalls === 1) return 'system prompt v1';
+      reloadStarted = true;
+      await reloadGate;
+      return '不应在清空后写回的 system prompt v2';
+    });
+    await session.init();
+
+    const runPromise = session.handleMessage('触发 prompt 热加载');
+    await waitFor(() => reloadStarted);
+    await session.handleCommand('clear', clearArgs);
+    releaseReload();
+    const runResult = await runPromise;
+    const historyResult = await session.handleCommand('history', []);
+
+    assert.equal(runResult.text, '已停止当前请求。');
+    assert.equal((session as any).initialized, false);
+    assert.equal(modelCalls, 0);
+    assert.match(historyResult.reply || '', /当前历史长度: 0 条消息/);
+  }
+});
+
 function buildMockServices(overrides: any = {}): any {
   return {
     aiService: overrides.aiService ?? {},

@@ -321,7 +321,13 @@ export class AgentSession {
   /** 构建系统提示词（幂等初始化；已初始化会话在下一轮开始前可热加载） */
   async init(options: InitSessionOptions = {}): Promise<void> {
     if (this.initialized) return;
+    const lifecycleGeneration = this.lifecycleGeneration;
+    const initSignal = options.signal ?? this.activeAbortController?.signal;
     const { systemPrompt, promptTrace } = await this.buildCurrentSystemPrompt();
+    if (initSignal?.aborted || this.interruptRequested || lifecycleGeneration !== this.lifecycleGeneration) {
+      Logger.info(`[会话 ${this.key}] 初始化期间会话已重置，忽略旧初始化结果`);
+      return;
+    }
     this.applyPromptTrace(promptTrace, 'init');
     this.initialized = true;
     const initialSystemMessages: Message[] = [];
@@ -348,7 +354,7 @@ export class AgentSession {
       const usage = this.contextWindowManager.getUsageInfo(this.messages);
       Logger.info(`[${this.key}] 恢复后上下文: ${usage.usedTokens}/${usage.maxTokens} tokens (${usage.usagePercent}%)`);
 
-      const compactionSignal = options.signal ?? this.activeAbortController?.signal;
+      const compactionSignal = initSignal;
       const messagesBeforeRestoreCompaction = stripAssistantArtifactsFromMessages(this.messages);
       const compactedMessages = await this.contextWindowManager.compactIfNeeded(messagesBeforeRestoreCompaction, {
         sessionKey: this.key,
@@ -505,7 +511,7 @@ export class AgentSession {
       this.lastActiveAt = Date.now();
 
       try {
-        await this.refreshSystemPromptIfNeeded();
+        await this.refreshSystemPromptIfNeeded(lifecycleGeneration, this.activeAbortController.signal);
       } catch (error: any) {
         Logger.warning(`[会话 ${this.key}] Prompt 热加载失败，继续使用上一版: ${error?.message || error}`);
       }
@@ -783,10 +789,17 @@ export class AgentSession {
     return { systemPrompt, promptTrace };
   }
 
-  private async refreshSystemPromptIfNeeded(): Promise<void> {
+  private async refreshSystemPromptIfNeeded(
+    lifecycleGeneration: number,
+    signal?: AbortSignal,
+  ): Promise<void> {
     if (!this.initialized || !this.promptTrace) return;
 
     const { systemPrompt, promptTrace } = await this.buildCurrentSystemPrompt();
+    if (signal?.aborted || this.interruptRequested || lifecycleGeneration !== this.lifecycleGeneration) {
+      Logger.info(`[会话 ${this.key}] Prompt 热加载期间会话已重置，忽略旧热加载结果`);
+      return;
+    }
     const changed = this.diffPromptTrace(promptTrace);
     if (!changed.any) return;
 
