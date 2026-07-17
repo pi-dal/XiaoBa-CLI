@@ -41,6 +41,7 @@ import {
   loadReviewQueueState,
   saveReviewQueueState,
 } from '../src/utils/skill-evolution-review-queue';
+import { readShardStructurally } from '../src/utils/evidence-review-engine';
 
 // ---------------------------------------------------------------------------
 // Test helpers
@@ -119,6 +120,14 @@ function createRestartableRuntimeLearning(root: string, settlementWindowMs = 0):
     operationalRetryMs: 1,
     operationalRetryMaxMs: 60_000,
     logEnabled: false,
+    readerFixture: ({ shard, lane }) => ({
+      findingSet: readShardStructurally(
+        shard.shardId,
+        shard.contentHash,
+        shard.content,
+        lane,
+      ),
+    }),
   });
 
   const episodeStore = new LearningEpisodeStore(episodeStorePath);
@@ -179,7 +188,10 @@ interface TestEnv {
 
 function setupEnv(
   settlementWindowMs = 0,
-  fixtures: Pick<SkillEvolutionOptions, 'authorFixture' | 'verifierFixture'> = {},
+  fixtures: Pick<
+    SkillEvolutionOptions,
+    'authorFixture' | 'verifierFixture' | 'readerFixture'
+  > = {},
 ): TestEnv {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'xiaoba-runtime-learning-'));
   const skillsRoot = path.join(root, 'skills');
@@ -230,6 +242,14 @@ function setupEnv(
     operationalRetryMs: 1,
     operationalRetryMaxMs: 60_000,
     logEnabled: false,
+    readerFixture: fixtures.readerFixture ?? (({ shard, lane }) => ({
+      findingSet: readShardStructurally(
+        shard.shardId,
+        shard.contentHash,
+        shard.content,
+        lane,
+      ),
+    })),
     authorFixture: fixtures.authorFixture ?? (({ bundle }) => {
       branchCalls.author++;
       return {
@@ -2174,6 +2194,14 @@ describe('RuntimeLearning — Provenance (AC4 follow-up)', () => {
       operationalRetryMs: 1,
       operationalRetryMaxMs: 60_000,
       logEnabled: false,
+      readerFixture: ({ shard, lane }) => ({
+        findingSet: readShardStructurally(
+          shard.shardId,
+          shard.contentHash,
+          shard.content,
+          lane,
+        ),
+      }),
       authorFixture: ({ bundle }) => {
         capturedCandidate = bundle.episode;
         return {
