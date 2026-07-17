@@ -33,6 +33,17 @@ import {
 } from './skill-evolution-review-queue';
 import { DistilledKnowledgeCandidate } from './capability-distiller';
 import type { SemanticObservation } from './learning-episode';
+import {
+  EvidenceReviewEngine,
+  resolveEvidenceReviewJobStorePath,
+} from './evidence-review-engine';
+import type {
+  EvidenceDossier,
+  DossierDifferenceIndex,
+  ObligationDisposition,
+  ReviewObligation,
+  ReviewWorkClass,
+} from './evidence-review-types';
 
 /**
  * V3's runtime-owned promotion seam.
@@ -499,6 +510,7 @@ function incrementTransitionCount(
 export class SkillEvolutionRuntime {
   private readonly options: SkillEvolutionOptions;
   private readonly inFlightCreateRoutingNames = new Set<string>();
+  private evidenceReviewEngine: EvidenceReviewEngine | undefined;
 
   constructor(options: SkillEvolutionOptions) {
     this.options = options;
@@ -506,7 +518,22 @@ export class SkillEvolutionRuntime {
     recoverTransitionJournal(options);
   }
 
+  /** Durable Evidence Review Job engine (ADR 0045). Created lazily. */
+  getEvidenceReviewEngine(): EvidenceReviewEngine {
+    if (!this.evidenceReviewEngine) {
+      this.evidenceReviewEngine = this.createEvidenceReviewEngine();
+    }
+    return this.evidenceReviewEngine;
+  }
+
   async reviewAndApply(bundle: EvidenceBundle, signal?: AbortSignal): Promise<SkillEvolutionResult> {
+    // Durable Evidence Review Jobs are the primary promotion path (ADR 0045).
+    // The linear Author/Verifier loop remains as an internal implementation
+    // detail for Skill Author / Verifier quanta and as a compatibility fallback
+    // when a job store path cannot be resolved.
+    if (this.options.reviewQueuePath || this.options.workingDirectory) {
+      return this.reviewAndApplyViaEvidenceReviewJob(bundle, signal);
+    }
     const { result } = await this.reviewAndApplyWithRetries(bundle, undefined, true, signal);
     return result;
   }
@@ -529,10 +556,22 @@ export class SkillEvolutionRuntime {
         .filter((bundleId): bundleId is string => typeof bundleId === 'string'),
     );
     const queuePath = this.options.reviewQueuePath;
-    if (!queuePath) return bundleIds;
-    const queue = loadReviewQueueState(queuePath);
-    for (const entry of queue.deferred) bundleIds.add(entry.bundleId);
-    for (const entry of queue.operational) bundleIds.add(entry.bundleId);
+    if (queuePath) {
+      const queue = loadReviewQueueState(queuePath);
+      for (const entry of queue.deferred) bundleIds.add(entry.bundleId);
+      for (const entry of queue.operational) bundleIds.add(entry.bundleId);
+    }
+    // Active Evidence Review Jobs own their bundle until a terminal disposition.
+    try {
+      const jobs = this.getEvidenceReviewEngine().loadStore().jobs;
+      for (const job of Object.values(jobs)) {
+        if (job.disposition === 'active' || job.disposition === 'deferred') {
+          bundleIds.add(job.bundle.bundleId);
+        }
+      }
+    } catch {
+      // Job store optional during early construction.
+    }
     return bundleIds;
   }
 
@@ -560,6 +599,185 @@ export class SkillEvolutionRuntime {
       failureKind: operational.failureKind,
     };
     return undefined;
+  }
+
+  private createEvidenceReviewEngine(): EvidenceReviewEngine {
+    const jobStorePath = resolveEvidenceReviewJobStorePath(this.options);
+    // Coverage quanta are Runtime-deterministic. Skill Author / Verifier / commit
+    // are executed by reviewAndApplyWithRetries after dual-lane coverage so the
+    // existing Branch Transcript, validateDraft, Journal, and Audit paths hold.
+    return new EvidenceReviewEngine({
+      jobStorePath,
+      workingDirectory: this.options.workingDirectory,
+      retryBaseMs: this.getEffectiveConfig().operationalRetryMs,
+      retryMaxMs: this.getEffectiveConfig().operationalRetryMaxMs,
+      maxQuantaPerAdvance: 64,
+      runSkillAuthor: async () => {
+        throw new Error('skill_author quantum is settled by the legacy review path after coverage');
+      },
+      runSkillVerifier: async () => {
+        throw new Error('skill_verifier quantum is settled by the legacy review path after coverage');
+      },
+      commitTransition: async () => {
+        throw new Error('commit quantum is settled by the legacy review path after coverage');
+      },
+    });
+  }
+
+  /**
+   * Public promotion path: create or resume a durable Evidence Review Job,
+   * complete dual-lane coverage quanta, then run the existing Author/Verifier
+   * commit path against the fixed bundle (with dossier context attached).
+   */
+  private async reviewAndApplyViaEvidenceReviewJob(
+    bundle: EvidenceBundle,
+    signal?: AbortSignal,
+  ): Promise<SkillEvolutionResult> {
+    const frozen = freezeClone(bundle);
+    validateEvidenceBundle(frozen);
+    const engine = this.getEvidenceReviewEngine();
+    const candidate = this.extractCandidateFromBundle(frozen);
+    const workClass = inferReviewWorkClass(frozen);
+    const job = engine.ensureJob({ bundle: frozen, candidate, workClass });
+    const wakeId = `wake:${randomUUID().replace(/-/g, '').slice(0, 12)}`;
+
+    // Advance only coverage-side quanta (readers → dossiers → diff → obligations).
+    await this.advanceCoverageQuanta(engine, job.jobId, wakeId, signal);
+
+    const covered = engine.loadStore().jobs[job.jobId];
+    if (!covered) {
+      throw new OperationalReviewError('branch_failure', 'Evidence Review Job disappeared during coverage');
+    }
+    if (covered.disposition === 'terminal_failed') {
+      if (this.options.reviewQueuePath) {
+        return this.enqueueOperationalFailureAndReturnResult(
+          frozen,
+          new OperationalReviewError(
+            'branch_failure',
+            covered.terminalReason ?? 'Evidence Review Job terminal failure',
+            [],
+          ),
+          new Date(),
+          this.options.reviewQueuePath,
+        );
+      }
+      throw new OperationalReviewError(
+        'branch_failure',
+        covered.terminalReason ?? 'Evidence Review Job terminal failure',
+      );
+    }
+
+    // Incomplete coverage (retry_wait readers) surfaces as operational retry.
+    if (!covered.authorDossier || !covered.verifierDossier || !covered.obligations) {
+      if (this.options.reviewQueuePath) {
+        return this.enqueueOperationalFailureAndReturnResult(
+          frozen,
+          new OperationalReviewError(
+            'branch_timeout',
+            'Evidence Review Job coverage incomplete after this wake.',
+            [],
+          ),
+          new Date(),
+          this.options.reviewQueuePath,
+        );
+      }
+      throw new OperationalReviewError(
+        'branch_timeout',
+        'Evidence Review Job coverage incomplete after this wake.',
+      );
+    }
+
+    // Author/Verifier receive dossier context but validate against the fixed bundle.
+    const reviewBundle = attachVerifierReviewContext(frozen, {
+      authorDossier: covered.authorDossier,
+      verifierDossier: covered.verifierDossier,
+      differenceIndex: covered.differenceIndex ?? { manifestHash: covered.manifest.manifestHash, entries: [] },
+      obligations: covered.obligations,
+    });
+
+    const { result, branchTranscriptPaths } = await this.reviewAndApplyWithRetries(
+      reviewBundle,
+      [],
+      true,
+      signal,
+    );
+
+    this.settlePromotionQuanta(engine, job.jobId, result, branchTranscriptPaths);
+    return result;
+  }
+
+  /** Run reader/dossier/diff/obligation quanta only; stop before skill_author. */
+  private async advanceCoverageQuanta(
+    engine: EvidenceReviewEngine,
+    jobId: string,
+    wakeId: string,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    const coverageKinds = [
+      'author_reader',
+      'verifier_reader',
+      'author_dossier',
+      'verifier_dossier',
+      'difference_index',
+      'obligations',
+    ] as const;
+    await engine.advanceJob(jobId, wakeId, signal, { allowedKinds: coverageKinds });
+  }
+
+  /** Mark skill_author / skill_verifier / commit quanta after legacy path settles. */
+  private settlePromotionQuanta(
+    engine: EvidenceReviewEngine,
+    jobId: string,
+    result: SkillEvolutionResult,
+    branchTranscriptPaths: readonly string[],
+  ): void {
+    const state = engine.loadStore();
+    const job = state.jobs[jobId];
+    if (!job) return;
+    const now = new Date().toISOString();
+    const mark = (kind: 'skill_author' | 'skill_verifier' | 'commit', payload: unknown) => {
+      for (const [id, quantum] of Object.entries(job.quanta)) {
+        if (quantum.kind !== kind || quantum.state === 'succeeded') continue;
+        job.quanta[id] = {
+          ...quantum,
+          state: 'succeeded',
+          result: payload,
+          resultHash: crypto.createHash('sha256').update(JSON.stringify(payload ?? null)).digest('hex'),
+          transcriptPaths: [...quantum.transcriptPaths, ...branchTranscriptPaths],
+          lease: undefined,
+          updatedAt: now,
+        };
+      }
+    };
+    if (result.draft) mark('skill_author', result.draft);
+    if (result.verifier) {
+      const dispositions = defaultObligationDispositions(job.obligations ?? [], result.verifier);
+      mark('skill_verifier', { verifier: result.verifier, dispositions });
+      job.obligationDispositions = dispositions;
+      job.verifierResult = result.verifier;
+    }
+    if (result.draft) job.draft = result.draft;
+    if (result.transitionId || result.audit?.transitionId) {
+      mark('commit', result);
+      job.transitionId = result.transitionId ?? result.audit?.transitionId;
+      job.disposition = result.transition === 'defer' ? 'deferred' : 'completed';
+    } else if (result.queued === 'operational') {
+      // Leave promotion quanta pending/retry for a later wake.
+      job.disposition = 'active';
+    } else if (result.transition === 'defer' || result.queued === 'deferred') {
+      mark('skill_author', result.draft ?? null);
+      mark('skill_verifier', result.verifier ?? null);
+      mark('commit', result);
+      job.disposition = 'deferred';
+    } else {
+      mark('skill_author', result.draft ?? null);
+      mark('skill_verifier', result.verifier ?? null);
+      mark('commit', result);
+      job.disposition = 'completed';
+    }
+    job.updatedAt = now;
+    state.jobs[jobId] = job;
+    engine.saveStore(state);
   }
 
   private async reviewAndApplyWithRetries(
@@ -2952,4 +3170,71 @@ const LIFECYCLE_OR_GENERIC_ROUTING_PATTERNS = [
 
 export function isLifecycleOrGenericRoutingName(routingName: string): boolean {
   return LIFECYCLE_OR_GENERIC_ROUTING_PATTERNS.some(pattern => pattern.test(routingName));
+}
+
+function attachAuthorDossierContext(
+  bundle: EvidenceBundle,
+  authorDossier: EvidenceDossier,
+): EvidenceBundle {
+  // Author still receives the fixed Evidence Bundle; dossier is diagnostic
+  // context encoded into a frozen clone's episode envelope for fixtures.
+  const episode = typeof bundle.episode === 'object' && bundle.episode !== null
+    ? { ...(bundle.episode as Record<string, unknown>), authorEvidenceDossier: authorDossier }
+    : { authorEvidenceDossier: authorDossier };
+  return freezeClone({ ...bundle, episode });
+}
+
+function attachVerifierReviewContext(
+  bundle: EvidenceBundle,
+  context: {
+    authorDossier: EvidenceDossier;
+    verifierDossier: EvidenceDossier;
+    differenceIndex: DossierDifferenceIndex;
+    obligations: readonly ReviewObligation[];
+  },
+): EvidenceBundle {
+  const episode = typeof bundle.episode === 'object' && bundle.episode !== null
+    ? {
+        ...(bundle.episode as Record<string, unknown>),
+        authorEvidenceDossier: context.authorDossier,
+        verifierEvidenceDossier: context.verifierDossier,
+        dossierDifferenceIndex: context.differenceIndex,
+        reviewObligations: context.obligations,
+      }
+    : {
+        authorEvidenceDossier: context.authorDossier,
+        verifierEvidenceDossier: context.verifierDossier,
+        dossierDifferenceIndex: context.differenceIndex,
+        reviewObligations: context.obligations,
+      };
+  return freezeClone({ ...bundle, episode });
+}
+
+function defaultObligationDispositions(
+  obligations: readonly ReviewObligation[],
+  verification: SkillVerifierResult,
+): ObligationDisposition[] {
+  if (obligations.length === 0) return [];
+  const decision: ObligationDisposition['decision'] = verification.decision === 'accept'
+    ? 'accepted'
+    : verification.decision === 'defer'
+      ? 'deferred'
+      : 'rejected';
+  return obligations.map(obligation => ({
+    obligationId: obligation.obligationId,
+    decision,
+    rationale: verification.rationale || `${decision} via Skill Verifier`,
+    citedSpans: obligation.requiredShardIds.map(shardId => ({
+      shardId,
+      span: { start: 0, end: 0 },
+    })),
+  }));
+}
+
+function inferReviewWorkClass(bundle: EvidenceBundle): ReviewWorkClass {
+  const episode = bundle.episode as { historicalTarget?: unknown } | null;
+  if (episode && typeof episode === 'object' && episode.historicalTarget) {
+    return 'historical_learning';
+  }
+  return 'live_learning';
 }
