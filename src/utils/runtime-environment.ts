@@ -3,7 +3,7 @@ import * as os from 'os';
 import * as path from 'path';
 import { spawnSync } from 'child_process';
 
-export type RuntimeBinaryName = 'node' | 'python' | 'git';
+export type RuntimeBinaryName = 'node' | 'python' | 'git' | 'xurl';
 export type RuntimeBinarySource = 'bundled' | 'system' | 'missing';
 
 export interface RuntimeBinary {
@@ -51,18 +51,23 @@ const BUNDLED_RELATIVE_PATHS: Record<RuntimeBinaryName, string[]> = {
   git: IS_WINDOWS
     ? [path.join('git', 'cmd', 'git.exe'), path.join('git', 'bin', 'git.exe')]
     : [path.join('git', 'bin', 'git')],
+  xurl: IS_WINDOWS
+    ? [path.join('xurl', 'xurl.exe')]
+    : [path.join('xurl', 'xurl')],
 };
 
 const SYSTEM_COMMANDS: Record<RuntimeBinaryName, string[]> = {
   node: ['node'],
   python: IS_WINDOWS ? ['python', 'python3', 'py'] : ['python3', 'python'],
   git: ['git'],
+  xurl: ['xurl'],
 };
 
 const SHIM_COMMAND_NAMES: Record<RuntimeBinaryName, string[]> = {
   node: ['node'],
   python: ['python', 'python3'],
   git: ['git'],
+  xurl: ['xurl'],
 };
 
 export function resolveRuntimeEnvironment(options: RuntimeEnvironmentOptions = {}): RuntimeEnvironment {
@@ -76,7 +81,12 @@ export function resolveRuntimeEnvironment(options: RuntimeEnvironmentOptions = {
     node: resolveBinary('node', env, runtimeRoot, includeSystemFallback, probeVersion),
     python: resolveBinary('python', env, runtimeRoot, includeSystemFallback, probeVersion),
     git: resolveBinary('git', env, runtimeRoot, includeSystemFallback, probeVersion),
+    xurl: resolveBinary('xurl', env, runtimeRoot, includeSystemFallback, probeVersion),
   };
+
+  if (!env.XIAOBA_EXTERNAL_SESSION_LOG_XURL_COMMAND?.trim() && binaries.xurl.executable) {
+    env.XIAOBA_EXTERNAL_SESSION_LOG_XURL_COMMAND = binaries.xurl.executable;
+  }
 
   const shimDirectory = ensureRuntimeShims(
     binaries,

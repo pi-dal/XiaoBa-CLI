@@ -62,7 +62,7 @@ export async function runtimeCommand(options: RuntimeCommandOptions = {}): Promi
     Logger.info('Prepended PATH entries: none');
   }
 
-  for (const name of ['node', 'python', 'git'] as const) {
+  for (const name of ['node', 'python', 'git', 'xurl'] as const) {
     const binary = runtimeEnvironment.binaries[name];
     if (binary.executable) {
       Logger.text(formatRuntimeSummary(binary));

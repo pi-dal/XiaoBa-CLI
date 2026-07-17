@@ -34,7 +34,8 @@ The Runtime therefore needs multiple independently controlled provider lanes, co
 
 - Reimplementing Codex, Claude Code, Pi, or other provider log parsers in XiaoBa.
 - Adding or requiring a new command or output mode in xURL.
-- Automatically installing or upgrading xURL.
+- Installing or upgrading xURL independently at runtime. Desktop releases may
+  bundle a release-pinned official executable as defined by ADR-0048.
 - Running multiple writes to Episode, Capsule, provenance, Registry, or cursor stores concurrently.
 - Turning external evidence into a separate review or promotion path.
 - Importing historical threads during ordinary provider enablement without an explicit catch-up policy.

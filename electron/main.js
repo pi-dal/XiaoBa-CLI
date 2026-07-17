@@ -546,6 +546,7 @@ async function startServer() {
   console.log('[runtime]', formatRuntimeSummary(runtimeEnvironment.binaries.node));
   console.log('[runtime]', formatRuntimeSummary(runtimeEnvironment.binaries.python));
   console.log('[runtime]', formatRuntimeSummary(runtimeEnvironment.binaries.git));
+  console.log('[runtime]', formatRuntimeSummary(runtimeEnvironment.binaries.xurl));
 
   // 闂備胶鍎甸弲娑㈡偤閵娧勬殰闁圭虎鍠栭幑鍫曟煏婵炲灝鈧洟鎯佸鍫濈骇闁冲搫鍊婚妴鎺楁煃鐠囧眰鍋㈢€规洏鍎甸、娑橆潩椤戭偅顣筧shboard server
   const { startDashboard } = require(path.join(appRoot, 'dist', 'dashboard', 'server'));
