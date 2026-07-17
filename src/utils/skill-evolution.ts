@@ -44,6 +44,12 @@ import type {
   ReviewObligation,
   ReviewWorkClass,
 } from './evidence-review-types';
+import {
+  compareReviewBasis,
+  createSuccessorReviewJob,
+  markJobSuperseded,
+} from './evidence-review-commit-fence';
+import { upsertEvidenceReviewJob } from './evidence-review-job-store';
 
 /**
  * V3's runtime-owned promotion seam.
@@ -687,6 +693,23 @@ export class SkillEvolutionRuntime {
       );
     }
 
+    // Review Commit Fence: compare declared Review Basis before promotion.
+    const liveRegistryReadSet = covered.basis.registryReadSet.map(entry => {
+      const live = this.getRegistry().capabilities[entry.handle];
+      return live
+        ? { handle: live.handle, revision: live.revision }
+        : entry;
+    });
+    const fence = compareReviewBasis(covered.basis, {
+      bundle: frozen,
+      registryReadSet: liveRegistryReadSet,
+      reviewPolicyVersion: covered.basis.reviewPolicyVersion,
+      promptVersion: covered.basis.promptVersion,
+    });
+    if (fence.status === 'stale') {
+      return this.supersedeStaleReviewJob(engine, covered, frozen, candidate, fence.reason);
+    }
+
     // Author/Verifier receive dossier context but validate against the fixed bundle.
     const reviewBundle = attachVerifierReviewContext(frozen, {
       authorDossier: covered.authorDossier,
@@ -702,8 +725,64 @@ export class SkillEvolutionRuntime {
       signal,
     );
 
+    // Fence again immediately before treating accept as committed history.
+    if (result.transition !== 'defer' && result.transition !== 'reject_candidate' && result.verified !== false) {
+      const postFence = compareReviewBasis(covered.basis, {
+        bundle: frozen,
+        registryReadSet: covered.basis.registryReadSet.map(entry => {
+          const live = this.getRegistry().capabilities[entry.handle];
+          return live ? { handle: live.handle, revision: live.revision } : entry;
+        }),
+        reviewPolicyVersion: covered.basis.reviewPolicyVersion,
+        promptVersion: covered.basis.promptVersion,
+      });
+      if (postFence.status === 'stale' && !result.transitionId && !result.audit) {
+        return this.supersedeStaleReviewJob(engine, covered, frozen, candidate, postFence.reason);
+      }
+    }
+
     this.settlePromotionQuanta(engine, job.jobId, result, branchTranscriptPaths);
     return result;
+  }
+
+  private supersedeStaleReviewJob(
+    engine: EvidenceReviewEngine,
+    staleJob: import('./evidence-review-types').EvidenceReviewJob,
+    liveBundle: EvidenceBundle,
+    candidate: DistilledKnowledgeCandidate,
+    reason: string,
+  ): SkillEvolutionResult {
+    const successor = createSuccessorReviewJob({
+      staleJob,
+      liveBundle,
+      candidate,
+      registryReadSet: staleJob.basis.registryReadSet,
+    });
+    const superseded = markJobSuperseded(staleJob, successor.jobId);
+    superseded.terminalReason = reason;
+    const state = engine.loadStore();
+    upsertEvidenceReviewJob(state, superseded);
+    upsertEvidenceReviewJob(state, successor);
+    engine.saveStore(state);
+    // Stale basis is not semantic rejection — queue operational follow-up for successor.
+    if (this.options.reviewQueuePath) {
+      return this.enqueueOperationalFailureAndReturnResult(
+        liveBundle,
+        new OperationalReviewError(
+          'branch_failure',
+          `Review Basis stale; successor job ${successor.jobId} created. ${reason}`,
+          [],
+        ),
+        new Date(),
+        this.options.reviewQueuePath,
+      );
+    }
+    return {
+      transition: 'defer',
+      verified: false,
+      rounds: 1,
+      queued: 'operational',
+    };
   }
 
   /** Run reader/dossier/diff/obligation quanta only; stop before skill_author. */
