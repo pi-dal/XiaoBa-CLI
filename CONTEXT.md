@@ -218,8 +218,36 @@ At most two author-verifier revision rounds over one fixed evidence bundle. The 
 _Avoid_: Infinite self-review, evidence fishing, silent rewrite
 
 **Evidence Bundle**:
-The complete runtime-constructed, fixed input shared by the Skill Author and Skill Verifier Branches for one Learning Episode. It includes the episode, completion evidence, Settlement Evidence Window, bounded continuity, applicable Referenced Skills, and related current skills; author-selected refs are claims within this bundle, not its boundary.
-_Avoid_: Author-selected transcript, global session search, mutable review context
+The immutable runtime-constructed manifest that fixes the complete review boundary for one Learning Episode through content-addressed Evidence Shard references. It covers the episode, completion evidence, Settlement Evidence Window, bounded continuity, applicable Referenced Skills, and related current skills without requiring their full content to be embedded in one object.
+_Avoid_: Embedded prompt payload, author-selected transcript, global session search, mutable review context
+
+**Evidence Shard**:
+One immutable, content-addressed portion of the evidence fixed by an Evidence Bundle. Its identity proves the reviewed content did not change while allowing branches and jobs to read, reuse, and verify bounded portions independently.
+_Avoid_: Arbitrary token slice, mutable cache entry, reviewer-created evidence
+
+**Deterministic Evidence Sharding**:
+The Runtime-owned partition of an Evidence Bundle along stable domain boundaries, recursively using internal document or turn structure only when one domain unit remains too large. Review branches consume the resulting Evidence Shards but cannot create, omit, or redefine their boundaries.
+_Avoid_: Model-selected chunking, tokenizer-dependent bundle slicing, reviewer-controlled evidence scope
+
+**Dual-Lane Evidence Coverage**:
+The requirement that every Evidence Shard receive independent semantic review in separate Author and Verifier lanes before a Capability Transition may commit. The lanes share immutable shard references and schemas but not each other's natural-language findings.
+_Avoid_: Shared reader summary, transcript-presence proof, author-selected verifier evidence
+
+**Evidence Dossier**:
+The lane-specific, provenance-linked collection of structured findings produced after that lane covers every Evidence Shard in a fixed Evidence Bundle. An Author Dossier supports drafting, while an independently produced Verifier Dossier supports certification.
+_Avoid_: Replacement Evidence Bundle, uncited summary, shared Author-Verifier scratchpad
+
+**Shard Finding Set**:
+The authoritative structured result of one lane reading one Evidence Shard, containing a coverage disposition and typed findings linked to exact spans in that shard. Free-form explanation and model-reported confidence are diagnostic only and cannot satisfy coverage or admission rules.
+_Avoid_: Uncited prose summary, transition proposal, cross-bundle claim, self-certified confidence
+
+**Dossier Difference Index**:
+The deterministic comparison of Author and Verifier Dossiers that exposes missing citations, incompatible classifications, and conflicting findings without resolving their semantics. It is visible to the Verifier and cannot expand the fixed evidence boundary.
+_Avoid_: Runtime semantic verdict, merged consensus summary, hidden disagreement
+
+**Review Obligation**:
+A Runtime-identified issue from either Evidence Dossier or their structural differences that the final Skill Verifier must explicitly disposition against original Evidence Shard spans. No Capability Transition may commit while an obligation remains unresolved.
+_Avoid_: Runtime semantic decision, optional reviewer note, uncited disagreement
 
 **Deterministic Promotion Reviewer**:
 The legacy rule-based implementation of Promotion Reviewer behavior. It may process legacy candidates and test fixtures, but it must not automatically promote a Settling Candidate when the Branch Promotion Reviewer is unavailable.
@@ -493,9 +521,53 @@ _Avoid_: Scattered constants, private test hooks, hidden timing policy
 One end-to-end Branch Promotion Reviewer execution for a fixed Evidence Bundle, including the bounded Author, Verifier, and any allowed revision rounds. It is the unit that succeeds with a Capability Transition or fails into Operational Review Retry.
 _Avoid_: Individual model call, single branch turn, heartbeat run
 
+**Review Admission**:
+The scheduling decision that lets due review work begin when reviewer capacity and wake timing permit. Estimated prompt size does not determine whether a candidate deserves review; an admitted attempt remains subject to the model's actual context capacity.
+_Avoid_: Prompt-size eligibility gate, semantic worth judgment, oversized-candidate rejection
+
+**Context Overflow Escalation**:
+The alternate review path used only when an actually constructed branch request cannot fit the selected model's context capacity. It preserves the fixed Evidence Bundle and review authority while changing how evidence is presented or which reviewer model is used.
+_Avoid_: Preflight bundle-size rejection, wake prompt budget, automatic evidence loss
+
+**Evidence Review Job**:
+A durable review lifecycle for one fixed Evidence Bundle that may advance across multiple Runtime Learning wakes. It owns evidence coverage and bounded Author/Verifier attempts until one Capability Transition commits or the job reaches an explicit terminal disposition.
+_Avoid_: Heartbeat-sized review, oversized-candidate retry, process-memory-only branch chain
+
+**Review Quantum**:
+One content-identified, independently resumable node in an Evidence Review Job that becomes schedulable after its declared dependencies succeed. Completed quanta remain durable, and failure retries only the affected node.
+_Avoid_: Whole-job retry, linear phase flag, arbitrary token slice, uncheckpointed subagent call
+
+**Evidence Review Dependency Graph**:
+The durable graph of Review Quanta and their input-hash dependencies for one Evidence Review Job. Job progress is derived from node results so parallel shard coverage, partial completion, and local retry survive wake and process boundaries.
+_Avoid_: Mutable linear workflow stage, in-memory task fan-out, whole-job replay
+
+**Quantum Lease**:
+A time-bounded ownership claim on one schedulable Review Quantum. An expired lease makes unfinished work eligible again without invalidating an already persisted successful result for the same quantum identity.
+_Avoid_: Permanent worker lock, process-local busy flag, duplicate success overwrite
+
+**Review Quantum Scheduling**:
+The Heartbeat-owned selection and leasing of schedulable Review Quanta across durable Evidence Review Jobs. A wake bounds newly claimed work and requests a follow-up wake for remaining runnable nodes; it does not create a second persistent review scheduler.
+_Avoid_: Independent review daemon, whole-job wake ownership, prompt-size admission
+
+**Fair Review Quantum Rotation**:
+The durable, work-conserving selection of Review Quanta by work class, then by Evidence Review Job, with ready critical-path nodes preferred inside a job. Job size and operational retry history do not grant permanent priority or permit one large job to starve other runnable work.
+_Avoid_: Largest-job-first, retry monopoly, non-durable FIFO, fixed per-job underutilization
+
+**Review Basis**:
+The immutable version vector that fixes the Evidence Bundle, relevant Registry read set, Referenced Skill hashes, and Review Policy Snapshot used by an Evidence Review Job. Every Review Quantum and the final Capability Transition are justified against this same declared basis.
+_Avoid_: Latest-state lookup, mutable job context, undeclared semantic dependency
+
+**Review Commit Fence**:
+The atomic comparison point that commits a Capability Transition only when its Review Basis still matches every declared relevant dependency. A relevant change ordered before the fence prevents the old job from committing, while a change ordered after it creates later reassessment work.
+_Avoid_: Blind last writer wins, eager cancellation race, global registry lock
+
+**Successor Review Job**:
+A new Evidence Review Job created after a prior job's Review Basis becomes stale before its Review Commit Fence. It fixes a new Evidence Bundle and may reuse successful Review Quantum results whose content-identified inputs remain unchanged.
+_Avoid_: Mutated in-flight bundle, whole-job restart, semantic rejection of stale work
+
 **Review Deadline**:
-The shared wall-clock budget for one Promotion Review Attempt. Author and Verifier branches consume the same deadline, while each branch also observes a separate bounded turn budget; expiry aborts the attempt and preserves it for Operational Review Retry.
-_Avoid_: Per-provider timeout, Settlement Window, evidence-gated defer
+The shared wall-clock budget for one bounded Promotion Review Attempt inside an Evidence Review Job. Author and Verifier branches consume the same deadline, while expiry preserves the durable job and retries only the affected attempt.
+_Avoid_: Evidence Review Job lifetime, heartbeat time slice, Settlement Window
 
 **Coalesced Wake**:
 A Runtime Learning wake request recorded while another wake is running. Multiple pending reasons are merged into one follow-up wake whose discovery and due-work stages cover the union of all requests; no trigger is silently discarded and no concurrent state-writing wake is started.
