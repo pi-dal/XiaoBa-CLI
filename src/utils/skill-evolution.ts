@@ -35,7 +35,10 @@ import { DistilledKnowledgeCandidate } from './capability-distiller';
 import type { SemanticObservation } from './learning-episode';
 import {
   EvidenceReviewEngine,
+  readShardStructurally,
   resolveEvidenceReviewJobStorePath,
+  type ReaderLaneInput,
+  type ReaderLaneResult,
 } from './evidence-review-engine';
 import {
   materializeLegacyReviewRecordsAsJobs,
@@ -47,6 +50,7 @@ import type {
   ObligationDisposition,
   ReviewObligation,
   ReviewWorkClass,
+  EvidenceReviewJob,
 } from './evidence-review-types';
 import {
   compareReviewBasis,
@@ -435,6 +439,11 @@ export interface SkillEvolutionOptions extends SkillEvolutionPaths {
   logEnabled?: boolean;
   authorFixture?: SkillAuthorFixture;
   verifierFixture?: SkillVerifierFixture;
+  /**
+   * Optional deterministic dual-lane reader fixture for tests.
+   * Production always has a runReaderLane seam (structural or model-backed).
+   */
+  readerFixture?: (input: ReaderLaneInput) => ReaderLaneResult | Promise<ReaderLaneResult>;
   authorFactory?: (options: SkillAuthorBranchOptions) => SkillAuthorBranchSession;
   verifierFactory?: (options: SkillVerifierBranchOptions) => SkillVerifierBranchSession;
 }
@@ -668,31 +677,25 @@ export class SkillEvolutionRuntime {
 
   private createEvidenceReviewEngine(): EvidenceReviewEngine {
     const jobStorePath = resolveEvidenceReviewJobStorePath(this.options);
-    // Coverage quanta are Runtime-deterministic. Skill Author / Verifier / commit
-    // are executed by reviewAndApplyWithRetries after dual-lane coverage so the
-    // existing Branch Transcript, validateDraft, Journal, and Audit paths hold.
+    // Authoritative quanta: dual-lane readers + skill_author / skill_verifier /
+    // commit execute as leased durable graph nodes via these callbacks.
+    // No deliberate-throw stubs and no post-hoc settlePromotionQuanta.
     return new EvidenceReviewEngine({
       jobStorePath,
       workingDirectory: this.options.workingDirectory,
       retryBaseMs: this.getEffectiveConfig().operationalRetryMs,
       retryMaxMs: this.getEffectiveConfig().operationalRetryMaxMs,
       maxQuantaPerAdvance: 64,
-      runSkillAuthor: async () => {
-        throw new Error('skill_author quantum is settled by the legacy review path after coverage');
-      },
-      runSkillVerifier: async () => {
-        throw new Error('skill_verifier quantum is settled by the legacy review path after coverage');
-      },
-      commitTransition: async () => {
-        throw new Error('commit quantum is settled by the legacy review path after coverage');
-      },
+      runReaderLane: async (input) => this.runReaderLaneCallback(input),
+      runSkillAuthor: async (input) => this.runSkillAuthorQuantum(input),
+      runSkillVerifier: async (input) => this.runSkillVerifierQuantum(input),
+      commitTransition: async (input) => this.commitTransitionQuantum(input),
     });
   }
 
   /**
-   * Public promotion path: create or resume a durable Evidence Review Job,
-   * complete dual-lane coverage quanta, then run the existing Author/Verifier
-   * commit path against the fixed bundle (with dossier context attached).
+   * Public promotion path: create or resume a durable Evidence Review Job and
+   * advance all runnable quanta (readers through commit) under lease ownership.
    */
   private async reviewAndApplyViaEvidenceReviewJob(
     bundle: EvidenceBundle,
@@ -706,107 +709,493 @@ export class SkillEvolutionRuntime {
     const job = engine.ensureJob({ bundle: frozen, candidate, workClass });
     const wakeId = `wake:${randomUUID().replace(/-/g, '').slice(0, 12)}`;
 
-    // Advance only coverage-side quanta (readers → dossiers → diff → obligations).
-    await this.advanceCoverageQuanta(engine, job.jobId, wakeId, signal);
-
-    const covered = engine.loadStore().jobs[job.jobId];
-    if (!covered) {
-      throw new OperationalReviewError('branch_failure', 'Evidence Review Job disappeared during coverage');
+    // Pre-promotion Review Commit Fence: stale basis → successor, no promotion.
+    const preFence = this.compareLiveReviewBasis(job, frozen);
+    if (preFence.status === 'stale') {
+      return this.supersedeStaleReviewJob(engine, job, frozen, candidate, preFence.reason);
     }
-    if (covered.disposition === 'terminal_failed') {
+
+    // Preserve Branch Transcript Contract deadlines/abort across quanta.
+    const attemptController = new AbortController();
+    const externalSignals = [...new Set(
+      [this.options.reviewAttemptSignal, signal].filter(
+        (s): s is AbortSignal => s !== undefined,
+      ),
+    )];
+    let cancelledByRuntimeShutdown = false;
+    const attemptDeadlineMs = this.getEffectiveConfig().reviewAttemptDeadlineMs;
+    const attemptDeadlineTimer = setTimeout(
+      () => attemptController.abort('review-timeout'),
+      Math.max(1, attemptDeadlineMs),
+    );
+    attemptDeadlineTimer.unref?.();
+    const removeExternalAbortListeners: Array<() => void> = [];
+    for (const externalSignal of externalSignals) {
+      if (externalSignal.aborted) {
+        const reason = this.resolveAbortReason(externalSignal.reason);
+        cancelledByRuntimeShutdown = reason === 'runtime-shutdown';
+        attemptController.abort(reason);
+        break;
+      }
+      const onAbort = () => {
+        const reason = this.resolveAbortReason(externalSignal.reason);
+        cancelledByRuntimeShutdown = reason === 'runtime-shutdown';
+        attemptController.abort(reason);
+      };
+      externalSignal.addEventListener('abort', onAbort, { once: true });
+      removeExternalAbortListeners.push(() => externalSignal.removeEventListener('abort', onAbort));
+    }
+
+    try {
+      const advanced = await engine.advanceJob(job.jobId, wakeId, attemptController.signal);
+      const live = engine.loadStore().jobs[job.jobId] ?? advanced.job;
+
+      if (advanced.result) {
+        // Queue deferred semantic results when a queue path is configured (legacy parity).
+        if (
+          this.options.reviewQueuePath
+          && advanced.result.transition === 'defer'
+          && !advanced.result.queued
+        ) {
+          return this.enqueueDeferredResult(frozen, advanced.result);
+        }
+        return advanced.result;
+      }
+
+      if (live.disposition === 'completed' || live.disposition === 'deferred') {
+        if (live.draft && live.verifierResult) {
+          const reconstructed: SkillEvolutionResult = {
+            transition: live.disposition === 'deferred'
+              ? 'defer'
+              : (live.verifierResult.transition ?? live.draft.envelope.decision),
+            transitionId: live.transitionId,
+            verified: live.disposition === 'completed',
+            rounds: 1,
+            draft: live.draft,
+            verifier: live.verifierResult,
+            ...(live.disposition === 'deferred' ? { queued: 'deferred' as const } : {}),
+          };
+          if (
+            this.options.reviewQueuePath
+            && reconstructed.transition === 'defer'
+          ) {
+            return this.enqueueDeferredResult(frozen, reconstructed);
+          }
+          return reconstructed;
+        }
+      }
+
+      if (live.disposition === 'terminal_failed') {
+        const terminalError = new OperationalReviewError(
+          'branch_failure',
+          live.terminalReason ?? 'Evidence Review Job terminal failure',
+          this.collectPromotionTranscriptPaths(live, advanced.lastError),
+        );
+        if (this.options.reviewQueuePath) {
+          return this.enqueueOperationalFailureAndReturnResult(
+            frozen,
+            terminalError,
+            new Date(),
+            this.options.reviewQueuePath,
+          );
+        }
+        throw terminalError;
+      }
+
+      // Incomplete graph — surface the concrete quantum failure when present.
+      const failure = this.buildIncompleteJobError(live, advanced.lastError, cancelledByRuntimeShutdown);
+      if (cancelledByRuntimeShutdown) {
+        throw failure;
+      }
       if (this.options.reviewQueuePath) {
         return this.enqueueOperationalFailureAndReturnResult(
           frozen,
-          new OperationalReviewError(
-            'branch_failure',
-            covered.terminalReason ?? 'Evidence Review Job terminal failure',
-            [],
-          ),
+          failure,
           new Date(),
           this.options.reviewQueuePath,
         );
       }
-      throw new OperationalReviewError(
+      throw failure;
+    } finally {
+      clearTimeout(attemptDeadlineTimer);
+      for (const remove of removeExternalAbortListeners) remove();
+    }
+  }
+
+  private enqueueDeferredResult(
+    bundle: EvidenceBundle,
+    result: SkillEvolutionResult,
+  ): SkillEvolutionResult {
+    if (!this.options.reviewQueuePath) return result;
+    const queue = loadReviewQueueState(this.options.reviewQueuePath);
+    const candidate = this.extractCandidateFromBundle(bundle);
+    const relevantReadSet = result.verifier
+      ? declaredRegistryReadSet(result.verifier, bundle, result.draft!)
+      : [];
+    upsertDeferredEntry(
+      queue,
+      candidate,
+      bundle,
+      this.options.reviewerVersion ?? SKILL_EVOLUTION_REVIEWER_VERSION,
+      relevantReadSet,
+      result.verifier?.rationale ?? 'Verifier deferred for later review.',
+      new Date(),
+    );
+    saveReviewQueueState(this.options.reviewQueuePath, queue);
+    return { ...result, queued: 'deferred' };
+  }
+
+  private buildIncompleteJobError(
+    job: EvidenceReviewJob,
+    lastError?: {
+      message: string;
+      kind?: string;
+      transcriptPaths?: string[];
+      quantumId?: string;
+      quantumKind?: string;
+    },
+    cancelledByRuntimeShutdown = false,
+  ): OperationalReviewError {
+    const transcripts = this.collectPromotionTranscriptPaths(job, lastError);
+    if (cancelledByRuntimeShutdown) {
+      return new OperationalReviewError(
         'branch_failure',
-        covered.terminalReason ?? 'Evidence Review Job terminal failure',
+        lastError?.message ?? 'Review branch was aborted before persistence.',
+        transcripts,
       );
     }
+    if (lastError?.kind) {
+      return new OperationalReviewError(
+        lastError.kind as OperationalReviewFailureKind,
+        lastError.message,
+        transcripts,
+      );
+    }
+    if (lastError?.message) {
+      const kind = /invalid completion schema|invalid_completion_schema/i.test(lastError.message)
+        ? 'invalid_completion_schema'
+        : /timeout|deadline|aborted|review-timeout/i.test(lastError.message)
+          ? 'branch_timeout'
+          : 'branch_failure';
+      return new OperationalReviewError(kind, lastError.message, transcripts);
+    }
+    return new OperationalReviewError(
+      'branch_timeout',
+      'Evidence Review Job incomplete after this wake; durable quanta will resume.',
+      transcripts,
+    );
+  }
 
-    // Incomplete coverage (retry_wait readers) surfaces as operational retry.
-    if (!covered.authorDossier || !covered.verifierDossier || !covered.obligations) {
-      if (this.options.reviewQueuePath) {
-        return this.enqueueOperationalFailureAndReturnResult(
-          frozen,
-          new OperationalReviewError(
-            'branch_timeout',
-            'Evidence Review Job coverage incomplete after this wake.',
-            [],
-          ),
-          new Date(),
-          this.options.reviewQueuePath,
-        );
+  /** Author/Verifier branch transcripts only — reader artifacts stay on quanta. */
+  private collectPromotionTranscriptPaths(
+    job: EvidenceReviewJob,
+    lastError?: { transcriptPaths?: string[] },
+  ): string[] {
+    const paths: string[] = [];
+    for (const quantum of Object.values(job.quanta)) {
+      if (quantum.kind !== 'skill_author' && quantum.kind !== 'skill_verifier') continue;
+      for (const p of quantum.transcriptPaths ?? []) {
+        if (p && !paths.includes(p)) paths.push(p);
       }
-      throw new OperationalReviewError(
-        'branch_timeout',
-        'Evidence Review Job coverage incomplete after this wake.',
-      );
     }
+    for (const p of lastError?.transcriptPaths ?? []) {
+      if (p && !paths.includes(p)) paths.push(p);
+    }
+    return paths;
+  }
 
-    // Review Commit Fence: compare declared Review Basis before promotion.
-    const liveRegistryReadSet = covered.basis.registryReadSet.map(entry => {
+  private compareLiveReviewBasis(
+    job: EvidenceReviewJob,
+    bundle: EvidenceBundle,
+  ): ReturnType<typeof compareReviewBasis> {
+    const liveRegistryReadSet = job.basis.registryReadSet.map(entry => {
       const live = this.getRegistry().capabilities[entry.handle];
       return live
         ? { handle: live.handle, revision: live.revision }
         : entry;
     });
-    const fence = compareReviewBasis(covered.basis, {
-      bundle: frozen,
+    return compareReviewBasis(job.basis, {
+      bundle,
       registryReadSet: liveRegistryReadSet,
-      reviewPolicyVersion: covered.basis.reviewPolicyVersion,
-      promptVersion: covered.basis.promptVersion,
+      reviewPolicyVersion: job.basis.reviewPolicyVersion,
+      promptVersion: job.basis.promptVersion,
     });
-    if (fence.status === 'stale') {
-      return this.supersedeStaleReviewJob(engine, covered, frozen, candidate, fence.reason);
-    }
+  }
 
-    // Author/Verifier receive dossier context but validate against the fixed bundle.
-    const reviewBundle = attachVerifierReviewContext(frozen, {
-      authorDossier: covered.authorDossier,
-      verifierDossier: covered.verifierDossier,
-      differenceIndex: covered.differenceIndex ?? { manifestHash: covered.manifest.manifestHash, entries: [] },
-      obligations: covered.obligations,
-    });
-
-    const { result, branchTranscriptPaths } = await this.reviewAndApplyWithRetries(
-      reviewBundle,
-      [],
-      true,
-      signal,
-    );
-
-    // Fence again immediately before treating accept as committed history.
-    if (result.transition !== 'defer' && result.transition !== 'reject_candidate' && result.verified !== false) {
-      const postFence = compareReviewBasis(covered.basis, {
-        bundle: frozen,
-        registryReadSet: covered.basis.registryReadSet.map(entry => {
-          const live = this.getRegistry().capabilities[entry.handle];
-          return live ? { handle: live.handle, revision: live.revision } : entry;
-        }),
-        reviewPolicyVersion: covered.basis.reviewPolicyVersion,
-        promptVersion: covered.basis.promptVersion,
-      });
-      if (postFence.status === 'stale' && !result.transitionId && !result.audit) {
-        return this.supersedeStaleReviewJob(engine, covered, frozen, candidate, postFence.reason);
+  private collectJobTranscriptPaths(job: EvidenceReviewJob): string[] {
+    const paths: string[] = [];
+    for (const quantum of Object.values(job.quanta)) {
+      for (const p of quantum.transcriptPaths ?? []) {
+        if (p && !paths.includes(p)) paths.push(p);
       }
     }
+    return paths;
+  }
 
-    this.settlePromotionQuanta(engine, job.jobId, result, branchTranscriptPaths);
-    return result;
+  private async runReaderLaneCallback(input: ReaderLaneInput): Promise<ReaderLaneResult> {
+    if (this.options.readerFixture) {
+      return this.options.readerFixture(input);
+    }
+    // Production structural seam: independent lane-scoped execution. A future
+    // model-backed reader plugs into this same callback without a second scheduler.
+    const findingSet = readShardStructurally(
+      input.shard.shardId,
+      input.shard.contentHash,
+      input.shard.content,
+      input.lane,
+    );
+    return { findingSet };
+  }
+
+  private async runSkillAuthorQuantum(input: {
+    bundle: EvidenceBundle;
+    authorDossier: EvidenceDossier;
+    job: EvidenceReviewJob;
+    signal?: AbortSignal;
+  }): Promise<{ draft: SkillDraft; transcriptPaths: string[] }> {
+    const reviewBundle = attachAuthorDossierContext(input.bundle, input.authorDossier);
+    const attemptDeadlineMs = this.getEffectiveConfig().reviewAttemptDeadlineMs;
+    const reviewAttempt: BranchReviewAttemptMetadata = {
+      deadlineMs: attemptDeadlineMs,
+      deadlineAt: new Date(Date.now() + Math.max(1, attemptDeadlineMs)).toISOString(),
+    };
+    const author = this.createAuthorBranch(
+      reviewBundle,
+      1,
+      undefined,
+      [],
+      { remainingTurns: this.getReviewAttemptMaxTurns() },
+      input.signal,
+      reviewAttempt,
+    );
+    let draft: SkillDraft;
+    try {
+      draft = await author.run();
+      this.throwIfReviewAborted(input.signal);
+    } catch (error) {
+      const paths = author.transcriptPath ? [author.transcriptPath] : [];
+      throw this.buildOperationalReviewError(error, paths);
+    }
+    const transcriptPaths = author.transcriptPath ? [author.transcriptPath] : [];
+    if (author.transcriptPath) {
+      assertHealthyBranchTranscript(author.transcriptPath, 'skill-author', this.options.branchLogRoot);
+    }
+    // Retryable schema issues enqueue operationally only when a durable queue exists
+    // (legacy parity). Semantic/policy issues remain on the draft for commit-time gate.
+    const draftIssues = validateDraft(draft, reviewBundle, this.getManualSkillNames());
+    if (
+      draftIssues.length > 0
+      && draftIssues.every(isRetryableAuthorDraftIssue)
+      && this.options.reviewQueuePath
+    ) {
+      throw new OperationalReviewError(
+        'invalid_completion_schema',
+        `Skill Author returned an invalid completion schema: ${draftIssues.map(i => i.message).join(' ')}`,
+        transcriptPaths,
+      );
+    }
+    return { draft, transcriptPaths };
+  }
+
+  private async runSkillVerifierQuantum(input: {
+    bundle: EvidenceBundle;
+    draft: SkillDraft;
+    authorDossier: EvidenceDossier;
+    verifierDossier: EvidenceDossier;
+    differenceIndex: DossierDifferenceIndex;
+    obligations: readonly ReviewObligation[];
+    job: EvidenceReviewJob;
+    signal?: AbortSignal;
+  }): Promise<{
+    verifier: SkillVerifierResult;
+    dispositions: readonly ObligationDisposition[];
+    transcriptPaths: string[];
+  }> {
+    const reviewBundle = attachVerifierReviewContext(input.bundle, {
+      authorDossier: input.authorDossier,
+      verifierDossier: input.verifierDossier,
+      differenceIndex: input.differenceIndex,
+      obligations: input.obligations,
+    });
+
+    // Legacy parity: runtime draft gate short-circuits the Verifier branch.
+    // Retryable schema issues with a queue already threw from skill_author.
+    const draftIssues = validateDraft(input.draft, reviewBundle, this.getManualSkillNames());
+    if (draftIssues.length > 0) {
+      if (
+        draftIssues.every(isRetryableAuthorDraftIssue)
+        && this.options.reviewQueuePath
+      ) {
+        throw new OperationalReviewError(
+          'invalid_completion_schema',
+          `Skill Author returned an invalid completion schema: ${draftIssues.map(i => i.message).join(' ')}`,
+          [],
+        );
+      }
+      const danger = draftIssues.some(issue => issue.severity === 'danger');
+      const forced: SkillVerifierResult = {
+        decision: danger ? 'reject' : 'defer',
+        issues: draftIssues,
+        rationale: `Runtime ${danger ? 'rejected' : 'deferred'} the author envelope before persistence: ${draftIssues.map(i => i.message).join(' ')}`,
+      };
+      const dispositions = defaultObligationDispositions(input.obligations, forced);
+      return { verifier: forced, dispositions, transcriptPaths: [] };
+    }
+
+    const attemptDeadlineMs = this.getEffectiveConfig().reviewAttemptDeadlineMs;
+    const reviewAttempt: BranchReviewAttemptMetadata = {
+      deadlineMs: attemptDeadlineMs,
+      deadlineAt: new Date(Date.now() + Math.max(1, attemptDeadlineMs)).toISOString(),
+    };
+    const verifier = this.createVerifierBranch(
+      reviewBundle,
+      input.draft,
+      1,
+      { remainingTurns: this.getReviewAttemptMaxTurns() },
+      input.signal,
+      reviewAttempt,
+    );
+    let verification: SkillVerifierResult;
+    try {
+      verification = normalizeVerifierResult(await verifier.run());
+      this.throwIfReviewAborted(input.signal);
+    } catch (error) {
+      const paths = verifier.transcriptPath ? [verifier.transcriptPath] : [];
+      throw this.buildOperationalReviewError(error, paths);
+    }
+    const transcriptPaths = verifier.transcriptPath ? [verifier.transcriptPath] : [];
+    if (verifier.transcriptPath) {
+      assertHealthyBranchTranscript(verifier.transcriptPath, 'skill-verifier', this.options.branchLogRoot);
+    }
+    const dispositions = defaultObligationDispositions(input.obligations, verification);
+    return { verifier: verification, dispositions, transcriptPaths };
+  }
+
+  private async commitTransitionQuantum(input: {
+    bundle: EvidenceBundle;
+    draft: SkillDraft;
+    verifier: SkillVerifierResult;
+    job: EvidenceReviewJob;
+    branchTranscriptPaths: string[];
+  }): Promise<SkillEvolutionResult> {
+    // Fence immediately before treating accept as committed history.
+    const fence = this.compareLiveReviewBasis(input.job, input.bundle);
+    if (fence.status === 'stale') {
+      const engine = this.getEvidenceReviewEngine();
+      const candidate = this.extractCandidateFromBundle(input.bundle);
+      return this.supersedeStaleReviewJob(
+        engine,
+        input.job,
+        input.bundle,
+        candidate,
+        fence.reason,
+      );
+    }
+
+    const reviewBundle = input.job.authorDossier && input.job.verifierDossier
+      ? attachVerifierReviewContext(input.bundle, {
+        authorDossier: input.job.authorDossier,
+        verifierDossier: input.job.verifierDossier,
+        differenceIndex: input.job.differenceIndex ?? {
+          manifestHash: input.job.manifest.manifestHash,
+          entries: [],
+        },
+        obligations: input.job.obligations ?? [],
+      })
+      : input.bundle;
+
+    // Runtime draft validation is a pre-persistence gate (legacy parity):
+    // invalid drafts never install guidance even if the Verifier accepted them.
+    const draftIssues = validateDraft(input.draft, reviewBundle, this.getManualSkillNames());
+    if (draftIssues.length > 0) {
+      if (
+        draftIssues.every(isRetryableAuthorDraftIssue)
+        && this.options.reviewQueuePath
+      ) {
+        throw new OperationalReviewError(
+          'invalid_completion_schema',
+          `Skill Author returned an invalid completion schema: ${draftIssues.map(i => i.message).join(' ')}`,
+          input.branchTranscriptPaths,
+        );
+      }
+      const danger = draftIssues.some(issue => issue.severity === 'danger');
+      const forced: SkillVerifierResult = {
+        decision: danger ? 'reject' : 'defer',
+        issues: draftIssues,
+        rationale: `Runtime ${danger ? 'rejected' : 'deferred'} the author envelope before persistence: ${draftIssues.map(i => i.message).join(' ')}`,
+      };
+      return this.applyReviewedTransition(
+        reviewBundle,
+        input.draft,
+        forced,
+        1,
+        [...input.branchTranscriptPaths],
+      );
+    }
+
+    // Optimistic commit retries for stale Capability read set (legacy parity):
+    // refresh Registry context and re-run Author + Verifier before re-applying.
+    let commitBundle = reviewBundle;
+    let draft = input.draft;
+    let verifier = input.verifier;
+    const branchTranscriptPaths = [...input.branchTranscriptPaths];
+    for (let retry = 0; retry <= MAX_OPTIMISTIC_COMMIT_RETRIES; retry++) {
+      try {
+        return this.applyReviewedTransition(
+          commitBundle,
+          draft,
+          verifier,
+          retry + 1,
+          branchTranscriptPaths,
+        );
+      } catch (error) {
+        if (error instanceof ReviewCommitConflictError) {
+          if (retry >= MAX_OPTIMISTIC_COMMIT_RETRIES) throw error;
+          commitBundle = freezeClone(this.refreshRegistryContext(commitBundle));
+          // Re-run Author / Verifier against the refreshed fixed-bundle context.
+          const authorOutcome = await this.runSkillAuthorQuantum({
+            bundle: commitBundle,
+            authorDossier: input.job.authorDossier ?? {
+              lane: 'author',
+              manifestHash: input.job.manifest.manifestHash,
+              coveredShardIds: [],
+              findings: [],
+              findingSets: [],
+              complete: false,
+            },
+            job: input.job,
+          });
+          draft = authorOutcome.draft;
+          for (const p of authorOutcome.transcriptPaths) {
+            if (p && !branchTranscriptPaths.includes(p)) branchTranscriptPaths.push(p);
+          }
+          const verifierOutcome = await this.runSkillVerifierQuantum({
+            bundle: commitBundle,
+            draft,
+            authorDossier: input.job.authorDossier!,
+            verifierDossier: input.job.verifierDossier!,
+            differenceIndex: input.job.differenceIndex ?? {
+              manifestHash: input.job.manifest.manifestHash,
+              entries: [],
+            },
+            obligations: input.job.obligations ?? [],
+            job: input.job,
+          });
+          verifier = verifierOutcome.verifier;
+          for (const p of verifierOutcome.transcriptPaths) {
+            if (p && !branchTranscriptPaths.includes(p)) branchTranscriptPaths.push(p);
+          }
+          continue;
+        }
+        throw error;
+      }
+    }
+    throw new Error('Skill Evolution exceeded optimistic commit retries.');
   }
 
   private supersedeStaleReviewJob(
     engine: EvidenceReviewEngine,
-    staleJob: import('./evidence-review-types').EvidenceReviewJob,
+    staleJob: EvidenceReviewJob,
     liveBundle: EvidenceBundle,
     candidate: DistilledKnowledgeCandidate,
     reason: string,
@@ -842,80 +1231,6 @@ export class SkillEvolutionRuntime {
       rounds: 1,
       queued: 'operational',
     };
-  }
-
-  /** Run reader/dossier/diff/obligation quanta only; stop before skill_author. */
-  private async advanceCoverageQuanta(
-    engine: EvidenceReviewEngine,
-    jobId: string,
-    wakeId: string,
-    signal?: AbortSignal,
-  ): Promise<void> {
-    const coverageKinds = [
-      'author_reader',
-      'verifier_reader',
-      'author_dossier',
-      'verifier_dossier',
-      'difference_index',
-      'obligations',
-    ] as const;
-    await engine.advanceJob(jobId, wakeId, signal, { allowedKinds: coverageKinds });
-  }
-
-  /** Mark skill_author / skill_verifier / commit quanta after legacy path settles. */
-  private settlePromotionQuanta(
-    engine: EvidenceReviewEngine,
-    jobId: string,
-    result: SkillEvolutionResult,
-    branchTranscriptPaths: readonly string[],
-  ): void {
-    const state = engine.loadStore();
-    const job = state.jobs[jobId];
-    if (!job) return;
-    const now = new Date().toISOString();
-    const mark = (kind: 'skill_author' | 'skill_verifier' | 'commit', payload: unknown) => {
-      for (const [id, quantum] of Object.entries(job.quanta)) {
-        if (quantum.kind !== kind || quantum.state === 'succeeded') continue;
-        job.quanta[id] = {
-          ...quantum,
-          state: 'succeeded',
-          result: payload,
-          resultHash: crypto.createHash('sha256').update(JSON.stringify(payload ?? null)).digest('hex'),
-          transcriptPaths: [...quantum.transcriptPaths, ...branchTranscriptPaths],
-          lease: undefined,
-          updatedAt: now,
-        };
-      }
-    };
-    if (result.draft) mark('skill_author', result.draft);
-    if (result.verifier) {
-      const dispositions = defaultObligationDispositions(job.obligations ?? [], result.verifier);
-      mark('skill_verifier', { verifier: result.verifier, dispositions });
-      job.obligationDispositions = dispositions;
-      job.verifierResult = result.verifier;
-    }
-    if (result.draft) job.draft = result.draft;
-    if (result.transitionId || result.audit?.transitionId) {
-      mark('commit', result);
-      job.transitionId = result.transitionId ?? result.audit?.transitionId;
-      job.disposition = result.transition === 'defer' ? 'deferred' : 'completed';
-    } else if (result.queued === 'operational') {
-      // Leave promotion quanta pending/retry for a later wake.
-      job.disposition = 'active';
-    } else if (result.transition === 'defer' || result.queued === 'deferred') {
-      mark('skill_author', result.draft ?? null);
-      mark('skill_verifier', result.verifier ?? null);
-      mark('commit', result);
-      job.disposition = 'deferred';
-    } else {
-      mark('skill_author', result.draft ?? null);
-      mark('skill_verifier', result.verifier ?? null);
-      mark('commit', result);
-      job.disposition = 'completed';
-    }
-    job.updatedAt = now;
-    state.jobs[jobId] = job;
-    engine.saveStore(state);
   }
 
   private async reviewAndApplyWithRetries(
