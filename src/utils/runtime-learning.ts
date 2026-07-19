@@ -115,6 +115,49 @@ import {
   retryExternalSourceQuarantineWithAudit,
   skipExternalSourceQuarantineWithAudit,
 } from './external-source-recovery';
+import {
+  BoundedSourceEvidence,
+  EvidenceBundle,
+  SkillEvolutionResult,
+  SkillEvolutionQueueReviewResult,
+  ReferencedSkillSnapshot,
+  RelatedCurrentSkill,
+  SkillEvidenceRef,
+} from './skill-evolution';
+import {
+  EvidenceCapsuleStore,
+  buildEvidenceCapsule,
+  sanitizeExternalDistillationUnit,
+} from './evidence-capsule';
+import {
+  ExternalSessionLogBackfillRequest,
+  ExternalSessionLogBackfillIngestContext,
+  ExternalSessionLogBackfillMetrics,
+  ExternalSessionLogBackfillRunResult,
+  ExternalSessionLogBackfillService,
+  ExternalSessionLogBackfillSource,
+  ExternalSessionLogBackfillState,
+  ExternalHistoryProgressUpdate,
+  loadExternalSessionLogBackfillState,
+} from './session-log-backfill';
+import { buildEpisodeEvidenceBundle } from './episode-evidence-bundle';
+import {
+  ExternalEpisodeProvenanceStore,
+  type ExternalEpisodeProvenanceState,
+} from './external-episode-provenance-store';
+
+// Re-export types used by callers (preserved public API from the former tail imports)
+export type {
+  EvidenceBundle,
+  SkillEvolutionResult,
+  SkillEvolutionQueueReviewResult,
+  BoundedSourceEvidence,
+  ReferencedSkillSnapshot,
+  RelatedCurrentSkill,
+  SkillEvidenceRef,
+};
+// Re-export provenance state type (preserved public API from former inline definition)
+export type { ExternalEpisodeProvenanceState };
 
 // ---------------------------------------------------------------------------
 // Public API: wake context / reports (shared with the heartbeat scheduler)
@@ -403,7 +446,6 @@ function normalizeDiscoveryQuota(value: number | undefined, fallback: number): n
   return Math.max(0, Math.floor(value));
 }
 
-const EXTERNAL_EPISODE_PROVENANCE_SCHEMA_VERSION = 1;
 const EXTERNAL_BACKFILL_SLICE_RESOURCES = 10;
 const EXTERNAL_BACKFILL_SLICE_BYTES = 2 * 1024 * 1024;
 // A single xurl discovery/read pair is an external process boundary. Keep the
@@ -432,71 +474,6 @@ interface ReviewContinuationState {
   updatedAt: string;
   nextClass: ReviewWorkClass;
   classCursors: Partial<Record<ReviewWorkClass, string>>;
-}
-
-export interface ExternalEpisodeProvenanceState {
-  schemaVersion: typeof EXTERNAL_EPISODE_PROVENANCE_SCHEMA_VERSION;
-  episodeToEvent: Record<string, string>;
-  eventToEpisodes: Record<string, string[]>;
-}
-
-function validateExternalEpisodeProvenanceState(value: unknown): ExternalEpisodeProvenanceState {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) {
-    throw new Error('external provenance state must be an object');
-  }
-  const candidate = value as Partial<ExternalEpisodeProvenanceState>;
-  if (candidate.schemaVersion !== EXTERNAL_EPISODE_PROVENANCE_SCHEMA_VERSION) {
-    throw new Error(`unsupported external provenance schema: ${String(candidate.schemaVersion)}`);
-  }
-  if (!candidate.episodeToEvent || typeof candidate.episodeToEvent !== 'object'
-    || Array.isArray(candidate.episodeToEvent)) {
-    throw new Error('external provenance episodeToEvent must be an object');
-  }
-  if (!candidate.eventToEpisodes || typeof candidate.eventToEpisodes !== 'object'
-    || Array.isArray(candidate.eventToEpisodes)) {
-    throw new Error('external provenance eventToEpisodes must be an object');
-  }
-
-  const episodeToEvent: Record<string, string> = {};
-  const expectedByEvent = new Map<string, string[]>();
-  for (const [episodeId, eventKey] of Object.entries(candidate.episodeToEvent)) {
-    if (!episodeId || typeof eventKey !== 'string' || !eventKey) {
-      throw new Error('external provenance contains an invalid episode/event mapping');
-    }
-    episodeToEvent[episodeId] = eventKey;
-    expectedByEvent.set(eventKey, [...(expectedByEvent.get(eventKey) ?? []), episodeId]);
-  }
-
-  const eventToEpisodes: Record<string, string[]> = {};
-  for (const [eventKey, episodeIds] of Object.entries(candidate.eventToEpisodes)) {
-    if (!eventKey || !Array.isArray(episodeIds)
-      || episodeIds.some(episodeId => typeof episodeId !== 'string' || !episodeId)) {
-      throw new Error('external provenance contains an invalid event/episodes mapping');
-    }
-    const normalized = [...new Set(episodeIds)].sort();
-    if (normalized.length !== episodeIds.length) {
-      throw new Error(`external provenance contains duplicate episode ids for event: ${eventKey}`);
-    }
-    eventToEpisodes[eventKey] = normalized;
-  }
-
-  const expectedKeys = [...expectedByEvent.keys()].sort();
-  const actualKeys = Object.keys(eventToEpisodes).sort();
-  if (expectedKeys.join('\n') !== actualKeys.join('\n')) {
-    throw new Error('external provenance indexes disagree on event keys');
-  }
-  for (const eventKey of expectedKeys) {
-    const expected = [...(expectedByEvent.get(eventKey) ?? [])].sort();
-    if (expected.join('\n') !== eventToEpisodes[eventKey].join('\n')) {
-      throw new Error(`external provenance indexes disagree for event: ${eventKey}`);
-    }
-  }
-
-  return {
-    schemaVersion: EXTERNAL_EPISODE_PROVENANCE_SCHEMA_VERSION,
-    episodeToEvent,
-    eventToEpisodes,
-  };
 }
 
 export interface RuntimeLearningOptions {
@@ -785,11 +762,6 @@ export class RuntimeLearning {
   private readonly schedulingStatePath: string;
   /** Durable Evidence Capsule store for external evidence (issue #78). */
   private readonly evidenceCapsuleStore: EvidenceCapsuleStore;
-  /** Durable provenance index tying external events to episode ids (issue #78). */
-  private readonly externalEpisodeProvenancePath: string;
-  /** Fail-closed marker written before a corrupt provenance file is quarantined. */
-  private readonly externalEpisodeProvenanceCorruptMarkerPath: string;
-  private externalEpisodeProvenanceStateCorrupt = false;
   /**
    * The single External Admission Coordinator (issue #93) that serializes
    * durable admission of ready pages produced by external source work lanes.
@@ -797,12 +769,8 @@ export class RuntimeLearning {
    * acknowledgement settle through this coordinator in fair, page-sized turns.
    */
   private readonly externalAdmissionCoordinator: ExternalAdmissionCoordinator;
-  /** Episode id -> event key for external provenance lookup. */
-  private readonly externalEpisodeProvenance = new Map<string, string>();
-  /** Event key -> external episode ids. */
-  private readonly externalEpisodeProvenanceByEvent = new Map<string, string[]>();
-  /** Remains true until the latest in-memory provenance mutation is durable. */
-  private externalEpisodeProvenanceDirty = false;
+  /** Durable provenance index tying external events to episode ids (issue #78). */
+  private readonly externalEpisodeProvenanceStore: ExternalEpisodeProvenanceStore;
 
   private readonly pendingCuratorObservationEpisodeIds = new Set<string>();
   private readonly activeWakeAbortControllers = new Set<AbortController>();
@@ -871,18 +839,21 @@ export class RuntimeLearning {
       path.dirname(this.config.learningEpisodeStorePath),
       'external-source-scheduling-state.json',
     );
-    this.externalEpisodeProvenancePath = path.join(
+    const externalEpisodeProvenancePath = path.join(
       path.dirname(this.config.learningEpisodeStorePath),
       'external-source-provenance.json',
     );
-    this.externalEpisodeProvenanceCorruptMarkerPath = `${this.externalEpisodeProvenancePath}.state-corrupt`;
     this.loadExternalSourceSchedulingState();
     for (const adapter of this.sessionLogSources) {
       if (adapter.identity.category !== 'external' || !adapter.getCursorStorePath?.()) continue;
       this.reconcileExternalSourceRecovery(adapter.identity.provider, adapter.identity.sourceId);
     }
     this.evidenceCapsuleStore = new EvidenceCapsuleStore(this.config.evidenceCapsulePath);
-    this.loadExternalEpisodeProvenanceState();
+    this.externalEpisodeProvenanceStore = new ExternalEpisodeProvenanceStore({
+      stateFilePath: externalEpisodeProvenancePath,
+      corruptMarkerPath: `${externalEpisodeProvenancePath}.state-corrupt`,
+      clock: this.clock,
+    });
     this.externalAdmissionCoordinator = new ExternalAdmissionCoordinator({
       stateFilePath: path.join(
         path.dirname(this.config.learningEpisodeStorePath),
@@ -1601,31 +1572,7 @@ export class RuntimeLearning {
    * already-admitted external episodes as internal evidence.
    */
   recoverExternalEpisodeProvenanceState(state: ExternalEpisodeProvenanceState): void {
-    const validated = validateExternalEpisodeProvenanceState(state);
-    this.externalEpisodeProvenance.clear();
-    this.externalEpisodeProvenanceByEvent.clear();
-    for (const [episodeId, eventKey] of Object.entries(validated.episodeToEvent)) {
-      this.externalEpisodeProvenance.set(episodeId, eventKey);
-    }
-    for (const [eventKey, episodeIds] of Object.entries(validated.eventToEpisodes)) {
-      this.externalEpisodeProvenanceByEvent.set(eventKey, [...episodeIds]);
-    }
-
-    const marker = fs.existsSync(this.externalEpisodeProvenanceCorruptMarkerPath)
-      ? fs.readFileSync(this.externalEpisodeProvenanceCorruptMarkerPath)
-      : undefined;
-    try {
-      if (marker) fs.unlinkSync(this.externalEpisodeProvenanceCorruptMarkerPath);
-      this.externalEpisodeProvenanceStateCorrupt = false;
-      this.externalEpisodeProvenanceDirty = true;
-      this.saveExternalEpisodeProvenanceState();
-    } catch (error) {
-      this.externalEpisodeProvenanceStateCorrupt = true;
-      if (marker && !fs.existsSync(this.externalEpisodeProvenanceCorruptMarkerPath)) {
-        fs.writeFileSync(this.externalEpisodeProvenanceCorruptMarkerPath, marker, { mode: 0o600 });
-      }
-      throw error;
-    }
+    this.externalEpisodeProvenanceStore.recover(state);
   }
 
   private async withStateWriter<T>(owner: symbol, work: () => Promise<T>): Promise<T> {
@@ -2025,9 +1972,7 @@ export class RuntimeLearning {
         this.saveExternalSourceSchedulingState();
       }
 
-      if (this.externalEpisodeProvenanceDirty) {
-        this.saveExternalEpisodeProvenanceState();
-      }
+      this.externalEpisodeProvenanceStore.flush();
 
       const maturationDueWork: DueWork = {
         settlementDue: true,
@@ -3058,7 +3003,6 @@ export class RuntimeLearning {
     const sourceReports: SessionLogSourceReport[] = [];
     let totalAdmittedEpisodes = 0;
     let totalContradictionSignals = 0;
-    let externalProvenanceUpdated = false;
 
     // Wake-level caps: bound resources examined, candidates admitted, and
     // wall-clock time so discovery cannot starve the overdue settlement/review
@@ -3083,7 +3027,6 @@ export class RuntimeLearning {
       sourceReports.push(result.report);
       totalAdmittedEpisodes += result.admittedEpisodes;
       totalContradictionSignals += result.contradictionSignals;
-      externalProvenanceUpdated ||= result.externalProvenanceUpdated;
     }
 
     if (!shared.discoveryCapped && externalSources.length > 0) {
@@ -3106,7 +3049,6 @@ export class RuntimeLearning {
             : result.report;
           externalAdmittedEpisodes += result.admittedEpisodes;
           externalContradictionSignals += result.contradictionSignals;
-          externalProvenanceUpdated ||= result.externalProvenanceUpdated;
         };
 
         const catchUpSources = catchUpEligible ? externalSources
@@ -3336,9 +3278,7 @@ export class RuntimeLearning {
     // Persist external source scheduling state (backoff deadlines) for restart
     // recovery (AC6).
     this.saveExternalSourceSchedulingState();
-    if (externalProvenanceUpdated || this.externalEpisodeProvenanceDirty) {
-      this.saveExternalEpisodeProvenanceState();
-    }
+    this.externalEpisodeProvenanceStore.flush();
     this.reconcileCompletedHistoricalTargets();
 
     return {
@@ -3428,7 +3368,6 @@ export class RuntimeLearning {
     report: SessionLogSourceReport;
     admittedEpisodes: number;
     contradictionSignals: number;
-    externalProvenanceUpdated: boolean;
   }> {
     const identity = adapter.identity;
     const isExternal = identity.category === 'external';
@@ -3456,8 +3395,7 @@ export class RuntimeLearning {
         },
         admittedEpisodes: 0,
         contradictionSignals: 0,
-        externalProvenanceUpdated: false,
-      };
+              };
     }
 
     if (isExternal && (this.shutdownDrainRequested || this.externalSourceDrainRequested || options.signal?.aborted)) {
@@ -3476,8 +3414,7 @@ export class RuntimeLearning {
         },
         admittedEpisodes: 0,
         contradictionSignals: 0,
-        externalProvenanceUpdated: false,
-      };
+              };
     }
 
     if (isExternal) {
@@ -3498,8 +3435,7 @@ export class RuntimeLearning {
           },
           admittedEpisodes: 0,
           contradictionSignals: 0,
-          externalProvenanceUpdated: false,
-        };
+                  };
       }
     }
 
@@ -3525,8 +3461,7 @@ export class RuntimeLearning {
         },
         admittedEpisodes: 0,
         contradictionSignals: 0,
-        externalProvenanceUpdated: false,
-      };
+              };
     }
 
     const activeReadKey = isExternal ? externalSourceLaneKey(identity) : null;
@@ -3555,7 +3490,6 @@ export class RuntimeLearning {
     let advancedResources = 0;
     let totalAdmittedEpisodes = 0;
     let totalContradictionSignals = 0;
-    let externalProvenanceUpdated = false;
     const sourceStartMs = this.clock().getTime();
 
     try {
@@ -3594,8 +3528,7 @@ export class RuntimeLearning {
           },
           admittedEpisodes: 0,
           contradictionSignals: 0,
-          externalProvenanceUpdated: false,
-        };
+                  };
       }
 
       const readContextBase: SessionLogSourceReadContext = { orderedResources: resources };
@@ -3869,7 +3802,6 @@ export class RuntimeLearning {
             }
             batchAdmittedEpisodes = commitResult.admittedEpisodes;
             batchContradictionSignals = commitResult.contradictionSignals;
-            externalProvenanceUpdated = false; // coordinator’s commit fn saves it
           } else {
             // Internal sources: existing inline commit logic (unchanged).
             for (let index = 0; index < distillationUnits.length; index++) {
@@ -3978,7 +3910,6 @@ export class RuntimeLearning {
         },
         admittedEpisodes: totalAdmittedEpisodes,
         contradictionSignals: totalContradictionSignals,
-        externalProvenanceUpdated,
       };
     } finally {
       detachParentAbort?.();
@@ -4470,53 +4401,13 @@ export class RuntimeLearning {
 
   /**
    * Track that a specific external event maps to the listed episode ids.
-   * Returns true if this run changed durable provenance state.
    */
   private recordExternalEpisodeProvenance(
     identity: SessionLogSourceIdentity,
     eventIdentity: SourceEventIdentity,
     episodeIds: readonly string[],
-  ): boolean {
-    this.assertExternalEpisodeProvenanceHealthy();
-    if (episodeIds.length === 0) return false;
-
-    const eventKey = this.getExternalEpisodeProvenanceEventKey(identity, eventIdentity);
-    const existingEventEpisodeIds = new Set(this.externalEpisodeProvenanceByEvent.get(eventKey) ?? []);
-    const nextEventEpisodeIds = new Set(existingEventEpisodeIds);
-
-    let changed = false;
-    for (const episodeId of episodeIds) {
-      nextEventEpisodeIds.add(episodeId);
-
-      const previousEventKey = this.externalEpisodeProvenance.get(episodeId);
-      if (previousEventKey === eventKey) {
-        continue;
-      }
-      if (previousEventKey !== undefined) {
-        const removedFromPrevious = this.externalEpisodeProvenanceByEvent.get(previousEventKey);
-        if (removedFromPrevious) {
-          const nextRemovedSet = new Set(removedFromPrevious);
-          nextRemovedSet.delete(episodeId);
-          const nextRemoved = [...nextRemovedSet];
-          if (nextRemoved.length === 0) {
-            this.externalEpisodeProvenanceByEvent.delete(previousEventKey);
-          } else {
-            this.externalEpisodeProvenanceByEvent.set(previousEventKey, nextRemoved);
-          }
-        }
-      }
-      this.externalEpisodeProvenance.set(episodeId, eventKey);
-      changed = true;
-    }
-
-    const nextEventEpisodeIdsList = [...nextEventEpisodeIds].sort();
-    const currentEventEpisodeIds = this.externalEpisodeProvenanceByEvent.get(eventKey);
-    if (!currentEventEpisodeIds || currentEventEpisodeIds.join('|') !== nextEventEpisodeIdsList.join('|')) {
-      this.externalEpisodeProvenanceByEvent.set(eventKey, nextEventEpisodeIdsList);
-      changed = true;
-    }
-    if (changed) this.externalEpisodeProvenanceDirty = true;
-    return changed;
+  ): void {
+    this.externalEpisodeProvenanceStore.record(identity, eventIdentity, episodeIds);
   }
 
   /**
@@ -4530,11 +4421,11 @@ export class RuntimeLearning {
     sanitizedUnit: DistillationUnit,
     ingestion: EvidenceIngestionResult,
   ): string[] {
-    this.assertExternalEpisodeProvenanceHealthy();
+    this.externalEpisodeProvenanceStore.assertHealthy();
     if (ingestion.admittedEpisodeIds.length > 0) {
       return [...ingestion.admittedEpisodeIds];
     }
-    const indexed = this.getExternalEpisodeIdsForEvent(identity, eventIdentity);
+    const indexed = this.externalEpisodeProvenanceStore.getEpisodeIdsForEvent(identity, eventIdentity);
     if (indexed.length > 0) return indexed;
     return Object.values(ingestion.state.episodes)
       .filter(episode => episode.sourceFilePath === sanitizedUnit.filePath)
@@ -4542,141 +4433,13 @@ export class RuntimeLearning {
       .sort();
   }
 
-  private getExternalEpisodeIdsForEvent(
-    identity: SessionLogSourceIdentity,
-    eventIdentity: SourceEventIdentity,
-  ): string[] {
-    this.assertExternalEpisodeProvenanceHealthy();
-    const eventKey = this.getExternalEpisodeProvenanceEventKey(identity, eventIdentity);
-    return [...(this.externalEpisodeProvenanceByEvent.get(eventKey) ?? [])];
-  }
-
   private isEpisodeFromExternalSource(episodeId: string): boolean {
-    this.assertExternalEpisodeProvenanceHealthy();
-    if (this.externalEpisodeProvenance.has(episodeId)) return true;
+    if (this.externalEpisodeProvenanceStore.hasEpisode(episodeId)) return true;
     // A crash can persist the Episode before its Capsule/provenance writes.
     // Sanitized external admission always uses this opaque URI namespace, so
     // review must still fail closed until replay completes those later writes.
     return this.episodeStore.load().episodes[episodeId]?.sourceFilePath
       .startsWith('external://event/') === true;
-  }
-
-  private getExternalEpisodeProvenanceEventKey(
-    identity: SessionLogSourceIdentity,
-    eventIdentity: SourceEventIdentity,
-  ): string {
-    const sourceHash = normalizeSourceHash(identity);
-    const contentHash = normalizeSourceEventHash(eventIdentity.contentHash);
-    const conversationPart = eventIdentity.conversationId ? `::conversation=${eventIdentity.conversationId}` : '';
-    const branchPart = eventIdentity.branchId ? `::branch=${eventIdentity.branchId}` : '';
-    const revisionPart = eventIdentity.revision ? `::revision=${eventIdentity.revision}` : '';
-    return `${identity.sourceId}::${identity.provider}::${identity.reader}::${sourceHash}::${eventIdentity.eventId}#${eventIdentity.position}`
-      + conversationPart
-      + branchPart
-      + revisionPart
-      + (contentHash ? `::${contentHash}` : '');
-  }
-
-  private loadExternalEpisodeProvenanceState(): void {
-    if (fs.existsSync(this.externalEpisodeProvenanceCorruptMarkerPath)) {
-      this.externalEpisodeProvenanceStateCorrupt = true;
-      Logger.warning(
-        `[RuntimeLearning] external episode provenance is quarantined: ${this.externalEpisodeProvenanceCorruptMarkerPath}`,
-      );
-      return;
-    }
-
-    try {
-      if (!fs.existsSync(this.externalEpisodeProvenancePath)) return;
-      const raw = fs.readFileSync(this.externalEpisodeProvenancePath, 'utf-8');
-      const parsed = validateExternalEpisodeProvenanceState(JSON.parse(raw));
-      for (const [episodeId, eventKey] of Object.entries(parsed.episodeToEvent)) {
-        this.externalEpisodeProvenance.set(episodeId, eventKey);
-      }
-      for (const [eventKey, episodeIds] of Object.entries(parsed.eventToEpisodes)) {
-        this.externalEpisodeProvenanceByEvent.set(eventKey, [...episodeIds]);
-      }
-    } catch (error) {
-      this.externalEpisodeProvenanceStateCorrupt = true;
-      fs.mkdirSync(path.dirname(this.externalEpisodeProvenancePath), { recursive: true });
-      fs.writeFileSync(
-        this.externalEpisodeProvenanceCorruptMarkerPath,
-        JSON.stringify({
-          detectedAt: this.clock().toISOString(),
-          sourcePath: this.externalEpisodeProvenancePath,
-          reason: error instanceof Error ? error.message : String(error),
-        }, null, 2),
-        { encoding: 'utf-8', mode: 0o600 },
-      );
-      const quarantinePath = `${this.externalEpisodeProvenancePath}.corrupt-${Date.now()}`;
-      try {
-        if (fs.existsSync(this.externalEpisodeProvenancePath)) {
-          fs.renameSync(this.externalEpisodeProvenancePath, quarantinePath);
-        }
-      } catch (quarantineError) {
-        Logger.warning(
-          `[RuntimeLearning] failed to quarantine corrupt external provenance: ${(quarantineError as Error).message}`,
-        );
-      }
-      Logger.warning(
-        `[RuntimeLearning] external episode provenance failed closed: ${(error as Error).message}`,
-      );
-    }
-  }
-
-  private saveExternalEpisodeProvenanceState(): void {
-    this.assertExternalEpisodeProvenanceHealthy();
-    const episodeToEvent: Record<string, string> = {};
-    for (const [episodeId, eventKey] of this.externalEpisodeProvenance) {
-      episodeToEvent[episodeId] = eventKey;
-    }
-
-    if (Object.keys(episodeToEvent).length === 0) {
-      if (fs.existsSync(this.externalEpisodeProvenancePath)) {
-        fs.unlinkSync(this.externalEpisodeProvenancePath);
-      }
-      this.externalEpisodeProvenanceDirty = false;
-      return;
-    }
-
-    const eventToEpisodes: Record<string, string[]> = {};
-    for (const [eventKey, episodeIds] of this.externalEpisodeProvenanceByEvent) {
-      if (episodeIds.length > 0) {
-        eventToEpisodes[eventKey] = [...episodeIds].sort();
-      }
-    }
-
-    const payload: ExternalEpisodeProvenanceState = {
-      schemaVersion: EXTERNAL_EPISODE_PROVENANCE_SCHEMA_VERSION,
-      episodeToEvent,
-      eventToEpisodes,
-    };
-    fs.mkdirSync(path.dirname(this.externalEpisodeProvenancePath), { recursive: true });
-    const tmpPath = `${this.externalEpisodeProvenancePath}.${process.pid}.${Date.now()}.tmp`;
-    try {
-      fs.writeFileSync(tmpPath, JSON.stringify(payload, null, 2), {
-        encoding: 'utf-8',
-        mode: 0o600,
-      });
-      fs.renameSync(tmpPath, this.externalEpisodeProvenancePath);
-      this.externalEpisodeProvenanceDirty = false;
-    } finally {
-      try {
-        if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath);
-      } catch {
-        // Preserve the original persistence failure; stale temp files are safe.
-      }
-    }
-  }
-
-  private assertExternalEpisodeProvenanceHealthy(): void {
-    if (this.externalEpisodeProvenanceStateCorrupt
-      || fs.existsSync(this.externalEpisodeProvenanceCorruptMarkerPath)) {
-      this.externalEpisodeProvenanceStateCorrupt = true;
-      throw new Error(
-        `external episode provenance is corrupt; restore a verified state and call recoverExternalEpisodeProvenanceState(): ${this.externalEpisodeProvenanceCorruptMarkerPath}`,
-      );
-    }
   }
 
   // -----------------------------------------------------------------------
@@ -4803,7 +4566,6 @@ export class RuntimeLearning {
     let admittedEpisodes = 0;
     let contradictionSignals = 0;
     const admittedEpisodeIds: string[] = [];
-    let externalProvenanceUpdated = false;
     let eventInProgress: SourceEventIdentity | undefined;
 
     try {
@@ -4872,7 +4634,7 @@ export class RuntimeLearning {
         );
 
         if (admissionEpisodeIds.length > 0) {
-          externalProvenanceUpdated ||= this.recordExternalEpisodeProvenance(
+          this.recordExternalEpisodeProvenance(
             identity,
             eventIdentity,
             admissionEpisodeIds,
@@ -4887,9 +4649,7 @@ export class RuntimeLearning {
       // Provenance is part of the crash-safe external commit boundary.
       // Persist it after episodes/capsules but before cursor acknowledgement;
       // replay is idempotent if the process stops anywhere before this point.
-      if (externalProvenanceUpdated || this.externalEpisodeProvenanceDirty) {
-        this.saveExternalEpisodeProvenanceState();
-      }
+      this.externalEpisodeProvenanceStore.flush();
 
       // Cursor acknowledgement is lane-specific and remains the final durable
       // step owned by that lane.
@@ -5309,108 +5069,10 @@ function normalizeHeartbeatRunStatus(value: unknown): RuntimeLearningHeartbeatRu
 // ---------------------------------------------------------------------------
 // Episode evidence bundle builder
 // ---------------------------------------------------------------------------
-
-import {
-  BoundedSourceEvidence,
-  EvidenceBundle,
-  SkillEvolutionResult,
-  SkillEvolutionQueueReviewResult,
-  ReferencedSkillSnapshot,
-  RelatedCurrentSkill,
-  SkillEvidenceRef,
-} from './skill-evolution';
-import {
-  EvidenceCapsuleStore,
-  buildEvidenceCapsule,
-  sanitizeExternalDistillationUnit,
-  reconstructBundleFromCapsule,
-} from './evidence-capsule';
-import {
-  ExternalSessionLogBackfillRequest,
-  ExternalSessionLogBackfillIngestContext,
-  ExternalSessionLogBackfillMetrics,
-  ExternalSessionLogBackfillRunResult,
-  ExternalSessionLogBackfillService,
-  ExternalSessionLogBackfillSource,
-  ExternalSessionLogBackfillState,
-  ExternalHistoryProgressUpdate,
-  loadExternalSessionLogBackfillState,
-} from './session-log-backfill';
-import { DistilledKnowledgeCandidate } from './capability-distiller';
-
-// Re-export types used by callers
-export type {
-  EvidenceBundle,
-  SkillEvolutionResult,
-  SkillEvolutionQueueReviewResult,
-  BoundedSourceEvidence,
-  ReferencedSkillSnapshot,
-  RelatedCurrentSkill,
-  SkillEvidenceRef,
-};
-
-function buildEpisodeEvidenceBundle(
-  episode: LearningEpisode,
-  candidate: DistilledKnowledgeCandidate,
-  skillEvolution: SkillEvolutionRuntime,
-  capsuleStore?: EvidenceCapsuleStore,
-  isExternalEpisode?: (episodeId: string) => boolean,
-): EvidenceBundle {
-  const completionEvidence: readonly SkillEvidenceRef[] = episode.completionEvidence
-    .filter(evidence => evidence.kind !== 'contradiction')
-    .map(evidence => ({
-      ref: evidence.ref,
-      sourceFilePath: evidence.sourceFilePath,
-      turn: evidence.turn,
-    }));
-  const settlementEvidence: readonly SkillEvidenceRef[] = [{
-    ref: `${episode.sourceFilePath}#episode-${episode.episodeId}:settled-${episode.settlementDeadline}`,
-    sourceFilePath: episode.sourceFilePath,
-    turn: episode.deliveryTurn,
-  }];
-  const registry = skillEvolution.getRegistry();
-  const relatedCurrentSkills: readonly RelatedCurrentSkill[] = Object.values(registry.capabilities).map(
-    record => ({
-      handle: record.handle,
-      revision: record.revision,
-      routingName: record.routingName,
-      description: record.description,
-      guidanceHash: record.guidanceHash,
-    }),
-  );
-
-  const bundleId = `v3:learning-episode:${episode.episodeId}`;
-
-  if (capsuleStore) {
-    const capsule = capsuleStore.findByBundleId(bundleId);
-    if (capsule) {
-      // For external-origin evidence, reconstruct the entire bundle from the
-      // pinned capsule so Author/Verifier never see raw external detail leaked
-      // through the fallback candidate's actionPattern or solvedLoop fields.
-      return reconstructBundleFromCapsule(
-        capsule,
-        skillEvolution.getReferencedSkillSnapshots(),
-        registry,
-      );
-    }
-    if (!capsule && isExternalEpisode?.(episode.episodeId)) {
-      throw new Error(
-        `External-origin Learning Episode ${episode.episodeId} requires a persisted Evidence Capsule before review.`,
-      );
-    }
-  }
-
-  return {
-    bundleId,
-    episode: candidate,
-    completionEvidence,
-    settlementEvidence,
-    boundedContinuity: [],
-    semanticObservations: episode.semanticObservations,
-    referencedSkills: skillEvolution.getReferencedSkillSnapshots(),
-    relatedCurrentSkills,
-  };
-}
+// buildEpisodeEvidenceBundle now lives in ./episode-evidence-bundle. The
+// RuntimeLearning class calls the extracted function directly; the imports
+// and type re-exports it depended on were hoisted to the top-level import
+// section above to eliminate the former mid-file late imports.
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -5472,14 +5134,6 @@ function clampConcurrency(value: number): number {
 function toErrorMessage(error: unknown): string {
   if (error instanceof Error) return error.message;
   return String(error);
-}
-
-function normalizeSourceHash(identity: SessionLogSourceIdentity): string {
-  return `${identity.sourceId}::${identity.provider}::${identity.reader}`;
-}
-
-function normalizeSourceEventHash(contentHash: string | undefined): string {
-  return (contentHash ?? '').trim();
 }
 
 function toStablePathComponent(value: string): string {

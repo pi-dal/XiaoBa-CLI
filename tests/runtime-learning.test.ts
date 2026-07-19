@@ -2446,3 +2446,31 @@ describe('RuntimeLearning — Provenance (AC4 follow-up)', () => {
     fs.rmSync(root, { recursive: true, force: true });
   });
 });
+
+describe('RuntimeLearning — external provenance crash fallback', () => {
+  let env: TestEnv;
+
+  beforeEach(() => { env = setupEnv(0); });
+  afterEach(() => { env.restore(); env.teardown(); });
+
+  test('treats external://event episodes as external before provenance replay completes', () => {
+    const episodeStore = new LearningEpisodeStore(env.episodeStorePath);
+    const state = episodeStore.load();
+    state.episodes['episode-crash-fallback'] = {
+      schemaVersion: 3,
+      episodeId: 'episode-crash-fallback',
+      runtimeSessionId: 'sess-crash-fallback',
+      sourceFilePath: 'external://event/github/external-github/evt-123',
+      deliveryTurn: 1,
+      completionEvidence: [],
+      contradictionSignals: [],
+      semanticObservations: [],
+      settlementDeadline: '2026-01-01T00:00:00.000Z',
+      status: 'settled',
+    } as LearningEpisode;
+    episodeStore.save(state);
+
+    assert.equal((env.runtimeLearning as any).isEpisodeFromExternalSource('episode-crash-fallback'), true);
+    assert.equal((env.runtimeLearning as any).isEpisodeFromExternalSource('episode-internal'), false);
+  });
+});
