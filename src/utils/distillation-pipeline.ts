@@ -72,7 +72,12 @@ import {
   SkillEvolutionResult,
   SkillEvolutionRuntime,
 } from './skill-evolution';
+import {
+  buildRuntimeOwnedReferencedSkillProvenance,
+  selectRuntimeOwnedReferencedSkills,
+} from './episode-evidence-bundle';
 import { SkillUsageCurator } from './skill-usage-curator';
+import type { GeneratedSkillLoadFact } from './skill-usage-ledger';
 
 /**
  * Distillation Pipeline (issue #6).
@@ -452,8 +457,9 @@ export class DistillationPipeline {
     for (const episode of episodes) {
       if (episode.status !== 'eligible' || this.hasReviewedLearningEpisode(episode)) continue;
       const candidate = buildLearningEpisodeCandidate(episode, unit);
+      const skillLoadFacts = this.listSkillLoadFactsForEpisode(episode);
       const bundle = this.v3EvidenceBundleBuilder?.(unit ?? emptyUnitForEpisode(episode), candidate)
-        ?? buildLearningEpisodeEvidenceBundle(episode, candidate, this.skillEvolution);
+        ?? buildLearningEpisodeEvidenceBundle(episode, candidate, this.skillEvolution, skillLoadFacts);
       reviewInputs.push({ candidate, bundle });
     }
 
@@ -471,6 +477,18 @@ export class DistillationPipeline {
 
   private queueCuratorObservations(episodeIds: readonly string[]): void {
     for (const episodeId of episodeIds) this.pendingCuratorObservationEpisodeIds.add(episodeId);
+  }
+
+  /**
+   * Return runtime-owned GeneratedSkillLoadFact entries tied to the episode's
+   * canonical AgentTurn correlation. Legacy episodes without
+   * `agentTurnEpisodeId` receive no facts — never join by timestamp or
+   * session proximity.
+   */
+  private listSkillLoadFactsForEpisode(episode: LearningEpisode): readonly GeneratedSkillLoadFact[] {
+    const episodeId = episode.agentTurnEpisodeId;
+    if (!episodeId) return [];
+    return this.skillUsageCurator?.listLoadFactsForEpisode(episodeId) ?? [];
   }
 
   private hasReviewedLearningEpisode(episode: LearningEpisode): boolean {
@@ -1082,6 +1100,7 @@ export function buildLearningEpisodeEvidenceBundle(
   episode: LearningEpisode,
   candidate: DistilledKnowledgeCandidate,
   skillEvolution: SkillEvolutionRuntime,
+  skillLoadFacts?: readonly GeneratedSkillLoadFact[],
 ): EvidenceBundle {
   const completionEvidence = episode.completionEvidence
     .filter(evidence => evidence.kind !== 'contradiction')
@@ -1095,6 +1114,11 @@ export function buildLearningEpisodeEvidenceBundle(
     sourceFilePath: episode.sourceFilePath,
     turn: episode.deliveryTurn,
   }];
+  const referencedSkills = selectRuntimeOwnedReferencedSkills(
+    skillLoadFacts,
+    episode,
+    skillEvolution.getReferencedSkillSnapshots(),
+  );
   return {
     bundleId: learningEpisodeBundleId(episode),
     episode: candidate,
@@ -1102,7 +1126,11 @@ export function buildLearningEpisodeEvidenceBundle(
     settlementEvidence,
     boundedContinuity: [],
     semanticObservations: episode.semanticObservations,
-    referencedSkills: skillEvolution.getReferencedSkillSnapshots(),
+    // Progressive Trust: only dependencies proven by a runtime-owned
+    // GeneratedSkillLoadFact tied to the same episode (joined by
+    // agentTurnEpisodeId + runtimeSessionId) appear in referencedSkills.
+    // Untrusted semantic observations must never authorize a dependency.
+    referencedSkills,
     relatedCurrentSkills: Object.values(skillEvolution.getRegistry().capabilities).map(record => ({
       handle: record.handle,
       revision: record.revision,
@@ -1110,6 +1138,11 @@ export function buildLearningEpisodeEvidenceBundle(
       description: record.description,
       guidanceHash: record.guidanceHash,
     })),
+    referencedSkillProvenance: buildRuntimeOwnedReferencedSkillProvenance(
+      skillLoadFacts,
+      episode,
+      referencedSkills,
+    ),
   };
 }
 
@@ -1142,7 +1175,12 @@ export function buildV3EvidenceBundle(
     completionEvidence,
     settlementEvidence,
     boundedContinuity: unit.continuityTurns,
-    referencedSkills: skillEvolution.getReferencedSkillSnapshots(),
+    // Progressive Trust: a Distillation Unit does not carry `referenced-skill`
+    // semantic observations, so generic V3 bundle construction exposes no
+    // referenced Skills. The complete generated registry remains in
+    // relatedCurrentSkills as recall context; specialized bundles that
+    // explicitly pin a dependency (e.g. flashcard composition) bypass this path.
+    referencedSkills: [],
     relatedCurrentSkills: Object.values(skillEvolution.getRegistry().capabilities).map(record => ({
       handle: record.handle,
       revision: record.revision,

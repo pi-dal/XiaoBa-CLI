@@ -43,6 +43,7 @@ import {
   XurlExternalSourceReader,
   type XurlExternalBackfillCatalogSelection,
 } from '../utils/xurl-session-log-source';
+import { buildXurlSubprocessEnv } from '../utils/xurl-subprocess-env';
 import { acquireHeartbeatSchedulerOwnerLock } from '../utils/heartbeat-scheduler-owner-lock';
 import { EvidenceIngestor } from '../utils/evidence-ingestor';
 import { DueWorkPlanner } from '../utils/due-work-planner';
@@ -481,6 +482,9 @@ function handleRebaseline(
       scope: scope.scope,
       scopePath: scope.scopePath,
       cwd: workingDirectory,
+      // Least-privilege env: xurl subprocesses receive only OS essentials,
+      // never unrelated model/CatsCo secrets or parent-only XiaoBa config.
+      env: buildXurlSubprocessEnv(),
     })
     : undefined;
   const source = new ExternalSessionLogSourceAdapter({
@@ -530,6 +534,9 @@ async function handleBackfill(
     scope: scope.scope,
     scopePath: scope.scopePath,
     cwd: workingDirectory,
+    // Least-privilege env: xurl subprocesses receive only OS essentials,
+    // never unrelated model/CatsCo secrets or parent-only XiaoBa config.
+    env: buildXurlSubprocessEnv(),
   });
 
   const selection = source.selectCatalogResourcesByUpdatedSince(cutoff);

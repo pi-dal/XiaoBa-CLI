@@ -81,6 +81,36 @@ export interface TurnOrigin {
 
 export type DistillationTurn = CompletedTurn & { origin?: TurnOrigin };
 
+/**
+ * Structured external-source event provenance.
+ *
+ * Present only on Distillation Units produced by external Session Log
+ * Sources (e.g. xURL). Carries the provider-scoped identity and immutable
+ * content fingerprint so downstream stages (distiller, learning-episode
+ * extractor, skill renderer) can expose lineage without fragile parsing of
+ * the synthetic `filePath`.
+ *
+ * For external units `byteRange` holds the canonical ordinal range
+ * (`startOrdinal`–`endOrdinal`), not filesystem byte offsets; this type
+ * makes that explicit so renderers can label it correctly.
+ */
+export interface ExternalEventProvenance {
+  /** External provider that owns the thread (e.g. "openai", "pi"). */
+  readonly provider: string;
+  /** Thread / conversation identity within the provider. */
+  readonly threadId: string;
+  /** Immutable content fingerprint from the rendered Timeline. */
+  readonly contentHash: string;
+  /** Inclusive start ordinal of the canonical event. */
+  readonly startOrdinal: number;
+  /** Inclusive end ordinal of the canonical event. */
+  readonly endOrdinal: number;
+  /** Branch identity within the thread, when the source exposes one. */
+  readonly branchId?: string;
+  /** Source revision / updated-at token, when available. */
+  readonly revision?: string;
+}
+
 export interface DistillationUnit {
   /** Session log file this unit was extracted from. */
   filePath: string;
@@ -92,6 +122,12 @@ export interface DistillationUnit {
   byteRange: { start: number; end: number };
   /** ISO timestamp of unit creation. */
   generatedAt: string;
+  /**
+   * External source event provenance; present only for units produced by
+   * external Session Log Sources (xURL). Absent for local/session-log units
+   * and older persisted records.
+   */
+  externalEventProvenance?: ExternalEventProvenance;
 }
 
 export interface CrossFileContinuityOptions {

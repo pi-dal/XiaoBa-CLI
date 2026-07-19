@@ -11,7 +11,7 @@ export const EVIDENCE_REVIEW_JOB_SCHEMA_VERSION = 1 as const;
 
 /** Default prompt / policy version stamps included in Quantum identity. */
 export const EVIDENCE_REVIEW_PROMPT_VERSION = 'evidence-review-job-v1' as const;
-export const EVIDENCE_REVIEW_POLICY_VERSION = 'evidence-review-policy-v1' as const;
+export const EVIDENCE_REVIEW_POLICY_VERSION = 'evidence-review-policy-v3' as const;
 
 /**
  * Common durable Quantum kinds for dual-lane coverage and final commit.

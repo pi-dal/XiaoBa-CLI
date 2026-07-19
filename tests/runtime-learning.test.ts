@@ -24,7 +24,12 @@ import { RuntimeLearning } from '../src/utils/runtime-learning';
 import { EvidenceIngestor } from '../src/utils/evidence-ingestor';
 import { LearningEpisode, LearningEpisodeStore } from '../src/utils/learning-episode';
 import { DueWorkPlanner, reviewContinuationPathForEpisodeStore } from '../src/utils/due-work-planner';
-import { SkillEvolutionOptions, SkillEvolutionRuntime } from '../src/utils/skill-evolution';
+import { DistilledKnowledgeCandidate } from '../src/utils/capability-distiller';
+import {
+  EvidenceBundle,
+  SkillEvolutionOptions,
+  SkillEvolutionRuntime,
+} from '../src/utils/skill-evolution';
 import { SkillUsageCurator } from '../src/utils/skill-usage-curator';
 import { SkillUsageLedger } from '../src/utils/skill-usage-ledger';
 import { DistillationPipeline, defaultDistilledOutputDir } from '../src/utils/distillation-pipeline';
@@ -41,7 +46,16 @@ import {
   loadReviewQueueState,
   saveReviewQueueState,
 } from '../src/utils/skill-evolution-review-queue';
-import { readShardStructurally } from '../src/utils/evidence-review-engine';
+import {
+  readShardStructurally,
+  resolveEvidenceReviewJobStorePath,
+} from '../src/utils/evidence-review-engine';
+import { listRunnableQuanta } from '../src/utils/evidence-review-graph-core';
+import { createEvidenceReviewJob } from '../src/utils/evidence-review-graph';
+import {
+  loadEvidenceReviewJobStore,
+  saveEvidenceReviewJobStore,
+} from '../src/utils/evidence-review-graph-store';
 
 // ---------------------------------------------------------------------------
 // Test helpers
@@ -66,6 +80,97 @@ function createDeferred<T = void>(): {
   let resolve!: (value: T | PromiseLike<T>) => void;
   const promise = new Promise<T>(done => { resolve = done; });
   return { promise, resolve };
+}
+
+function runtimeReviewBundle(bundleId: string): EvidenceBundle {
+  const candidate: DistilledKnowledgeCandidate = {
+    schemaVersion: 1,
+    kind: 'capability',
+    capabilityId: bundleId,
+    title: `Candidate ${bundleId}`,
+    applicability: 'When the user needs this bounded workflow.',
+    actionPattern: 'Follow the bounded workflow only.',
+    boundaries: ['Bounded by the cited evidence only.'],
+    risks: ['Do not import unrelated dependencies.'],
+    solvedLoop: {
+      problem: 'bounded task',
+      action: 'solved it',
+      verification: 'accepted',
+      noCorrection: 'none',
+    },
+    provenance: [
+      { filePath: 'session.jsonl', turn: 12, role: 'problem-action', unitByteRange: { start: 0, end: 10 } },
+      { filePath: 'session.jsonl', turn: 13, role: 'verification', unitByteRange: { start: 11, end: 20 } },
+    ],
+    generatedAt: '2026-07-19T00:00:00.000Z',
+    sourceUnit: {
+      filePath: 'session.jsonl',
+      byteRange: { start: 0, end: 20 },
+      generatedAt: '2026-07-19T00:00:00.000Z',
+    },
+  };
+  return {
+    bundleId,
+    episode: candidate,
+    completionEvidence: [{ ref: 'session.jsonl#12' }],
+    settlementEvidence: [{ ref: 'session.jsonl#13' }],
+    semanticObservations: [
+      { kind: 'user-intent', value: 'use the bounded workflow', sourceRefs: ['session.jsonl#12:user-intent'] },
+    ],
+    boundedContinuity: [],
+    referencedSkills: [],
+    relatedCurrentSkills: [],
+  };
+}
+
+function seedDueReviewContinuation(episodeStorePath: string): void {
+  const continuationPath = reviewContinuationPathForEpisodeStore(episodeStorePath);
+  fs.mkdirSync(path.dirname(continuationPath), { recursive: true });
+  fs.writeFileSync(continuationPath, JSON.stringify({
+    schemaVersion: 1,
+    episodeIds: [],
+    nextAttemptAt: new Date(0).toISOString(),
+    updatedAt: new Date(0).toISOString(),
+    nextClass: 'live',
+    classCursors: {},
+  }, null, 2));
+}
+
+async function advanceJobReadyForSkillAuthor(
+  env: TestEnv,
+  jobId: string,
+): Promise<string> {
+  const engine = env.skillEvolution.getEvidenceReviewEngine();
+
+  while (true) {
+    const current = engine.loadStore().jobs[jobId]!;
+    const runnable = listRunnableQuanta(current, new Date());
+    assert.ok(runnable.length > 0, 'expected seeded job to stay runnable');
+    if (runnable.some(quantum => quantum.kind === 'skill_author')) {
+      return current.jobId;
+    }
+    const next = runnable[0]!;
+    const advanced = await engine.advanceJob(
+      current.jobId,
+      `seed:${current.jobId}:${next.quantumId}`,
+      undefined,
+      { quantumId: next.quantumId, maxQuanta: 1 },
+    );
+    assert.ok(advanced.executedQuantumIds.includes(next.quantumId));
+  }
+}
+
+async function seedActiveJobReadyForSkillAuthor(
+  env: TestEnv,
+  bundle: EvidenceBundle,
+): Promise<string> {
+  const engine = env.skillEvolution.getEvidenceReviewEngine();
+  const job = engine.ensureJob({
+    bundle,
+    candidate: bundle.episode as DistilledKnowledgeCandidate,
+    workClass: 'live_learning',
+  });
+  return advanceJobReadyForSkillAuthor(env, job.jobId);
 }
 
 function futureTurn(
@@ -181,6 +286,7 @@ interface TestEnv {
   pipeline: DistillationPipeline;
   runtimeLearning: RuntimeLearning;
   skillEvolution: SkillEvolutionRuntime;
+  skillEvolutionOptions: SkillEvolutionOptions;
   branchCalls: { author: number; verifier: number };
   restore: () => void;
   teardown: () => void;
@@ -241,7 +347,7 @@ function setupEnv(
   delete process.env.XIAOBA_EXTERNAL_SESSION_LOG_SELECTED_SOURCE_ID;
   delete process.env.XIAOBA_EXTERNAL_SESSION_LOG_XURL_COMMAND;
 
-  const skillEvolution = new SkillEvolutionRuntime({
+  const skillEvolutionOptions: SkillEvolutionOptions = {
     workingDirectory: root,
     outputDir,
     registryPath,
@@ -283,7 +389,8 @@ function setupEnv(
         rationale: 'The bounded report workflow is supported by the fixed artifact evidence.',
       };
     }),
-  });
+  };
+  const skillEvolution = new SkillEvolutionRuntime(skillEvolutionOptions);
 
   const episodeStore = new LearningEpisodeStore(episodeStorePath);
   const curator = new SkillUsageCurator({
@@ -339,6 +446,7 @@ function setupEnv(
     pipeline,
     runtimeLearning,
     skillEvolution,
+    skillEvolutionOptions,
     branchCalls,
     restore: () => {
       for (const [key, value] of Object.entries(savedEnv)) {
@@ -2279,6 +2387,125 @@ describe('Issue #83 — controlled production acceptance', () => {
       env.restore();
       env.teardown();
     }
+  });
+});
+
+describe('RuntimeLearning — fair wake pre-claim fencing', () => {
+  let env: TestEnv;
+
+  beforeEach(() => { env = setupEnv(0); });
+  afterEach(() => { env.restore(); env.teardown(); });
+
+  test('fences a policy-v2 active skill_author job before Author and advances only the normalized v3 successor', async () => {
+    const authorBundles: Array<{ bundleId: string; referencedSkills: string[] }> = [];
+    env.skillEvolutionOptions.authorFixture = ({ bundle }) => {
+      authorBundles.push({
+        bundleId: bundle.bundleId,
+        referencedSkills: bundle.referencedSkills.map(skill => skill.name),
+      });
+      assert.deepEqual(
+        bundle.referencedSkills,
+        [],
+        'normalized successor must strip leaked catalog references before Author runs',
+      );
+      return {
+        body: 'Use the bounded normalized workflow only.',
+        envelope: {
+          decision: 'create_current_skill',
+          routingName: 'normalized-fair-wake-successor',
+          description: 'Normalized fair wake successor.',
+          referencedSkills: [],
+          evidenceRefs: ['session.jsonl#12', 'session.jsonl#13'],
+        },
+      };
+    };
+    env.skillEvolutionOptions.verifierFixture = () => ({
+      decision: 'accept',
+      transition: 'create_current_skill',
+      issues: [],
+      rationale: 'Normalized fair wake successor looks bounded.',
+    });
+
+    const bundle = {
+      ...runtimeReviewBundle('v3:session.jsonl:0:20:candidate-active-v2'),
+      referencedSkills: [
+        { name: 'generated-helper-a', capabilityHandle: 'cap-a', guidanceHash: 'hash-a' },
+        { name: 'generated-helper-b', capabilityHandle: 'cap-b', guidanceHash: 'hash-b' },
+      ],
+    };
+    const jobStorePath = resolveEvidenceReviewJobStorePath(env.skillEvolutionOptions);
+    const state = loadEvidenceReviewJobStore(jobStorePath);
+    const staleJob = createEvidenceReviewJob({
+      bundle,
+      candidate: bundle.episode as DistilledKnowledgeCandidate,
+      workClass: 'live_learning',
+      reviewPolicyVersion: 'evidence-review-policy-v2',
+      now: new Date('2026-07-19T00:00:00.000Z'),
+    });
+    state.jobs[staleJob.jobId] = staleJob;
+    saveEvidenceReviewJobStore(jobStorePath, state);
+    const staleJobId = await advanceJobReadyForSkillAuthor(env, staleJob.jobId);
+    seedDueReviewContinuation(env.episodeStorePath);
+
+    const result = await env.runtimeLearning.wake('manual');
+
+    const reloaded = loadEvidenceReviewJobStore(jobStorePath);
+    const persistedStale = reloaded.jobs[staleJobId]!;
+    const successor = Object.values(reloaded.jobs).find(job => job.parentJobId === staleJobId);
+
+    assert.equal(result.review.status, 'succeeded');
+    assert.ok(persistedStale.successorJobId, 'expected stale job to record successorJobId');
+    assert.ok(successor, 'expected normalized successor job to be created');
+    assert.deepEqual(successor!.bundle.referencedSkills, []);
+    assert.ok(
+      authorBundles.some(call => call.bundleId === successor!.bundle.bundleId),
+      'fair wake should continue on the normalized successor when budget allows',
+    );
+    assert.ok(
+      authorBundles.every(call => call.referencedSkills.length === 0),
+      'no Author invocation may see leaked legacy referencedSkills',
+    );
+  });
+
+  test('keeps current v3 active skill_author jobs on the same job without spurious supersession', async () => {
+    const authorBundles: string[] = [];
+    env.skillEvolutionOptions.authorFixture = ({ bundle }) => {
+      authorBundles.push(bundle.bundleId);
+      return {
+        body: 'Use the current bounded workflow only.',
+        envelope: {
+          decision: 'create_current_skill',
+          routingName: 'current-fair-wake-job',
+          description: 'Current fair wake job.',
+          referencedSkills: [],
+          evidenceRefs: ['session.jsonl#12', 'session.jsonl#13'],
+        },
+      };
+    };
+    env.skillEvolutionOptions.verifierFixture = () => ({
+      decision: 'accept',
+      transition: 'create_current_skill',
+      issues: [],
+      rationale: 'Current fair wake job looks bounded.',
+    });
+
+    const bundle = runtimeReviewBundle('v3:session.jsonl:0:20:candidate-active-v3');
+    const currentJobId = await seedActiveJobReadyForSkillAuthor(env, bundle);
+    const jobStorePath = resolveEvidenceReviewJobStorePath(env.skillEvolutionOptions);
+    seedDueReviewContinuation(env.episodeStorePath);
+
+    const result = await env.runtimeLearning.wake('manual');
+
+    const reloaded = loadEvidenceReviewJobStore(jobStorePath);
+    const persisted = reloaded.jobs[currentJobId]!;
+    const successor = Object.values(reloaded.jobs).find(job => job.parentJobId === currentJobId);
+
+    assert.equal(result.review.status, 'succeeded');
+    assert.ok(authorBundles.includes(bundle.bundleId), 'current v3 job should reach Author on fair wake');
+    assert.equal(successor, undefined, 'current v3 job must not be spuriously superseded');
+    assert.equal(persisted.successorJobId, undefined);
+    assert.equal(persisted.disposition, 'active');
+    assert.ok(persisted.draft, 'fair wake should advance the current v3 job normally');
   });
 });
 

@@ -765,13 +765,13 @@ function stripIndent(text: string): string {
   return text.replace(/\r\n?/gu, '\n').trim();
 }
 
-function parseProvenanceRefs(
+export function parseProvenanceRefs(
   body: string,
   fallbackSourceFilePath: string,
   fallbackRange: { start: number; end: number },
 ): Array<{ turn: number; role: 'problem-action' | 'verification'; start: number; end: number; sourceFilePath: string }> {
   const parsed: Array<{ turn: number; role: 'problem-action' | 'verification'; start: number; end: number; sourceFilePath: string }> = [];
-  const regex = /`([^`]+)` turn (\d+) \((problem-action|verification)\)\s*[—-]\s*byte range (\d+)\u2013?(\d+)/gu;
+  const regex = /`([^`]+)` turn (\d+) \((problem-action|verification)\)\s*[—-]\s*(?:byte|ordinal) range (\d+)\u2013?(\d+)/gu;
   for (const match of body.matchAll(regex)) {
     const sourceFilePath = match[1] ?? fallbackSourceFilePath;
     const turn = Number(match[2]);

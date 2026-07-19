@@ -180,21 +180,46 @@ function uniqueNonEmpty(values: readonly string[]): string[] {
   return [...new Set(values.filter(value => typeof value === 'string' && value.trim()))];
 }
 
+/**
+ * Read-side validation for persisted ledger facts. It must be at least as
+ * strict as the write-side assertions in `recordGeneratedSkillLoad` /
+ * `recordOutcome`: nonempty identity and correlation fields, the
+ * generated-distilled path invariant for generated Current Skill loads, and a
+ * valid outcome enum. Malformed or corrupt JSONL facts are ignored (never
+ * thrown) so a single bad line cannot poison the trusted dependency seam.
+ */
 function isLedgerFact(value: unknown): value is SkillUsageLedgerFact {
   if (!value || typeof value !== 'object') return false;
   const fact = value as Partial<SkillUsageLedgerFact>;
   if (fact.schemaVersion !== SKILL_USAGE_LEDGER_SCHEMA_VERSION || typeof fact.factId !== 'string') return false;
+  if (typeof fact.recordedAt !== 'string') return false;
   if (fact.kind === 'generated-skill-load') {
-    return typeof fact.episodeId === 'string'
-      && typeof fact.runtimeSessionId === 'string'
+    return isNonEmpty(fact.episodeId)
+      && isNonEmpty(fact.runtimeSessionId)
       && (fact.requestedRoutingName === undefined || typeof fact.requestedRoutingName === 'string')
-      && !!fact.skill
-      && typeof fact.skill.capabilityHandle === 'string'
-      && typeof fact.skill.skillFilePath === 'string';
+      && isValidGeneratedCurrentSkillIdentity(fact.skill);
   }
   return fact.kind === 'episode-outcome'
-    && typeof fact.loadFactId === 'string'
-    && typeof fact.episodeId === 'string'
+    && isNonEmpty(fact.loadFactId)
+    && isNonEmpty(fact.episodeId)
     && (fact.outcome === 'verified-success' || fact.outcome === 'deferred' || fact.outcome === 'contradicted')
-    && Array.isArray(fact.evidenceRefs);
+    && Array.isArray(fact.evidenceRefs)
+    && fact.evidenceRefs.every(ref => typeof ref === 'string');
+}
+
+function isValidGeneratedCurrentSkillIdentity(skill: unknown): boolean {
+  if (!skill || typeof skill !== 'object') return false;
+  const identity = skill as Partial<GeneratedCurrentSkillIdentity>;
+  // Mirror write-side assertGeneratedCurrentSkill exactly: nonempty
+  // capabilityHandle, routingName, guidanceHash, skillFilePath, and the
+  // generated-distilled path invariant.
+  return isNonEmpty(identity.capabilityHandle)
+    && isNonEmpty(identity.routingName)
+    && isNonEmpty(identity.guidanceHash)
+    && isNonEmpty(identity.skillFilePath)
+    && identity.skillFilePath!.split(/[\\/]+/).includes('generated-distilled');
+}
+
+function isNonEmpty(value: unknown): value is string {
+  return typeof value === 'string' && value.trim().length > 0;
 }

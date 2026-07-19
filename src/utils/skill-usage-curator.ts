@@ -8,6 +8,7 @@ import {
 } from './skill-evolution';
 import {
   GeneratedCurrentSkillIdentity,
+  GeneratedSkillLoadFact,
   SkillUsageLedger,
   SkillUsageOutcomeFact,
 } from './skill-usage-ledger';
@@ -66,6 +67,20 @@ export class SkillUsageCurator {
     this.now = options.now ?? (() => new Date());
     this.successThreshold = Math.max(1, options.successThreshold ?? 2);
     this.deferThreshold = Math.max(1, options.deferThreshold ?? 2);
+  }
+
+  /**
+   * Return runtime-owned `GeneratedSkillLoadFact` entries tied to one episode
+   * by the canonical AgentTurn correlation. This is the trusted dependency
+   * fact seam for Evidence Bundle construction — it is never derived from
+   * untrusted external/capsule semantic content.
+   */
+  listLoadFactsForEpisode(episodeId: string): readonly GeneratedSkillLoadFact[] {
+    return this.options.ledger
+      .listFacts()
+      .filter((fact): fact is GeneratedSkillLoadFact =>
+        fact.kind === 'generated-skill-load' && fact.episodeId === episodeId,
+      );
   }
 
   observeEpisode(episode: LearningEpisode): SkillUsageOutcomeFact[] {

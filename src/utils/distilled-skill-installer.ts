@@ -410,8 +410,65 @@ function renderBody(
   return sections.join('\n');
 }
 
+/**
+ * Maximum length for a rendered external identifier (provider, threadId,
+ * contentHash) inside an inline-code span. External sources control these
+ * values; without a bound a malicious or buggy source could emit an
+ * unbounded identifier that bloats the skill file or breaks Markdown
+ * framing. The hash is preserved honestly — only display control
+ * characters (newlines, backticks) are neutralised and the visible length
+ * is capped. The original value remains in the structured
+ * {@link CapabilityProvenanceRef} for verification.
+ */
+const MAX_EXTERNAL_ID_DISPLAY_LEN = 128;
+
+/**
+ * Render an external identifier inside an inline-code span safely.
+ *
+ * Provider, threadId, and contentHash arrive from external Markdown sources
+ * and must be treated as untrusted display data. This function:
+ *   1. Strips carriage returns and newlines so the value cannot inject new
+ *      Markdown lines or sections.
+ *   2. Removes backticks so the value cannot break out of the inline-code
+ *      framing.
+ *   3. Truncates to {@link MAX_EXTERNAL_ID_DISPLAY_LEN} so a malicious or
+ *      oversized identifier cannot grow the skill file without bound.
+ *
+ * The original structured value is preserved unchanged in the
+ * {@link CapabilityProvenanceRef} for verification; only the *display*
+ * representation is bounded.
+ */
+function sanitizeExternalIdForDisplay(value: string): string {
+  const stripped = value.replace(/[\u000d\u000a\u0060]/g, '');
+  return stripped.length > MAX_EXTERNAL_ID_DISPLAY_LEN
+    ? stripped.slice(0, MAX_EXTERNAL_ID_DISPLAY_LEN)
+    : stripped;
+}
+
 function renderProvenanceRef(ref: CapabilityProvenanceRef): string {
-  return `- \`${ref.filePath}\` turn ${ref.turn} (${ref.role}) \u2014 byte range ${ref.unitByteRange.start}\u2013${ref.unitByteRange.end}`;
+  // Base format is preserved exactly for backward compatibility with the
+  // legacy skill bootstrap parser (parseProvenanceRefs), which matches this
+  // line shape. External provenance fields are appended after the base so
+  // the parser regex still matches the leading portion.
+  const isExternal = typeof ref.provider === 'string' && ref.provider.trim() !== '';
+  const rangeLabel = isExternal ? 'ordinal range' : 'byte range';
+  // When structured startOrdinal/endOrdinal are available (typed external
+  // provenance), use them for the rendered range instead of relabeling an
+  // arbitrary unitByteRange. Fall back to unitByteRange for older persisted
+  // records that lack the typed ordinals.
+  const rangeStart = isExternal && typeof ref.startOrdinal === 'number'
+    ? ref.startOrdinal
+    : ref.unitByteRange.start;
+  const rangeEnd = isExternal && typeof ref.endOrdinal === 'number'
+    ? ref.endOrdinal
+    : ref.unitByteRange.end;
+  const base = `- \`${ref.filePath}\` turn ${ref.turn} (${ref.role}) \u2014 ${rangeLabel} ${rangeStart}\u2013${rangeEnd}`;
+  if (!isExternal) return base;
+  const parts: string[] = [base];
+  parts.push(`provider: \`${sanitizeExternalIdForDisplay(ref.provider!)}\``);
+  if (ref.threadId) parts.push(`thread: \`${sanitizeExternalIdForDisplay(ref.threadId)}\``);
+  if (ref.contentHash) parts.push(`content hash: \`${sanitizeExternalIdForDisplay(ref.contentHash)}\``);
+  return parts.join(' \u00b7 ');
 }
 
 // ---------------------------------------------------------------------------

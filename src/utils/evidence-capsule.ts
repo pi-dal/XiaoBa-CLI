@@ -32,6 +32,7 @@ import {
   ReferencedSkillSnapshot,
   RelatedCurrentSkill,
   CurrentSkillRegistryState,
+  RuntimeOwnedReferencedSkillProvenance,
 } from './skill-evolution';
 import { DistilledKnowledgeCandidate } from './capability-distiller';
 import { type SemanticObservation } from './learning-episode';
@@ -724,6 +725,7 @@ export function reconstructBundleFromCapsule(
   capsule: EvidenceCapsule,
   referencedSkills: readonly ReferencedSkillSnapshot[],
   registry: CurrentSkillRegistryState,
+  referencedSkillProvenance?: RuntimeOwnedReferencedSkillProvenance,
 ): EvidenceBundle {
   // Reconstruct evidence refs from capsule evidence entries
   const completionEvidence: readonly SkillEvidenceRef[] = capsule.completionEvidence.map(e => ({
@@ -791,6 +793,11 @@ export function reconstructBundleFromCapsule(
       turn: e.turn ?? 0,
       role: index === 0 ? 'problem-action' as const : 'verification' as const,
       unitByteRange: e.byteRange ?? { start: 0, end: 1 },
+      ...(capsule.provenance.category === 'external' ? {
+        provider: capsule.provenance.provider,
+        ...(capsule.identity.conversationId ? { threadId: capsule.identity.conversationId } : {}),
+        ...(capsule.identity.contentHash ? { contentHash: capsule.identity.contentHash } : {}),
+      } : {}),
     })),
     generatedAt: capsule.redactedAt,
     sourceUnit: {
@@ -822,6 +829,7 @@ export function reconstructBundleFromCapsule(
       : undefined,
     referencedSkills,
     relatedCurrentSkills,
+    referencedSkillProvenance,
     sourceEvidence,
   };
 }

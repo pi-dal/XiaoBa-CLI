@@ -125,6 +125,19 @@ export interface RelatedCurrentSkill {
   guidanceHash: string;
 }
 
+export interface TrustedReferencedSkillIdentity {
+  capabilityHandle: string;
+  routingName: string;
+  guidanceHash: string;
+}
+
+export interface RuntimeOwnedReferencedSkillProvenance {
+  kind: 'runtime-owned-generated-skill-load-v1';
+  runtimeSessionId: string;
+  agentTurnEpisodeId: string;
+  referencedSkills: readonly TrustedReferencedSkillIdentity[];
+}
+
 /** The one fixed input shared by Author and Verifier branches. */
 export interface EvidenceBundle {
   bundleId: string;
@@ -134,6 +147,8 @@ export interface EvidenceBundle {
   boundedContinuity: readonly unknown[];
   referencedSkills: readonly ReferencedSkillSnapshot[];
   relatedCurrentSkills: readonly RelatedCurrentSkill[];
+  /** Optional trusted marker for ordinary bundle retry normalization. */
+  referencedSkillProvenance?: RuntimeOwnedReferencedSkillProvenance;
   /** Optional for legacy callers; production V3 bundles always supply it. */
   semanticObservations?: readonly SemanticObservation[];
   /** Optional for compatibility; production construction always supplies it. */
@@ -1354,12 +1369,14 @@ export class SkillEvolutionRuntime {
     if (!fence.shouldScheduleReassessment) return;
 
     // Prefer engine create path so reassessment freezes the live declared vector.
+    // Normalize the successor bundle so a persisted legacy/global-catalog
+    // referencedSkills array cannot leak into the reassessment Author/Verifier.
     const reassessment = createSuccessorReviewJob({
       staleJob: {
         ...completed,
         workClass: 'semantic_reassessment',
       },
-      liveBundle,
+      liveBundle: this.normalizePersistedBundleForReReview(liveBundle),
       candidate,
       registryReadSet: liveSnap.liveRegistryReadSet,
     });
@@ -1403,6 +1420,40 @@ export class SkillEvolutionRuntime {
     };
   }
 
+  /**
+   * Progressive Trust normalization for a persisted Evidence Bundle that is
+   * about to re-enter Author/Verifier review or be frozen into a successor
+   * Review Basis.
+   *
+   * Fail closed for ordinary persisted bundle families whose referencedSkills
+   * were historically sourced from a global catalog or whose trusted runtime
+   * load facts cannot be re-established from the persisted bundle alone. This
+   * includes ordinary Learning Episode bundles (`v3:learning-episode:`),
+   * generic Distillation Unit bundles (`v3:<file>:<range>:<candidate>`), and
+   * legacy bootstrap bundles (`legacy-v3:`).
+   *
+   * Preserve dependencies only for explicit, audited specialized families whose
+   * builders already authenticate or intentionally pin their dependency vector:
+   * flashcard composition (`flashcard-`), usage curation (`usage-curation:`),
+   * and semantic reassessment (`semantic-reassessment:`).
+   */
+  private normalizePersistedBundleForReReview(bundle: EvidenceBundle): EvidenceBundle {
+    if (bundle.referencedSkills.length === 0) return bundle;
+    if (this.preservePersistedReferencedSkills(bundle.bundleId)) return bundle;
+    const trustedReferencedSkills = selectTrustedPersistedReferencedSkills(bundle);
+    if (trustedReferencedSkills.length === 0) {
+      return freezeClone({ ...bundle, referencedSkills: [] });
+    }
+    if (trustedReferencedSkills.length === bundle.referencedSkills.length) return bundle;
+    return freezeClone({ ...bundle, referencedSkills: trustedReferencedSkills });
+  }
+
+  private preservePersistedReferencedSkills(bundleId: string): boolean {
+    return bundleId.startsWith('flashcard-')
+      || bundleId.startsWith('usage-curation:')
+      || bundleId.startsWith('semantic-reassessment:');
+  }
+
   private supersedeStaleReviewJob(
     engine: EvidenceReviewEngine,
     staleJob: EvidenceReviewJob,
@@ -1412,7 +1463,12 @@ export class SkillEvolutionRuntime {
     liveRegistryReadSet?: readonly CapabilityReadSetEntry[],
   ): SkillEvolutionResult {
     // Successors freeze the *current live* declared dependency vector, never the
-    // stale job's frozen read set alone.
+    // stale job's frozen read set alone. A persisted legacy/global-catalog
+    // `referencedSkills` array must never be carried into the successor: apply
+    // the Progressive Trust normalization so ordinary legacy referencedSkills
+    // are stripped (fail closed) while specialized bundles keep their pinned
+    // dependencies.
+    const normalizedLiveBundle = this.normalizePersistedBundleForReReview(liveBundle);
     const resolvedLiveReadSet = liveRegistryReadSet
       ?? resolveLiveDeclaredRegistryReadSet(
         staleJob.basis.registryReadSet,
@@ -1420,7 +1476,7 @@ export class SkillEvolutionRuntime {
       );
     const successor = createSuccessorReviewJob({
       staleJob,
-      liveBundle,
+      liveBundle: normalizedLiveBundle,
       candidate,
       registryReadSet: resolvedLiveReadSet,
     });
@@ -1434,7 +1490,7 @@ export class SkillEvolutionRuntime {
     // Do not also enqueue semantic defer for the same supersession.
     if (this.options.reviewQueuePath) {
       return this.enqueueOperationalFailureAndReturnResult(
-        liveBundle,
+        normalizedLiveBundle,
         new OperationalReviewError(
           'branch_failure',
           `Review Basis stale; successor job ${successor.jobId} created. ${reason}`,
@@ -1450,6 +1506,66 @@ export class SkillEvolutionRuntime {
       rounds: 1,
       queued: 'operational',
     };
+  }
+
+  /**
+   * Fail-closed pre-claim fence for durable fair scheduling.
+   *
+   * RuntimeLearning may wake directly into fair quantum rotation for already
+   * active jobs. Before any quantum is claimed/executed, supersede jobs whose
+   * frozen Review Basis is stale/corrupted so Author/Verifier only ever see a
+   * normalized live successor bundle under the current v3 policy.
+   */
+  fenceStaleActiveJobsBeforeFairAdvance(now: Date = new Date()): {
+    supersededJobIds: string[];
+    successorJobIds: string[];
+  } {
+    const engine = this.getEvidenceReviewEngine();
+    const supersededJobIds: string[] = [];
+    const successorJobIds: string[] = [];
+
+    const isDueRunnableActiveJob = (job: EvidenceReviewJob): boolean => {
+      if (job.disposition !== 'active') return false;
+      const notBefore = job.nextDueAt ? Date.parse(job.nextDueAt) : Number.NaN;
+      if (Number.isFinite(notBefore) && notBefore > now.getTime()) return false;
+      return Object.values(job.quanta).some(quantum => (
+        quantum.state === 'pending'
+        || quantum.state === 'leased'
+        || quantum.state === 'retry_wait'
+      ));
+    };
+
+    const activeJobIds = Object.values(engine.loadStore().jobs)
+      .filter(isDueRunnableActiveJob)
+      .sort((left, right) => left.createdAt.localeCompare(right.createdAt, 'en')
+        || left.jobId.localeCompare(right.jobId, 'en'))
+      .map(job => job.jobId);
+
+    for (const jobId of activeJobIds) {
+      const current = engine.loadStore().jobs[jobId];
+      if (!current || !isDueRunnableActiveJob(current)) continue;
+      const preFence = this.decideLiveReviewFence(current, current.bundle);
+      if (
+        preFence.decision.kind !== 'stale_before_fence'
+        && preFence.decision.kind !== 'corrupted_basis'
+      ) {
+        continue;
+      }
+      const candidate = this.extractCandidateFromBundle(current.bundle);
+      this.supersedeStaleReviewJob(
+        engine,
+        current,
+        preFence.liveBundle,
+        candidate,
+        preFence.decision.reason,
+        preFence.liveRegistryReadSet,
+      );
+      supersededJobIds.push(current.jobId);
+      const successorJobId = engine.loadStore().jobs[current.jobId]?.successorJobId;
+      if (successorJobId) successorJobIds.push(successorJobId);
+    }
+
+    return { supersededJobIds, successorJobIds };
   }
 
   private async reviewAndApplyWithRetries(
@@ -2162,9 +2278,13 @@ export class SkillEvolutionRuntime {
     config: SkillEvolutionEffectiveConfig,
     signal?: AbortSignal,
   ): Promise<void> {
+    // Normalize the persisted bundle so a v2/policy-v3 legacy global-catalog
+    // referencedSkills array cannot reach the Author/Verifier branches through
+    // the direct linear review seam. Specialized bundles keep pinned deps.
+    const bundle = this.normalizePersistedBundleForReReview(entry.bundle);
     try {
       const { result: reviewed, bundle: reviewedBundle } = await this.reviewAndApplyWithRetries(
-        entry.bundle,
+        bundle,
         [],
         false,
         signal,
@@ -2205,7 +2325,7 @@ export class SkillEvolutionRuntime {
       addOrUpdateOperationalFailure(
         queue,
         entry.candidate,
-        entry.bundle,
+        bundle,
         operationalError.kind,
         operationalError.message,
         operationalError.transcriptPath,
@@ -2238,9 +2358,13 @@ export class SkillEvolutionRuntime {
     config: SkillEvolutionEffectiveConfig,
     signal?: AbortSignal,
   ): Promise<void> {
+    // Normalize the persisted bundle so a v2/policy-v3 legacy global-catalog
+    // referencedSkills array cannot reach the Author/Verifier branches through
+    // the direct linear review seam. Specialized bundles keep pinned deps.
+    const bundle = this.normalizePersistedBundleForReReview(entry.bundle);
     try {
       const { result: reviewed, bundle: reviewedBundle } = await this.reviewAndApplyWithRetries(
-        entry.bundle,
+        bundle,
         [],
         false,
         signal,
@@ -2250,7 +2374,7 @@ export class SkillEvolutionRuntime {
         addOrUpdateOperationalFailure(
           queue,
           entry.candidate,
-          entry.bundle,
+          bundle,
           'branch_failure',
           'Operational review remains queued after re-review.',
           undefined,
@@ -2295,7 +2419,7 @@ export class SkillEvolutionRuntime {
       addOrUpdateOperationalFailure(
         queue,
         entry.candidate,
-        entry.bundle,
+        bundle,
         operationalError.kind,
         operationalError.message,
         operationalError.transcriptPath,
@@ -3473,6 +3597,9 @@ function validateEvidenceBundle(bundle: EvidenceBundle): void {
   if (new Set(completionRefs).size !== completionRefs.length) throw new Error('Evidence Bundle contains duplicate completion refs.');
   if (new Set(settlementRefs).size !== settlementRefs.length) throw new Error('Evidence Bundle contains duplicate settlement refs.');
   if (!Array.isArray(bundle.referencedSkills) || !Array.isArray(bundle.relatedCurrentSkills)) throw new Error('Evidence Bundle is incomplete.');
+  if (bundle.referencedSkillProvenance !== undefined && !isRuntimeOwnedReferencedSkillProvenance(bundle.referencedSkillProvenance)) {
+    throw new Error('Evidence Bundle referenced-skill provenance is malformed.');
+  }
   if (bundle.semanticObservations !== undefined) {
     if (!Array.isArray(bundle.semanticObservations) || bundle.semanticObservations.length > 12) {
       throw new Error('Evidence Bundle semantic observations exceed the bounded limit.');
@@ -3505,6 +3632,48 @@ function validateEvidenceBundle(bundle: EvidenceBundle): void {
       throw new Error('Evidence Bundle source evidence is incomplete.');
     }
   }
+}
+
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === 'string' && value.trim().length > 0;
+}
+
+function isRuntimeOwnedReferencedSkillProvenance(
+  value: unknown,
+): value is RuntimeOwnedReferencedSkillProvenance {
+  if (!value || typeof value !== 'object') return false;
+  const provenance = value as Partial<RuntimeOwnedReferencedSkillProvenance>;
+  return provenance.kind === 'runtime-owned-generated-skill-load-v1'
+    && isNonEmptyString(provenance.runtimeSessionId)
+    && isNonEmptyString(provenance.agentTurnEpisodeId)
+    && Array.isArray(provenance.referencedSkills)
+    && provenance.referencedSkills.every(skill => (
+      !!skill
+      && typeof skill === 'object'
+      && isNonEmptyString((skill as TrustedReferencedSkillIdentity).capabilityHandle)
+      && isNonEmptyString((skill as TrustedReferencedSkillIdentity).routingName)
+      && isNonEmptyString((skill as TrustedReferencedSkillIdentity).guidanceHash)
+    ));
+}
+
+function trustedReferencedSkillIdentityKey(skill: TrustedReferencedSkillIdentity): string {
+  return `${skill.capabilityHandle}\u0000${skill.routingName}\u0000${skill.guidanceHash}`;
+}
+
+function referencedSkillSnapshotIdentityKey(snapshot: ReferencedSkillSnapshot): string | undefined {
+  if (!snapshot.capabilityHandle || !snapshot.name || !snapshot.guidanceHash) return undefined;
+  return `${snapshot.capabilityHandle}\u0000${snapshot.name}\u0000${snapshot.guidanceHash}`;
+}
+
+function selectTrustedPersistedReferencedSkills(bundle: EvidenceBundle): ReferencedSkillSnapshot[] {
+  const provenance = bundle.referencedSkillProvenance;
+  if (!isRuntimeOwnedReferencedSkillProvenance(provenance)) return [];
+  const provenIdentities = new Set(provenance.referencedSkills.map(trustedReferencedSkillIdentityKey));
+  if (provenIdentities.size === 0) return [];
+  return bundle.referencedSkills.filter(snapshot => {
+    const identity = referencedSkillSnapshotIdentityKey(snapshot);
+    return !!identity && provenIdentities.has(identity);
+  });
 }
 
 function normalizeSemanticObservations(observations: readonly SemanticObservation[] | undefined): SemanticObservation[] {

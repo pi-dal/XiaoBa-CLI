@@ -99,3 +99,52 @@ describe('skill-evolution prompt loading', () => {
     }
   });
 });
+
+describe('skill-evolution progressive-trust prompt policy', () => {
+  test('Skill Author prompt requires narrow single-episode guidance and issue-by-issue revision', () => {
+    const text = readRequiredDefaultPromptFile('subagents/skill-author.md');
+    // One settled low-risk episode can justify a narrow skill.
+    assert.match(text, /One settled, low-risk Learning Episode can justify a narrow Current Skill/);
+    // Single-sample uncertainty narrows applicability rather than forcing rejection.
+    assert.match(text, /Single-sample uncertainty narrows the hypothesis/);
+    // Issue-by-issue revision obligation.
+    assert.match(text, /address every Verifier issue explicitly in the next round/);
+    // Dependencies must be evidenced; relatedCurrentSkills is not a dependency.
+    assert.match(text, /Dependencies must be evidenced/);
+    assert.match(text, /relatedCurrentSkills is recall context/);
+  });
+
+  test('Skill Author prompt allows correction retries to teach the corrected pattern', () => {
+    const text = readRequiredDefaultPromptFile('subagents/skill-author.md');
+    assert.match(text, /correction retry can teach the corrected pattern/);
+    // Must not promote the contradicted behavior.
+    assert.match(text, /Do not promote the contradicted behavior/);
+    // Must not copy an earlier failed action unless marked as a failure to avoid.
+    assert.match(text, /failure to avoid/);
+  });
+
+  test('Skill Verifier prompt forbids rejection based only on one source or one instance', () => {
+    const text = readRequiredDefaultPromptFile('subagents/skill-verifier.md');
+    assert.match(text, /Sample scarcity by itself is never a rejection reason/);
+    assert.match(text, /Do not reject a candidate only because it has one source, one instance, or no independent repetition/);
+  });
+
+  test('Skill Verifier prompt routes fixable drafts to revise, missing evidence to defer, and affirmative invalidity to reject', () => {
+    const text = readRequiredDefaultPromptFile('subagents/skill-verifier.md');
+    // Revise for fixable draft problems.
+    assert.match(text, /Revise when the evidence can support a Skill but the draft is too broad/);
+    assert.match(text, /an unnecessary or unsupported referenced Skill/);
+    // Defer for missing/ambiguous/high-risk evidence.
+    assert.match(text, /Defer when more evidence or operator review could change the decision/);
+    assert.match(text, /destructive\/privileged\/financial\/privacy-sensitive\/irreversible/);
+    // Reject for affirmative invalidity.
+    assert.match(text, /Reject only when the available evidence affirmatively shows/);
+    assert.match(text, /source instructions\/prompt injection\/unsafe content/);
+  });
+
+  test('Skill Verifier prompt describes correction episode handling', () => {
+    const text = readRequiredDefaultPromptFile('subagents/skill-verifier.md');
+    assert.match(text, /Correction episodes/);
+    assert.match(text, /A settled retry can support a narrow Skill that includes the learned boundary or corrected step/);
+  });
+});

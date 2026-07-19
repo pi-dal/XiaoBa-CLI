@@ -20,11 +20,15 @@ import type { SkillEvolutionRuntime } from './skill-evolution';
 import type {
   BoundedSourceEvidence,
   EvidenceBundle,
+  ReferencedSkillSnapshot,
   RelatedCurrentSkill,
+  RuntimeOwnedReferencedSkillProvenance,
   SkillEvidenceRef,
+  TrustedReferencedSkillIdentity,
 } from './skill-evolution';
 import type { EvidenceCapsuleStore } from './evidence-capsule';
 import { reconstructBundleFromCapsule } from './evidence-capsule';
+import type { GeneratedSkillLoadFact } from './skill-usage-ledger';
 
 // Re-export the bundle-related types that RuntimeLearning previously
 // re-exported from its tail, so external consumers can still reach them through
@@ -35,6 +39,111 @@ export type {
   RelatedCurrentSkill,
   SkillEvidenceRef,
 };
+
+/**
+ * Select referenced-skill snapshots proven by runtime-owned
+ * `GeneratedSkillLoadFact` entries tied to the same episode.
+ *
+ * Progressive Trust policy: `EvidenceBundle.referencedSkills` means actual
+ * dependencies proven by a runtime-owned Skill load fact, not untrusted
+ * semantic observations from external/capsule content or the complete runtime
+ * Skill catalog. A `GeneratedSkillLoadFact` is the smallest typed,
+ * runtime-owned dependency fact: it is recorded by the SkillTool when a
+ * generated Current Skill is actually loaded during an AgentTurn, and it
+ * carries the canonical `episodeId` correlation.
+ *
+ * Fail-closed exact-load identity: a snapshot is authorized only when a
+ * runtime-owned load fact joins the episode by BOTH `agentTurnEpisodeId` AND
+ * `runtimeSessionId`, AND the snapshot's `capabilityHandle`, `routingName`
+ * (`snapshot.name`), and `guidanceHash` ALL agree with the fact's
+ * `skill` identity. A stale load fact (e.g. an older `guidanceHash`) must not
+ * authorize the current successor snapshot — route-reuse, handle-reuse, and
+ * stale-hash reuse all fail closed. Legacy episodes without the canonical
+ * AgentTurn correlation receive no dependencies (never join by timestamp or
+ * session proximity). External/capsule episodes default to empty unless an
+ * existing authenticated runtime-owned fact matches the same episode.
+ *
+ * `relatedCurrentSkills` remains the bounded recall context for merge, append,
+ * replacement, and routing decisions and is populated separately by callers.
+ *
+ * Returns a new array (possibly empty) of snapshots drawn from `allSnapshots`.
+ */
+export function selectRuntimeOwnedReferencedSkills(
+  skillLoadFacts: readonly GeneratedSkillLoadFact[] | undefined,
+  episode: Pick<LearningEpisode, 'agentTurnEpisodeId' | 'runtimeSessionId'>,
+  allSnapshots: readonly ReferencedSkillSnapshot[],
+): ReferencedSkillSnapshot[] {
+  const provenIdentities = collectRuntimeOwnedLoadIdentities(skillLoadFacts, episode);
+  if (provenIdentities.size === 0) return [];
+  return allSnapshots.filter(snapshot =>
+    !!snapshot.capabilityHandle
+    && !!snapshot.guidanceHash
+    && !!snapshot.name
+    && provenIdentities.has(loadIdentityKeyFromSnapshot(snapshot)),
+  );
+}
+
+export function buildRuntimeOwnedReferencedSkillProvenance(
+  skillLoadFacts: readonly GeneratedSkillLoadFact[] | undefined,
+  episode: Pick<LearningEpisode, 'agentTurnEpisodeId' | 'runtimeSessionId'>,
+  referencedSkills: readonly ReferencedSkillSnapshot[],
+): RuntimeOwnedReferencedSkillProvenance | undefined {
+  const episodeId = episode.agentTurnEpisodeId;
+  const sessionId = episode.runtimeSessionId;
+  if (!episodeId || !sessionId) return undefined;
+  const provenIdentities = collectRuntimeOwnedLoadIdentities(skillLoadFacts, episode);
+  if (provenIdentities.size === 0) return undefined;
+  const identities: TrustedReferencedSkillIdentity[] = referencedSkills.flatMap(snapshot => {
+    if (!snapshot.capabilityHandle || !snapshot.guidanceHash || !snapshot.name) return [];
+    const identity = {
+      capabilityHandle: snapshot.capabilityHandle,
+      routingName: snapshot.name,
+      guidanceHash: snapshot.guidanceHash,
+    } satisfies TrustedReferencedSkillIdentity;
+    return provenIdentities.has(loadIdentityKey(identity)) ? [identity] : [];
+  });
+  if (identities.length === 0) return undefined;
+  return {
+    kind: 'runtime-owned-generated-skill-load-v1',
+    runtimeSessionId: sessionId,
+    agentTurnEpisodeId: episodeId,
+    referencedSkills: identities,
+  };
+}
+
+/**
+ * Canonical join key for a runtime-owned generated Current Skill load identity.
+ * Combines `capabilityHandle`, `routingName`, and `guidanceHash` so that any
+ * single-field drift (route reuse, handle reuse, or stale guidance) produces a
+ * different key and fails closed.
+ */
+function loadIdentityKey(skill: {
+  capabilityHandle: string;
+  routingName: string;
+  guidanceHash: string;
+}): string {
+  return `${skill.capabilityHandle}\u0000${skill.routingName}\u0000${skill.guidanceHash}`;
+}
+
+function loadIdentityKeyFromSnapshot(snapshot: ReferencedSkillSnapshot): string {
+  return `${snapshot.capabilityHandle}\u0000${snapshot.name}\u0000${snapshot.guidanceHash}`;
+}
+
+function collectRuntimeOwnedLoadIdentities(
+  skillLoadFacts: readonly GeneratedSkillLoadFact[] | undefined,
+  episode: Pick<LearningEpisode, 'agentTurnEpisodeId' | 'runtimeSessionId'>,
+): Set<string> {
+  const episodeId = episode.agentTurnEpisodeId;
+  const sessionId = episode.runtimeSessionId;
+  if (!episodeId || !sessionId) return new Set<string>();
+  const provenIdentities = new Set<string>();
+  for (const fact of skillLoadFacts ?? []) {
+    if (fact.kind !== 'generated-skill-load') continue;
+    if (fact.episodeId !== episodeId || fact.runtimeSessionId !== sessionId) continue;
+    provenIdentities.add(loadIdentityKey(fact.skill));
+  }
+  return provenIdentities;
+}
 
 /**
  * Build the fixed Evidence Bundle for one Learning Episode.
@@ -49,6 +158,7 @@ export type {
  * @param skillEvolution     The SkillEvolutionRuntime providing the current registry and referenced-skill snapshots.
  * @param capsuleStore      Optional capsule store; when present, external-origin episodes are reconstructed from their capsule.
  * @param isExternalEpisode Optional predicate marking an episode as external-origin (requires a persisted capsule).
+ * @param skillLoadFacts    Optional runtime-owned `GeneratedSkillLoadFact` entries from the SkillUsageLedger. Only facts whose `episodeId` matches the episode's `agentTurnEpisodeId` authorize a dependency. External/capsule semantic observations are never used for dependency authorization.
  */
 export function buildEpisodeEvidenceBundle(
   episode: LearningEpisode,
@@ -56,6 +166,7 @@ export function buildEpisodeEvidenceBundle(
   skillEvolution: SkillEvolutionRuntime,
   capsuleStore?: EvidenceCapsuleStore,
   isExternalEpisode?: (episodeId: string) => boolean,
+  skillLoadFacts?: readonly GeneratedSkillLoadFact[],
 ): EvidenceBundle {
   const completionEvidence: readonly SkillEvidenceRef[] = episode.completionEvidence
     .filter(evidence => evidence.kind !== 'contradiction')
@@ -81,17 +192,26 @@ export function buildEpisodeEvidenceBundle(
   );
 
   const bundleId = `v3:learning-episode:${episode.episodeId}`;
+  const allReferencedSkillSnapshots = skillEvolution.getReferencedSkillSnapshots();
+  const referencedSkills = selectRuntimeOwnedReferencedSkills(
+    skillLoadFacts,
+    episode,
+    allReferencedSkillSnapshots,
+  );
+  const referencedSkillProvenance = buildRuntimeOwnedReferencedSkillProvenance(
+    skillLoadFacts,
+    episode,
+    referencedSkills,
+  );
 
   if (capsuleStore) {
     const capsule = capsuleStore.findByBundleId(bundleId);
     if (capsule) {
-      // For external-origin evidence, reconstruct the entire bundle from the
-      // pinned capsule so Author/Verifier never see raw external detail leaked
-      // through the fallback candidate's actionPattern or solvedLoop fields.
       return reconstructBundleFromCapsule(
         capsule,
-        skillEvolution.getReferencedSkillSnapshots(),
+        referencedSkills,
         registry,
+        referencedSkillProvenance,
       );
     }
     if (!capsule && isExternalEpisode?.(episode.episodeId)) {
@@ -108,7 +228,8 @@ export function buildEpisodeEvidenceBundle(
     settlementEvidence,
     boundedContinuity: [],
     semanticObservations: episode.semanticObservations,
-    referencedSkills: skillEvolution.getReferencedSkillSnapshots(),
+    referencedSkills,
     relatedCurrentSkills,
+    referencedSkillProvenance,
   };
 }

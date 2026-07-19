@@ -43,6 +43,7 @@ import type { ExternalHistoryMode } from './distillation-heartbeat-config';
 import { LearningEpisodeStore, LearningEpisode, buildLearningEpisodeCandidate } from './learning-episode';
 import { SkillEvolutionRuntime, CapabilityTransitionKind } from './skill-evolution';
 import { SkillUsageCurator, CuratorRunResult } from './skill-usage-curator';
+import type { GeneratedSkillLoadFact } from './skill-usage-ledger';
 import { Logger } from './logger';
 import { bootstrapSemanticReassessmentOnce } from './distilled-skill-bootstrap';
 import { SemanticReassessmentManifestStore } from './semantic-reassessment';
@@ -50,6 +51,7 @@ import { cleanupBranchTranscripts } from './branch-transcript-retention';
 import { createReviewBudget, type ReviewBudget } from './review-budget';
 import { advanceJobsFairly } from './evidence-review-engine';
 import { XurlExternalSourceReader } from './xurl-session-log-source';
+import { buildXurlSubprocessEnv } from './xurl-subprocess-env';
 import {
   ExternalAdmissionCoordinator,
   type ExternalEvidencePage,
@@ -1536,6 +1538,9 @@ export class RuntimeLearning {
           sourceId,
           scope: scope.scope,
           scopePath: scope.scopePath,
+          // Least-privilege env: xurl subprocesses receive only OS essentials,
+          // never unrelated model/CatsCo secrets or parent-only XiaoBa config.
+          env: buildXurlSubprocessEnv(),
         })
         : undefined;
       adapters.push(new ExternalSessionLogSourceAdapter({
@@ -2605,6 +2610,7 @@ export class RuntimeLearning {
     try {
       const engine = this.skillEvolution.getEvidenceReviewEngine();
       if (!this.shutdownDrainRequested) {
+        this.skillEvolution.fenceStaleActiveJobsBeforeFairAdvance(this.clock());
         const fair = await advanceJobsFairly(engine, `wake-fair:${this.clock().getTime()}`, {
           maxClaims: Math.max(0, Math.floor(this.config.skillEvolutionReviewMaxCandidates)),
           maxClaimsPerJob: 1,
@@ -2723,6 +2729,7 @@ export class RuntimeLearning {
               this.skillEvolution,
               this.evidenceCapsuleStore,
               this.isEpisodeFromExternalSource.bind(this),
+              this.listSkillLoadFactsForEpisode(selected.episode),
             );
         if (!this.canAdmitReviewWork(reviewBudget)) continue;
         classCursors[selected.workClass] = taskId(selected);
@@ -4440,6 +4447,18 @@ export class RuntimeLearning {
     // review must still fail closed until replay completes those later writes.
     return this.episodeStore.load().episodes[episodeId]?.sourceFilePath
       .startsWith('external://event/') === true;
+  }
+
+  /**
+   * Return runtime-owned GeneratedSkillLoadFact entries tied to the episode's
+   * canonical AgentTurn correlation. Legacy episodes without
+   * `agentTurnEpisodeId` receive no facts — never join by timestamp or
+   * session proximity.
+   */
+  private listSkillLoadFactsForEpisode(episode: LearningEpisode): readonly GeneratedSkillLoadFact[] {
+    const episodeId = episode.agentTurnEpisodeId;
+    if (!episodeId) return [];
+    return this.curator?.listLoadFactsForEpisode(episodeId) ?? [];
   }
 
   // -----------------------------------------------------------------------

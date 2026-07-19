@@ -1456,11 +1456,11 @@ describe('V3 verified semantic Current Skills', () => {
       };
 
       const runtime = new SkillEvolutionRuntime(env.options);
-      const first = await runtime.reviewAndApply(fixtureCandidateBundle(fixtureCandidate(), 'retry-failure-detail'));
+      const first = await runtime.reviewAndApply(fixtureCandidateBundle(fixtureCandidate(), 'flashcard-retry-failure-detail'));
       assert.equal(first.queued, 'operational');
 
       const dueQueue = loadReviewQueueState(reviewQueuePath);
-      const entry = findOperationalByBundleId(dueQueue, 'retry-failure-detail');
+      const entry = findOperationalByBundleId(dueQueue, 'flashcard-retry-failure-detail');
       assert.ok(entry);
       dueQueue.operational = dueQueue.operational.map(item => item.bundleId === entry!.bundleId
         ? { ...item, nextRetryAt: new Date(0).toISOString() }
@@ -1470,7 +1470,7 @@ describe('V3 verified semantic Current Skills', () => {
       const retry = await runtime.reviewDueQueueEntries();
       assert.equal(retry.reviewed, 1);
       assert.equal(retry.operationalRetried, 1);
-      const retried = findOperationalByBundleId(loadReviewQueueState(reviewQueuePath), 'retry-failure-detail');
+      const retried = findOperationalByBundleId(loadReviewQueueState(reviewQueuePath), 'flashcard-retry-failure-detail');
       assert.ok(retried);
       assert.equal(retried!.attempts, 2);
       assert.equal(retried!.failureKind, 'branch_timeout');
@@ -1551,7 +1551,7 @@ describe('V3 verified semantic Current Skills', () => {
     }
   });
 
-  test('the default Evidence Bundle carries real source evidence and manual skill snapshots', async () => {
+  test('the default Evidence Bundle carries real source evidence without leaking the manual Skill catalog', async () => {
     const env = setup();
     try {
       const manualPath = path.join(env.root, 'skills', 'word-card-maker', 'SKILL.md');
@@ -1590,9 +1590,17 @@ describe('V3 verified semantic Current Skills', () => {
       assert.equal(bundle.settlementEvidence[0]!.ref, 'session.jsonl#13:verification:11-20');
       assert.equal(bundle.sourceEvidence?.length, 2);
       assert.match(bundle.sourceEvidence?.[0]!.content ?? '', /make a card/);
-      assert.equal(bundle.referencedSkills[0]!.name, 'word-card-maker');
-      assert.match(bundle.referencedSkills[0]!.content ?? '', /Use the card maker/);
-      assert.equal(bundle.referencedSkills[0]!.contentFingerprint?.length, 64);
+      // Progressive Trust: a Distillation Unit carries no `referenced-skill`
+      // semantic observation, so generic V3 bundle construction must not copy
+      // the manual `word-card-maker` snapshot into referencedSkills. The manual
+      // skill remains discoverable via runtime.getReferencedSkillSnapshots() and
+      // the manual-name collision check; it is simply not an evidenced
+      // dependency of this episode.
+      assert.deepEqual(bundle.referencedSkills, []);
+      assert.ok(
+        runtime.getReferencedSkillSnapshots().some(s => s.name === 'word-card-maker'),
+        'manual skill remains in the runtime catalog, just not in this bundle',
+      );
     } finally {
       env.cleanup();
     }

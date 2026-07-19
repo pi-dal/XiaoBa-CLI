@@ -32,6 +32,8 @@ import {
   type ParsedRenderedFrontmatter,
   type RenderedTimelineEvent,
 } from './xurl-rendered-timeline';
+import { buildXurlSubprocessEnv } from './xurl-subprocess-env';
+import { sanitizeProviderErrorMessageForLog } from './provider-error-log-sanitizer';
 
 // ---------------------------------------------------------------------------
 // Official xURL agents:// rendered-Timeline reader contract (ADR-0043).
@@ -638,7 +640,11 @@ class XurlOfficialRunner {
       ? requireNonEmptyText('xurl scopePath', options.scopePath)
       : undefined;
     this.cwd = options.cwd;
-    this.env = options.env;
+    // When the caller provides an explicit env (tests, operators), use it
+    // as-is. When omitted, build a least-privilege environment from
+    // process.env so xurl subprocesses never receive unrelated XiaoBa/model/
+    // CatsCo secrets through the inherited parent environment.
+    this.env = options.env ?? buildXurlSubprocessEnv();
     this.timeoutMs = normalizePositiveInteger(options.timeoutMs, DEFAULT_XURL_TIMEOUT_MS, 'xurl timeoutMs');
     this.maxOutputBytes = normalizePositiveInteger(
       options.maxOutputBytes,
@@ -1216,6 +1222,15 @@ function buildDistillationUnit(
       end: event.endOrdinal,
     },
     generatedAt: turn.timestamp,
+    externalEventProvenance: {
+      provider,
+      threadId: timeline.threadId,
+      contentHash: event.contentHash,
+      startOrdinal: event.startOrdinal,
+      endOrdinal: event.endOrdinal,
+      ...(timeline.branch ? { branchId: timeline.branch } : {}),
+      ...(timeline.revision ? { revision: timeline.revision } : {}),
+    },
   };
 }
 
@@ -1527,7 +1542,15 @@ function mapXurlProcessError(kind: XurlCommandKind, error: unknown, timeoutMs: n
     : Buffer.isBuffer(candidate?.stderr)
       ? candidate.stderr.toString('utf8')
       : '';
-  const detail = truncateLine((stderr || candidate?.message || '').trim(), 240);
+  // Route stderr through the existing provider sanitization/redaction boundary
+  // so secrets, tokens, URLs, and IPs are redacted before the error message
+  // can enter durable backfill state, audit logs, dashboard diagnostics, or
+  // user-facing reports. Reuse the existing sanitizer rather than inventing
+  // inconsistent regexes.
+  const rawDetail = (stderr || candidate?.message || '').trim();
+  const detail = rawDetail
+    ? sanitizeProviderErrorMessageForLog(rawDetail)
+    : '';
   const exitStatus = candidate?.status ?? candidate?.code ?? 'unknown';
   return new Error(`xurl ${kind} exited with status ${String(exitStatus)}${detail ? `: ${detail}` : ''}`);
 }

@@ -5,6 +5,7 @@ import {
   CompletedTurn,
   DistillationTurn,
   DistillationUnit,
+  ExternalEventProvenance,
   MAX_CONTINUITY_TURNS,
   normalizeContinuityLimit,
 } from './distillation-unit';
@@ -120,6 +121,12 @@ export interface LearningEpisode {
   unitByteRange?: { start: number; end: number };
   /** Source generatedAt timestamp from the DistillationUnit that admitted this episode. */
   unitGeneratedAt?: string;
+  /**
+   * External source event provenance; present only when the admitting
+   * DistillationUnit carried external identity (xURL). Absent for local
+   * episodes and older persisted records.
+   */
+  externalEventProvenance?: ExternalEventProvenance;
 }
 
 export interface LearningEpisodeExtractionResult {
@@ -151,6 +158,16 @@ export function buildLearningEpisodeCandidate(
   const task = deriveCandidateTaskSummary(episode, toolNames, evidenceSummary);
   const sourceByteRange = sourceUnit?.byteRange ?? episode.unitByteRange ?? { start: 0, end: 0 };
   const generatedAt = sourceUnit?.generatedAt ?? episode.unitGeneratedAt ?? episode.settlementDeadline;
+  const external = episode.externalEventProvenance;
+  const externalFields = external
+    ? {
+        provider: external.provider,
+        threadId: external.threadId,
+        contentHash: external.contentHash,
+        startOrdinal: external.startOrdinal,
+        endOrdinal: external.endOrdinal,
+      }
+    : {};
 
   return {
     schemaVersion: 1,
@@ -179,6 +196,7 @@ export function buildLearningEpisodeCandidate(
       turn: item.turn,
       role: index === 0 ? 'problem-action' as const : 'verification' as const,
       unitByteRange: sourceByteRange,
+      ...externalFields,
     })),
     generatedAt,
     sourceUnit: {
@@ -404,6 +422,7 @@ export function extractLearningEpisodes(
       status: signal ? 'contradicted' : 'settling',
       unitByteRange: unit.byteRange,
       unitGeneratedAt: unit.generatedAt,
+      ...(unit.externalEventProvenance && { externalEventProvenance: unit.externalEventProvenance }),
     };
     // A retry points back to the contradicted delivery, never to itself.
     if (predecessor?.status === 'contradicted') {
@@ -456,6 +475,7 @@ export function extractLearningEpisodes(
         status: 'settling',
         unitByteRange: unit.byteRange,
         unitGeneratedAt: unit.generatedAt,
+        ...(unit.externalEventProvenance && { externalEventProvenance: unit.externalEventProvenance }),
       });
     }
   }

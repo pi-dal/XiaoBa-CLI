@@ -14,6 +14,8 @@
 
 import { execFileSync } from 'node:child_process';
 
+import { buildXurlSubprocessEnv } from './xurl-subprocess-env';
+
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
@@ -75,12 +77,15 @@ export function getXurlVersion(
 ): XurlVersionDiagnostic {
   const timeoutMs = options.timeoutMs ?? 5_000;
   const obtainedAt = new Date().toISOString();
+  // Least-privilege: when the caller does not provide an explicit env, build
+  // one from process.env that excludes unrelated secrets.
+  const env = options.env ?? buildXurlSubprocessEnv();
   try {
     const stdout = execFileSync(command, ['--version'], {
       encoding: 'utf8',
       timeout: timeoutMs,
       stdio: ['ignore', 'pipe', 'pipe'],
-      env: options.env,
+      env,
     }) as string;
     return {
       rawVersion: stdout.trim(),

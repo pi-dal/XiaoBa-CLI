@@ -20,6 +20,9 @@ export interface RuntimeEnvironmentOptions {
   env?: NodeJS.ProcessEnv;
   appRoot?: string;
   runtimeRoot?: string;
+  /** When true, the runtime is a packaged production build. Automatic xurl
+   *  discovery is bundled-only; an explicit command override is preserved
+   *  without probing or executing an unrelated binary from system PATH. */
   isPackaged?: boolean;
   includeSystemFallback?: boolean;
   probeVersion?: boolean;
@@ -76,12 +79,23 @@ export function resolveRuntimeEnvironment(options: RuntimeEnvironmentOptions = {
   const runtimeRoot = resolveRuntimeRoot(env, options);
   const includeSystemFallback = options.includeSystemFallback !== false;
   const probeVersion = options.probeVersion !== false;
+  const isPackaged = options.isPackaged === true;
+
+  // Production fail-closed: when packaged, xurl must prefer the pinned bundled
+  // binary and must not fall back to system PATH. This prevents a tampered or
+  // untrusted system xurl from becoming the learning boundary in production.
+  // An explicit XIAOBA_EXTERNAL_SESSION_LOG_XURL_COMMAND is consumed directly
+  // by the external-source runtime below. It must not re-enable PATH discovery:
+  // doing so could execute a different PATH binary during the version probe
+  // before the explicit command is used. Development keeps the existing
+  // fallback behavior.
+  const xurlIncludeSystemFallback = isPackaged ? false : includeSystemFallback;
 
   const binaries: Record<RuntimeBinaryName, RuntimeBinary> = {
     node: resolveBinary('node', env, runtimeRoot, includeSystemFallback, probeVersion),
     python: resolveBinary('python', env, runtimeRoot, includeSystemFallback, probeVersion),
     git: resolveBinary('git', env, runtimeRoot, includeSystemFallback, probeVersion),
-    xurl: resolveBinary('xurl', env, runtimeRoot, includeSystemFallback, probeVersion),
+    xurl: resolveBinary('xurl', env, runtimeRoot, xurlIncludeSystemFallback, probeVersion),
   };
 
   if (!env.XIAOBA_EXTERNAL_SESSION_LOG_XURL_COMMAND?.trim() && binaries.xurl.executable) {

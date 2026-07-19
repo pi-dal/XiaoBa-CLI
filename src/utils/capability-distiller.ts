@@ -51,6 +51,36 @@ export interface CapabilityProvenanceRef {
   role: 'problem-action' | 'verification';
   /** Byte range of the Distillation Unit that sourced this evidence. */
   unitByteRange: { start: number; end: number };
+  /**
+   * External source provider; present only for external/xurl provenance.
+   * Absent for local/session-log provenance and older persisted records.
+   */
+  provider?: string;
+  /**
+   * External thread / conversation identity; present only for external/xurl
+   * provenance. Absent for local/session-log provenance and older records.
+   */
+  threadId?: string;
+  /**
+   * Immutable content fingerprint from the external source. Preserved exactly
+   * as received so it remains a verification identifier. Absent for
+   * local/session-log provenance and older persisted records.
+   */
+  contentHash?: string;
+  /**
+   * Inclusive start ordinal of the canonical external event. Present only
+   * for external/xurl provenance. When present, renderers should use this
+   * instead of {@link unitByteRange}.start for the ordinal range label.
+   * Absent for local/session-log provenance and older persisted records.
+   */
+  startOrdinal?: number;
+  /**
+   * Inclusive end ordinal of the canonical external event. Present only
+   * for external/xurl provenance. When present, renderers should use this
+   * instead of {@link unitByteRange}.end for the ordinal range label.
+   * Absent for local/session-log provenance and older persisted records.
+   */
+  endOrdinal?: number;
 }
 
 export interface SolvedLoopEvidence {
@@ -318,18 +348,30 @@ function buildProvenance(
   problemTurn: CompletedTurn,
   verificationTurn: CompletedTurn,
 ): CapabilityProvenanceRef[] {
+  const external = unit.externalEventProvenance;
+  const externalFields = external
+    ? {
+        provider: external.provider,
+        threadId: external.threadId,
+        contentHash: external.contentHash,
+        startOrdinal: external.startOrdinal,
+        endOrdinal: external.endOrdinal,
+      }
+    : {};
   return [
     {
       filePath: turnSourceFilePath(problemTurn, unit.filePath),
       turn: problemTurn.turn,
       role: 'problem-action',
       unitByteRange: turnSourceByteRange(problemTurn, unit.byteRange),
+      ...externalFields,
     },
     {
       filePath: turnSourceFilePath(verificationTurn, unit.filePath),
       turn: verificationTurn.turn,
       role: 'verification',
       unitByteRange: turnSourceByteRange(verificationTurn, unit.byteRange),
+      ...externalFields,
     },
   ];
 }
