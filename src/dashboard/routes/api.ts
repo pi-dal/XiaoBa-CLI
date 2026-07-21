@@ -27,6 +27,7 @@ import {
 import {
   getDashboardSettings,
   isSensitiveEnvKey,
+  type DashboardModelConfig,
   updateDashboardSettings,
   writeDashboardEnvUpdates,
 } from '../settings';
@@ -51,11 +52,16 @@ import { inferCatsUploadType, uploadCatsLocalFile } from '../../catscompany/uplo
 import { createCatsCoLocalConfigService } from '../../catscompany/local-config';
 import { catalogRuntimeMatchesModelId, createBotDefinitionSyncService } from '../../bot-definition/service';
 import { prepareBoundBotDefinition } from '../../bot-definition/activation';
-import { resolveActiveBotLLMConfig } from '../../bot-definition/llm-config-resolver';
+import {
+  customModelDefinitionToConfig,
+  modelRuntimeToConfig,
+  resolveActiveBotLLMConfig,
+} from '../../bot-definition/llm-config-resolver';
 import {
   BOT_CATALOG_MODEL_RUNTIME_SCHEMA,
   type BotCatalogModelRuntime,
   type BotDefinitionSyncResult,
+  type CustomBotModelDefinition,
 } from '../../bot-definition/types';
 import { resolveCatsCoRuntimeConfig } from '../../catscompany/runtime-config';
 import { consumeLocalFileGrant, validateLocalFileGrant } from '../local-file-grants';
@@ -1184,12 +1190,23 @@ function dashboardSecretValue(raw: unknown, current: string | undefined, id: str
   throw httpError(`${id} must keep or replace a non-empty value`, 400);
 }
 
-/** Writes an explicit user model edit straight to the current bot Definition. */
-function updateBoundBotModelFromDashboardSettings(body: any): Record<string, unknown> | undefined {
+/** Saves the custom profile independently and only selects it when activation is explicit. */
+function updateBoundBotCustomModelFromDashboardSettings(
+  body: any,
+  options: { publishActive: boolean },
+): Record<string, unknown> | undefined {
   const botId = currentBoundBotId();
   if (!botId || !hasDashboardModelUpdates(body)) return undefined;
+  if (body?.modelProfileSource !== undefined && body.modelProfileSource !== 'custom') {
+    throw httpError('modelProfileSource must be custom for dashboard model settings', 400);
+  }
   const settings = body.settings as Record<string, unknown>;
-  const current = getModelConfigReadonly();
+  const service = createBotDefinitionSyncService({ runtimeRoot: runtimeDataRoot() });
+  const savedCustom = service.readCustomModelProfile(botId);
+  const active = resolveActiveBotLLMConfig({ runtimeRoot: runtimeDataRoot() });
+  const current: Partial<DashboardModelConfig> = savedCustom
+    ? customModelDefinitionToConfig(savedCustom)
+    : active?.source === 'custom_definition' ? active.config : {};
   const text = (id: string, fallback: unknown): string => (
     Object.prototype.hasOwnProperty.call(settings, id) ? String(settings[id] || '').trim() : String(fallback || '').trim()
   );
@@ -1208,8 +1225,7 @@ function updateBoundBotModelFromDashboardSettings(body: any): Record<string, unk
   if (!provider || !apiBase || !model || !apiKey || !contextWindowTokens) {
     throw httpError('A bound bot requires provider, API base, model, API key, and context window.', 400);
   }
-  const service = createBotDefinitionSyncService({ runtimeRoot: runtimeDataRoot() });
-  return toBotDefinitionSyncPayload(service.publish(botId, {
+  const customModel: CustomBotModelDefinition = {
     kind: 'custom',
     protocol: provider === 'anthropic'
       ? 'anthropic'
@@ -1221,7 +1237,11 @@ function updateBoundBotModelFromDashboardSettings(body: any): Record<string, unk
     ...(current.maxTokens ? { maxTokens: current.maxTokens } : {}),
     ...(current.temperature !== undefined ? { temperature: current.temperature } : {}),
     ...(reasoningEffort ? { reasoningEffort } : {}),
-  }));
+  };
+  service.storeCustomModelProfile(botId, customModel);
+  return options.publishActive
+    ? toBotDefinitionSyncPayload(service.publish(botId, customModel))
+    : undefined;
 }
 
 function publishCurrentBotDefinition(): BotDefinitionSyncResult | undefined {
@@ -2262,12 +2282,21 @@ export function createApiRouter(
   router.get('/settings', (_req, res) => {
     try {
       const activeBotConfig = resolveActiveBotLLMConfig({ runtimeRoot: runtimeDataRoot() });
+      const definitionService = activeBotConfig
+        ? createBotDefinitionSyncService({ runtimeRoot: runtimeDataRoot() })
+        : undefined;
+      const savedCustom = activeBotConfig && definitionService?.readCustomModelProfile(activeBotConfig.botId);
+      const savedRelay = activeBotConfig && definitionService?.readCatalogRuntime(activeBotConfig.botId);
       res.json(getDashboardSettings({
         runtimeRoot: runtimeDataRoot(),
         ...(activeBotConfig
           ? {
             modelConfig: activeBotConfig.config,
             modelConfigSource: activeBotConfig.source === 'custom_definition' ? 'custom' as const : 'relay' as const,
+            customModelConfig: savedCustom
+              ? customModelDefinitionToConfig(savedCustom)
+              : activeBotConfig.source === 'custom_definition' ? activeBotConfig.config : undefined,
+            relayModelConfig: savedRelay ? modelRuntimeToConfig(savedRelay) : undefined,
           }
           : { effectiveModelConfig: getModelConfigReadonly() }),
       }));
@@ -2282,10 +2311,11 @@ export function createApiRouter(
       const previousSource = storedModelSource();
       const boundBot = currentBoundBotId();
       const changedModelSettings = hasDashboardModelUpdates(req.body);
+      const publishBoundCustom = req.body?.activateConnector !== false;
       // Bound bots never write a second model source to .env. Non-model
       // dashboard settings keep their existing machine-local behavior.
       const botDefinitionSync = boundBot
-        ? updateBoundBotModelFromDashboardSettings(req.body)
+        ? updateBoundBotCustomModelFromDashboardSettings(req.body, { publishActive: publishBoundCustom })
         : undefined;
       const result = updateDashboardSettings(
         boundBot ? withoutDashboardModelUpdates(req.body) : req.body,
@@ -2297,14 +2327,22 @@ export function createApiRouter(
       const legacyDefinitionSync = changedModelSettings && !boundBot
         ? publishCurrentBotDefinitionPayload()
         : undefined;
-      const restartInfo = req.body?.restartConnector === true && changedModelSettings
-        ? activateCatsCompanyConnector(serviceManager)
+      const activateConnector = req.body?.activateConnector === true;
+      const restartConnector = req.body?.restartConnector === true;
+      const restartInfo = changedModelSettings
+        && (restartConnector || activateConnector)
+        ? activateCatsCompanyConnector(serviceManager, {
+          startIfStopped: activateConnector,
+        })
         : { wasRunning: false, restartRequested: false, startRequested: false, startBlocked: false };
       res.json({
         ...result,
         botDefinitionSync: botDefinitionSync ?? legacyDefinitionSync,
         connectorRestarted: restartInfo.restartRequested,
+        connectorStarted: restartInfo.startRequested,
+        connectorStartBlocked: restartInfo.startBlocked,
         restartError: restartInfo.restartError ? sanitizeCatsErrorMessage(restartInfo.restartError) : undefined,
+        startError: restartInfo.startError ? sanitizeCatsErrorMessage(restartInfo.startError) : undefined,
       });
     } catch (e: any) {
       res.status(400).json({ error: e.message });
@@ -2404,9 +2442,22 @@ export function createApiRouter(
   router.post('/model-source/custom/apply', (req, res) => {
     try {
       const activeBotConfig = resolveActiveBotLLMConfig({ runtimeRoot: runtimeDataRoot() });
-      if (activeBotConfig) {
-        if (activeBotConfig.source !== 'custom_definition') {
+      const botId = currentBoundBotId();
+      if (botId) {
+        const definitionService = createBotDefinitionSyncService({ runtimeRoot: runtimeDataRoot() });
+        const savedCustom = definitionService.readCustomModelProfile(botId);
+        const customConfig = activeBotConfig?.source === 'custom_definition'
+          ? activeBotConfig.config
+          : savedCustom ? customModelDefinitionToConfig(savedCustom) : undefined;
+        if (!customConfig) {
           throw httpError('Set custom model fields in Settings before selecting the custom source.', 409);
+        }
+        let botDefinitionSync: Record<string, unknown> | undefined;
+        if (activeBotConfig?.source !== 'custom_definition') {
+          if (!savedCustom) {
+            throw httpError('Set custom model fields in Settings before selecting the custom source.', 409);
+          }
+          botDefinitionSync = toBotDefinitionSyncPayload(definitionService.publish(botId, savedCustom));
         }
         const activation = activateCatsCompanyConnector(serviceManager, {
           startIfStopped: req.body?.activateConnector === true || req.body?.startConnector === true,
@@ -2414,17 +2465,18 @@ export function createApiRouter(
         return res.json({
           ok: true,
           source: 'custom',
-          provider: activeBotConfig.config.provider,
-          apiBase: sanitizePublicUrl(activeBotConfig.config.apiUrl),
-          model: activeBotConfig.config.model,
-          contextWindowTokens: activeBotConfig.config.contextWindowTokens,
-          contextLabel: activeBotConfig.config.contextWindowTokens
-            ? formatContextWindowTokens(activeBotConfig.config.contextWindowTokens)
+          provider: customConfig.provider,
+          apiBase: sanitizePublicUrl(customConfig.apiUrl),
+          model: customConfig.model,
+          contextWindowTokens: customConfig.contextWindowTokens,
+          contextLabel: customConfig.contextWindowTokens
+            ? formatContextWindowTokens(customConfig.contextWindowTokens)
             : undefined,
-          reasoningEffort: activeBotConfig.config.reasoningEffort ?? 'default',
-          openaiApiMode: activeBotConfig.config.openaiApiMode ?? 'chat_completions',
+          reasoningEffort: customConfig.reasoningEffort ?? 'default',
+          openaiApiMode: customConfig.openaiApiMode ?? 'chat_completions',
           updated: [],
           cleared: [],
+          botDefinitionSync,
           restartRequired: activation.wasRunning && !activation.restartRequested,
           connectorRestarted: activation.restartRequested,
           connectorStarted: activation.startRequested,
@@ -2978,6 +3030,45 @@ export function createApiRouter(
     } catch (e: any) {
       const payload = catsErrorResponse(e);
       res.status(payload.status).json(payload.body);
+    }
+  });
+
+  router.post('/cats/connector/start', async (_req, res) => {
+    try {
+      const botId = currentBoundBotId();
+      if (!botId) {
+        return res.status(409).json({ error: 'No CatsCo bot is bound on this device' });
+      }
+      const preparedBot = await prepareBoundBotDefinition({
+        runtimeRoot: runtimeDataRoot(),
+        botId,
+      });
+      const result = await startCatsCompanyConnectorIfReady(serviceManager);
+      if (!result.service) {
+        return res.status(409).json({ error: 'CatsCompany connector service is unavailable' });
+      }
+      if (result.preflight?.status === 'blocked') {
+        return res.status(400).json({
+          error: 'CatsCo connector preflight blocked',
+          preflight: {
+            status: result.preflight.status,
+            blockingChecks: result.preflight.blockingChecks,
+            warningChecks: result.preflight.warningChecks,
+          },
+        });
+      }
+      return res.json({
+        ok: true,
+        botUid: botId,
+        service: result.service,
+        preflight: result.preflight,
+        connectorStarted: result.connectorStarted,
+        connectorAlreadyRunning: result.service.status === 'running' && !result.connectorStarted,
+        botDefinitionSync: toBotDefinitionSyncPayload(preparedBot?.sync),
+      });
+    } catch (e: any) {
+      const payload = catsErrorResponse(e);
+      return res.status(payload.status).json(payload.body);
     }
   });
 
