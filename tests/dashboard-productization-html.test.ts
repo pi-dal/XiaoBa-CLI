@@ -7,6 +7,40 @@ import vm from 'node:vm';
 const dashboardHtml = readFileSync(join(process.cwd(), 'dashboard/index.html'), 'utf-8');
 const servicesPageHtml = dashboardHtml.match(/<div class="page" id="page-services">[\s\S]*?<div class="page" id="page-companion">/)?.[0] || '';
 
+test('Branch page follows the approved per-branch model layout', () => {
+  const branchPageHtml = dashboardHtml.match(/<div class="page" id="page-branches">[\s\S]*?<div class="page" id="page-prompts">/)?.[0] || '';
+  assert.match(dashboardHtml, /data-page="branches"/);
+  assert.match(dashboardHtml, /<span>Branch<\/span>/);
+  assert.match(branchPageHtml, /Memory Search/);
+  assert.match(branchPageHtml, /id="branch-workbench"/);
+  assert.match(dashboardHtml, /branch-model-grid/);
+  assert.match(dashboardHtml, /renderBranchCustomCard\(custom,customActive\)/);
+  assert.match(dashboardHtml, /renderBranchInheritCard\(primary,source==='inherit'\)/);
+  assert.match(
+    dashboardHtml,
+    /\[renderBranchCustomCard\(custom,customActive\),renderBranchInheritCard\(primary,source==='inherit'\)\]\.concat/,
+    'custom stays first and inherit is presented before the CatsCo catalog',
+  );
+  assert.match(dashboardHtml, /renderBranchCatalogCard/);
+  assert.match(dashboardHtml, /data-model-id/);
+  assert.match(dashboardHtml, /decodeURIComponent\(this\.dataset\.modelId\)/);
+  assert.doesNotMatch(dashboardHtml, /onclick="applyBranchCatalogModel\('\+escapeHtml\(model\.id\)/);
+  assert.match(dashboardHtml, /branch-custom-panel/);
+  assert.match(dashboardHtml, /let branchCustomDraft = null/);
+  assert.match(dashboardHtml, /function updateBranchCustomDraft\(\)/);
+  assert.match(dashboardHtml, /if\(path\.endsWith\('\/enabled'\)\)renderBranchPage\(\)/);
+  assert.doesNotMatch(dashboardHtml, /function toggleBranchCustomPanel\(\)\{branchCustomOpen=!branchCustomOpen;renderBranchPage\(\);\}/);
+  assert.doesNotMatch(dashboardHtml, /function renderPromptBranchAgentControls/);
+  assert.match(dashboardHtml, /测试 Tool Calling/);
+  assert.match(dashboardHtml, /Memory Branch 自定义模型必须支持 Tool Calling，否则无法执行记忆检索/);
+  assert.match(dashboardHtml, /function applyBranchInheritModel\(\)/);
+  assert.match(dashboardHtml, /\/api\/branch-agents\/memory\/model\/inherit/);
+  assert.match(dashboardHtml, /\/api\/branch-agents\/memory\/model\/custom/);
+  assert.match(dashboardHtml, /\/api\/branch-agents\/memory\/model\/catalog\/apply/);
+  assert.doesNotMatch(dashboardHtml, /清除已保存的访问凭证，并恢复跟随主模型/);
+  assert.doesNotMatch(branchPageHtml, /Memory Branch/);
+});
+
 test('Agent Hub keeps connector controls and third-party model config without duplicate runtime panels', () => {
   assert.match(servicesPageHtml, /Agent Hub/);
   assert.match(servicesPageHtml, /运行、连接与设置/);
@@ -155,6 +189,8 @@ test('CatsCo Chat page is driven by readiness state instead of loose controls', 
   assert.match(dashboardHtml, /if\(!connected\)\{\s*list\.classList\.remove\('compact'\);\s*list\.innerHTML='';\s*return;\s*\}/);
   assert.match(dashboardHtml, /diagnostics\.style\.display=connected\?'block':'none'/);
   assert.match(dashboardHtml, /function renderCatsRelayModelPanel\(\)/);
+  assert.match(dashboardHtml, /云端当前覆盖/);
+  assert.match(dashboardHtml, /cloudModelOverride/);
   assert.match(dashboardHtml, /function runCatsNextAction\(\)/);
   assert.match(dashboardHtml, /先完成模型来源/);
   assert.match(dashboardHtml, /启动模型/);
@@ -285,11 +321,38 @@ test('custom model save refreshes simplified state before Chat remains locked', 
   );
   assert.match(
     dashboardHtml,
-    /const requestPayload=\{\.\.\.payload,modelProfileSource:'custom',activateConnector:!auto\}/,
+    /const requestPayload=\{\.\.\.payload,modelProfileSource:'custom',activateConnector:true\}/,
   );
-  assert.match(dashboardHtml, /已自动保存，等待启用。/);
+  assert.match(dashboardHtml, /已自动保存为当前自定义配置。/);
   assert.match(dashboardHtml, /if\(auto\)await fetchDashboardSettings\(\)/);
+  assert.match(dashboardHtml, /if\(!activationError\)customModelAutoSaveLastSignature=signature/);
+  assert.match(dashboardHtml, /setModelSourceStatus\(appliedMessage,activationError\?'error':'success'\)/);
   assert.doesNotMatch(dashboardHtml, /restartConnector:!auto/);
+});
+
+test('custom model activation failures remain retryable and visible', () => {
+  const functionSource = dashboardHtml.match(
+    /function customModelActivationError\(result\)\{[\s\S]*?\n    \}/,
+  )?.[0];
+  assert.ok(functionSource);
+
+  const activationError = vm.runInNewContext(
+    `${functionSource}; customModelActivationError`,
+  ) as (result: Record<string, unknown>) => string;
+
+  assert.match(
+    activationError({ connectorStartBlocked: true }),
+    /connector 启动检查未通过/,
+  );
+  assert.match(
+    activationError({ restartError: 'restart failed' }),
+    /connector 激活失败：restart failed/,
+  );
+  assert.match(
+    activationError({ startError: 'start failed' }),
+    /connector 激活失败：start failed/,
+  );
+  assert.equal(activationError({ connectorRestarted: true }), '');
 });
 
 test('CatsCo Chat setup refreshes readiness before unlocking the composer', () => {

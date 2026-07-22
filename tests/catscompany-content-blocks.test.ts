@@ -651,29 +651,28 @@ describe('CatsCo content blocks', () => {
 
   test('keeps CatsCo image block metadata on the stable local cache path', async () => {
     const bot = Object.create(CatsCompanyBot.prototype) as any;
-    const originalModel = process.env.GAUZ_LLM_MODEL;
-    const originalApiBase = process.env.GAUZ_LLM_API_BASE;
     const testRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'catsco-image-ref-'));
     const localPath = path.join(testRoot, 'tmp', 'downloads', 'secret-image.png');
 
     try {
-      process.env.GAUZ_LLM_MODEL = 'gpt-4o';
-      process.env.GAUZ_LLM_API_BASE = 'https://api.openai.com/v1';
       fs.mkdirSync(path.dirname(localPath), { recursive: true });
       fs.writeFileSync(
         localPath,
         Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=', 'base64'),
       );
 
-      const blocks = await bot.buildMultimodalMessage('看看这张图', [{
-        fileName: 'secret-image.png',
-        localPath,
-        type: 'image',
-        receivedAt: Date.now(),
-        localFileGrant: {
-          attachmentRef: 'catsco_attachment:image-ref',
-        },
-      }]);
+      const blocks = await withPatchedModel(
+        { model: 'gpt-4o', apiUrl: 'https://api.openai.com/v1', provider: 'openai' },
+        () => bot.buildMultimodalMessage('看看这张图', [{
+          fileName: 'secret-image.png',
+          localPath,
+          type: 'image',
+          receivedAt: Date.now(),
+          localFileGrant: {
+            attachmentRef: 'catsco_attachment:image-ref',
+          },
+        }]),
+      );
 
       const imageBlock = blocks.find((block: any) => block.type === 'image') as any;
       assert.ok(imageBlock);
@@ -681,16 +680,6 @@ describe('CatsCo content blocks', () => {
       assert.ok(blocks.some((block: any) => block.type === 'text' && String(block.text).includes(localPath)));
       assert.doesNotMatch(JSON.stringify(blocks), /catsco_attachment:image-ref/);
     } finally {
-      if (originalModel === undefined) {
-        delete process.env.GAUZ_LLM_MODEL;
-      } else {
-        process.env.GAUZ_LLM_MODEL = originalModel;
-      }
-      if (originalApiBase === undefined) {
-        delete process.env.GAUZ_LLM_API_BASE;
-      } else {
-        process.env.GAUZ_LLM_API_BASE = originalApiBase;
-      }
       fs.rmSync(testRoot, { recursive: true, force: true });
     }
   });

@@ -39,10 +39,16 @@ import {
   withSyntheticObservationTiming,
 } from './synthetic-observation';
 import { MemorySidecarBranchHandle, startMemorySidecarBranch } from './sidecar-memory-branch';
-import { isBranchAgentsEnabled } from './branch-agent-settings';
+
+const EMPTY_FINAL_RESPONSE_MESSAGE = '模型本轮未返回有效内容。请重新发送上一条消息；若仍失败，请切换模型或稍后再试。';
 
 export interface AgentTurnServices {
   aiService: AIService;
+  memoryBranch?: {
+    enabled: boolean;
+    modelSource: 'inherit' | 'catalog' | 'custom';
+    aiService: AIService;
+  };
   toolManager: ToolManager;
   skillManager: SkillManager;
 }
@@ -126,7 +132,7 @@ export class AgentTurnController {
     const turnNumber = ++this.turnSequence;
     const episodeId = this.createEpisodeId(turnNumber);
     const previousCarryoverMemoryBranch = this.memoryBranchCarryover;
-    const branchAgentsEnabled = isBranchAgentsEnabled();
+    const branchAgentsEnabled = this.isMemoryBranchEnabled();
     const carryoverMemoryBranch = branchAgentsEnabled ? previousCarryoverMemoryBranch : null;
     this.memoryBranchCarryover = null;
     if (!branchAgentsEnabled) {
@@ -236,7 +242,7 @@ export class AgentTurnController {
     }
 
     return {
-      text: finalResponseVisible ? (result.response || '[无回复]') : '',
+      text: finalResponseVisible ? (result.response || EMPTY_FINAL_RESPONSE_MESSAGE) : '',
       visibleToUser: finalResponseVisible,
       newMessages: result.newMessages,
       messages: nextMessages,
@@ -323,13 +329,11 @@ export class AgentTurnController {
     messages: Message[];
     abortSignal?: AbortSignal;
   }): MemoryBranchSlot | null {
-    if (!isBranchAgentsEnabled()) {
+    if (!this.isMemoryBranchEnabled()) {
       return null;
     }
-    if (process.env.XIAOBA_MEMORY_SIDECAR_ENABLED === 'false') {
-      return null;
-    }
-    if (!(this.options.services.aiService instanceof AIService)) {
+    const memoryBranchAiService = this.options.services.memoryBranch?.aiService ?? this.options.services.aiService;
+    if (!(memoryBranchAiService instanceof AIService) || !memoryBranchAiService.isToolCallingSupported()) {
       return null;
     }
     const queue = new InMemorySyntheticObservationQueue();
@@ -420,10 +424,14 @@ export class AgentTurnController {
       recentMessages: options.messages,
       workingDirectory: this.options.getCurrentDirectory(),
       branchLogRoot: this.options.branchLogRoot,
-      aiService: this.options.services.aiService,
+      aiService: this.options.services.memoryBranch?.aiService ?? this.options.services.aiService,
       queue: options.queue,
       signal: options.abortSignal,
     });
+  }
+
+  private isMemoryBranchEnabled(): boolean {
+    return this.options.services.memoryBranch?.enabled ?? true;
   }
 
   private withMemoryBranchObservationMetadata(
