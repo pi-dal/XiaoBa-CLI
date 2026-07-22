@@ -151,7 +151,6 @@ function classifySameClassFinding(
   const sameCits = sameCitations.get(finding.findingId) ?? [];
   const sameIsHighSignal = isHighSignal(finding);
   const sameLaneLabel = sameDossier.lane;
-  const otherLaneLabel = otherDossier.lane;
 
   let regionMismatchPeer: TypedFinding | undefined;
   for (const other of otherDossier.findings) {

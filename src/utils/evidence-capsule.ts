@@ -945,10 +945,6 @@ function reconstructExternalSolvedLoop(
   };
 }
 
-function sha256(value: string): string {
-  return crypto.createHash('sha256').update(value).digest('hex');
-}
-
 function redactSourceReference(value: string): string {
   return truncateUtf8(redactExternalEvidenceContent(value), MAX_EVIDENCE_CAPSULE_REFERENCE_BYTES);
 }
@@ -979,7 +975,7 @@ function computeCapsuleFingerprint(
   completion: readonly EvidenceCapsuleEvidence[],
   settlement: readonly EvidenceCapsuleEvidence[],
 ): string {
-  return sha256(
+  return hash(
     JSON.stringify({
       completion: completion.map(e => ({ ref: e.ref, content: e.content, role: e.role })),
       settlement: settlement.map(e => ({ ref: e.ref, content: e.content, role: e.role })),
@@ -993,12 +989,4 @@ function redactSemanticObservation(observation: SemanticObservation): SemanticOb
     value: redactExternalEvidenceContent(observation.value),
     sourceRefs: observation.sourceRefs?.map(ref => redactExternalEvidenceContent(ref)),
   };
-}
-
-/** Export store helpers for constructor injection. */
-export function defaultEvidenceCapsuleAtomicWrite(filePath: string, state: EvidenceCapsuleStoreState): void {
-  fs.mkdirSync(path.dirname(filePath), { recursive: true });
-  const tmp = `${filePath}.${process.pid}.${Date.now()}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(state, null, 2), { encoding: 'utf8', mode: 0o600 });
-  fs.renameSync(tmp, filePath);
 }

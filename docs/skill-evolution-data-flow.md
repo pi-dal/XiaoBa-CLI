@@ -57,22 +57,13 @@ The Evidence Review Job store (`evidence-review-jobs.json`) is the single
 durable owner of review retry/defer state after the Round 9 consolidation.
 
 1. **EvidenceReviewJob** (`evidence-review-jobs.json`): the durable graph owner.
-   Jobs carry `disposition: 'deferred'` with a `deferState` bag capturing the
-   three re-eligibility triggers (reviewer/policy version, Registry read-set,
-   and a freshly rebuilt bundle hash). Operational failures
-   live directly on the failed Review Quantum: `retry_wait`, attempts, current
-   delay, failure metadata, and next retry time. The engine applies fair
-   work-class rotation through the sole execution path.
-
-2. **One-time migration**: existing `review-queue.json` files are imported into
-   the job store by `importLegacyReviewQueue` on first access. After
-successful import the legacy file is atomically renamed to
-`review-queue.json.migrated`. Re-running after a crash is a no-op:
-   the durable receipt makes a replay archive-only, while dual-written Jobs
-   are hydrated in place during the first import. Invalid input is quarantined
-   behind a persistent corruption latch and stops review startup rather than
-   being mistaken for an empty queue. The legacy
-   `skill-evolution-review-queue.ts` module has been deleted.
+   Jobs carry `disposition: 'deferred'` with a `deferState` bag recording the
+   reviewer version, reason, and defer time. The immutable Review Basis owns
+   the Registry read-set and evidence bundle hash used for re-eligibility.
+   Operational failures live directly on the failed Review Quantum:
+   `retry_wait`, attempts, current delay, failure metadata, and next retry
+   time. The engine applies fair work-class rotation through the sole
+   execution path.
 
 See [Progressive Trust for Skill Evolution](./skill-evolution-progressive-trust.md)
 for the acceptance policy that governs Author/Verifier decisions inside these

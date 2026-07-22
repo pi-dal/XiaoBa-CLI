@@ -8,8 +8,8 @@ export interface ReviewBudgetConfig {
 export interface ReviewBudget {
   readonly deadlineAt: number;
   readonly candidates: number;
-  canStart(serializedInput?: unknown): boolean;
-  admit(serializedInput?: unknown): boolean;
+  canStart(): boolean;
+  admit(): boolean;
 }
 
 /**
@@ -22,15 +22,15 @@ export function createReviewBudget(config: ReviewBudgetConfig): ReviewBudget {
   const deadlineAt = now() + Math.max(1, Math.floor(config.deadlineMs));
   const maxCandidates = Math.max(0, Math.floor(config.maxCandidates));
   let candidates = 0;
-  const canStart = (_input?: unknown): boolean => (
+  const canStart = (): boolean => (
     now() < deadlineAt && candidates < maxCandidates
   );
   return {
     deadlineAt,
     get candidates() { return candidates; },
     canStart,
-    admit(input?: unknown): boolean {
-      if (!canStart(input)) return false;
+    admit(): boolean {
+      if (!canStart()) return false;
       candidates += 1;
       return true;
     },

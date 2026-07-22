@@ -12,6 +12,7 @@ import {
 } from '../src/utils/skill-evolution';
 import type { DistilledKnowledgeCandidate } from '../src/utils/capability-distiller';
 import type { ShardFindingSet } from '../src/utils/evidence-review-types';
+import { acceptReviewObligations } from './evidence-review-test-fixtures';
 
 /**
  * Integration regression (root cause: relatedCurrentSkills duplicate avoidance).
@@ -22,11 +23,10 @@ import type { ShardFindingSet } from '../src/utils/evidence-review-types';
  * silently installing a duplicate create_current_skill with the same route.
  *
  * Strong signal: when the Author fixture proposes a duplicate
- * create_current_skill with the matching routingName, the runtime draft gate
- * fires BEFORE the Verifier branch runs, so the Verifier fixture is never
- * called and the draft is deferred/rejected — never committed as a duplicate.
- * When the Author switches to append_evidence targeting the existing
- * capability, the transition commits.
+ * create_current_skill with the matching routingName, the Verifier still
+ * dispositions every review obligation, while the runtime draft gate tightens
+ * the decision so the duplicate is never committed. When the Author switches
+ * to append_evidence targeting the existing capability, the transition commits.
  */
 
 const EXISTING_HANDLE = 'cap_11af8d6aa4ea448594d705e231455b5e';
@@ -142,7 +142,7 @@ function setup(): { root: string; options: SkillEvolutionOptions; cleanup: () =>
 }
 
 describe('Capability update guidance — integration (RC #6b)', () => {
-  test('a duplicate create_current_skill never reaches the Verifier and is not committed as a duplicate', async () => {
+  test('a duplicate create_current_skill is verified for evidence but is not committed as a duplicate', async () => {
     const env = setup();
     try {
       // Seed the live registry with the existing capability so the Review
@@ -186,14 +186,20 @@ describe('Capability update guidance — integration (RC #6b)', () => {
           ],
         },
       });
-      env.options.verifierFixture = () => {
+      env.options.verifierFixture = ({ bundle }) => {
         verifierReached += 1;
-        return { decision: 'accept', transition: 'create_current_skill', issues: [], rationale: 'should not be reached for a duplicate' };
+        return {
+          decision: 'accept',
+          transition: 'create_current_skill',
+          issues: [],
+          rationale: 'The cited evidence supports the draft, subject to runtime capability constraints.',
+          obligationDispositions: acceptReviewObligations(bundle),
+        };
       };
 
       const result = await new SkillEvolutionRuntime(env.options).reviewAndApply(externalBundle());
 
-      assert.equal(verifierReached, 0, 'the duplicate draft gate must fire before the Verifier branch runs');
+      assert.ok(verifierReached >= 1, 'the Verifier must disposition obligations before the runtime gate tightens the decision');
       assert.notEqual(
         result.transition,
         'create_current_skill',

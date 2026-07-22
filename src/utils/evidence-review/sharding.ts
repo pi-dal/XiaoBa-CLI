@@ -20,16 +20,8 @@ import type {
 /** Soft content budget for one shard before recursive split (bytes). */
 export const DEFAULT_SHARD_SOFT_LIMIT_BYTES = 12_000;
 
-/**
- * Absolute ceiling for a single recursive split step. Pieces larger than the
- * soft limit continue recursive structure splits; only when structure cannot
- * reduce further do we fall back to stable UTF-8 byte boundaries.
- */
-export const DEFAULT_SHARD_HARD_LIMIT_BYTES = 24_000;
-
 export interface ShardingOptions {
   softLimitBytes?: number;
-  hardLimitBytes?: number;
   /**
    * When true (default), a whole bundle that already fits the soft limit is
    * emitted as one `bundle_remainder` shard for one-shard tracer jobs.
@@ -211,20 +203,17 @@ export function splitByStableBytes(content: string, limit: number): string[] {
 export function recursivelySplitContent(
   content: string,
   softLimit: number,
-  hardLimit: number,
 ): string[] {
   const bytes = Buffer.byteLength(content, 'utf8');
   if (bytes <= softLimit) return [content];
 
   const structural = tryStructuralSplit(content, softLimit);
   if (structural && structural.length > 1) {
-    return structural.flatMap(piece => recursivelySplitContent(piece, softLimit, hardLimit));
+    return structural.flatMap(piece => recursivelySplitContent(piece, softLimit));
   }
 
   // Structure could not reduce; fall back to byte boundaries at soft limit.
-  // hardLimit is retained as a safety ceiling for pathological single graphemes.
-  const limit = Math.max(1, Math.min(softLimit, hardLimit));
-  return splitByStableBytes(content, limit);
+  return splitByStableBytes(content, Math.max(1, softLimit));
 }
 
 function locateOriginSpan(original: string, piece: string, fromOffset: number): EvidenceShardSpan {
@@ -269,7 +258,6 @@ export function shardEvidenceBundle(
   options: ShardingOptions = {},
 ): ShardEvidenceBundleResult {
   const softLimit = Math.max(1, options.softLimitBytes ?? DEFAULT_SHARD_SOFT_LIMIT_BYTES);
-  const hardLimit = Math.max(softLimit, options.hardLimitBytes ?? DEFAULT_SHARD_HARD_LIMIT_BYTES);
   const preferSingle = options.preferSingleShardWhenFits !== false;
 
   const whole = stableStringify(bundle);
@@ -292,7 +280,7 @@ export function shardEvidenceBundle(
     const expanded: EvidenceShard[] = [];
     let index = 0;
     for (const unit of units) {
-      const pieces = recursivelySplitContent(unit.content, softLimit, hardLimit);
+      const pieces = recursivelySplitContent(unit.content, softLimit);
       let searchFrom = 0;
       for (const piece of pieces) {
         const originSpan = pieces.length > 1
@@ -334,4 +322,3 @@ export function verifyShardContent(shard: EvidenceShard): boolean {
   return hashEvidenceContent(shard.content) === shard.contentHash
     && Buffer.byteLength(shard.content, 'utf8') === shard.byteLength;
 }
-

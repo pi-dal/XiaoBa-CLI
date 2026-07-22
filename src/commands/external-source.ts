@@ -20,7 +20,6 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 
 import { Logger } from '../utils/logger';
-import { AIService } from '../utils/ai-service';
 import { getDistillationHeartbeatConfig } from '../utils/distillation-heartbeat-config';
 import type { DistillationHeartbeatConfig, ExternalHistoryMode } from '../utils/distillation-heartbeat-config';
 import {
@@ -45,14 +44,8 @@ import {
 } from '../utils/xurl-session-log-source';
 import { buildXurlSubprocessEnv } from '../utils/xurl-subprocess-env';
 import { acquireHeartbeatSchedulerOwnerLock } from '../utils/heartbeat-scheduler-owner-lock';
-import { EvidenceIngestor } from '../utils/evidence-ingestor';
-import { DueWorkPlanner } from '../utils/due-work-planner';
-import { defaultDistilledOutputDir } from '../utils/path-resolver';
-import { PathResolver } from '../utils/path-resolver';
 import { RuntimeLearning } from '../utils/runtime-learning';
-import { SkillEvolutionRuntime } from '../utils/skill-evolution';
-import { SkillUsageCurator } from '../utils/skill-usage-curator';
-import { SkillUsageLedger } from '../utils/skill-usage-ledger';
+import { buildRuntimeLearningStack } from '../utils/runtime-command-support';
 import {
   loadExternalSessionLogBackfillState,
   type ExternalSessionLogBackfillRequest,
@@ -671,7 +664,12 @@ async function handleBackfill(
   }
 
   try {
-    const runtime = buildBackfillRuntimeLearning(workingDirectory, config, options.now);
+    const runtime = buildRuntimeLearningStack(workingDirectory, config, {
+      clock: options.now,
+      skillEvolutionOptions: { logEnabled: false },
+      // Explicit backfill supplies its own XurlExternalBackfillSource.
+      sessionLogSources: [],
+    }).runtimeLearning;
     await runBackfill(runtime);
   } finally {
     ownerLock.release();
@@ -688,67 +686,6 @@ function emitBackfillReport(
     return;
   }
   writeBackfillReport(report, options.json ?? false, extra);
-}
-
-function buildBackfillRuntimeLearning(
-  workingDirectory: string,
-  config: DistillationHeartbeatConfig,
-  clock?: () => Date,
-): RuntimeLearning {
-  const skillsRoot = PathResolver.getSkillsPath();
-  const outputDir = defaultDistilledOutputDir(skillsRoot);
-  const skillEvolution = new SkillEvolutionRuntime({
-    workingDirectory,
-    branchLogRoot: config.branchLogRoot,
-    outputDir,
-    registryPath: config.skillEvolutionRegistryPath,
-    auditPath: config.skillEvolutionAuditPath,
-    journalPath: config.skillEvolutionJournalPath,
-    reviewQueuePath: config.skillEvolutionReviewQueuePath,
-    // Backfill must review admitted episodes with the same Author/Verifier
-    // model path as production wakes. Without AIService, evidence readers
-    // fail closed and review jobs stall in operational retry.
-    aiService: new AIService(),
-    settlementWindowMs: config.skillEvolutionSettlementWindowHours * 60 * 60 * 1000,
-    reviewerConcurrency: config.skillEvolutionReviewerConcurrency,
-    operationalRetryMs: config.skillEvolutionOperationalRetryMinutes * 60 * 1000,
-    operationalRetryMaxMs: config.skillEvolutionOperationalRetryMaxHours * 60 * 60 * 1000,
-    reviewAttemptDeadlineMs: config.skillEvolutionReviewAttemptDeadlineMinutes * 60 * 1000,
-    authorModel: config.skillEvolutionAuthorModel,
-    verifierModel: config.skillEvolutionVerifierModel,
-    logEnabled: false,
-  });
-  const learningEpisodeStore = new LearningEpisodeStore(config.learningEpisodeStorePath);
-  const evidenceIngestor = new EvidenceIngestor({
-    episodeStore: learningEpisodeStore,
-    settlementWindowMs: config.skillEvolutionSettlementWindowHours * 60 * 60 * 1000,
-  });
-  const curator = new SkillUsageCurator({
-    ledger: new SkillUsageLedger(config.skillUsageLedgerPath),
-    statePath: config.skillEvolutionCuratorStatePath,
-    intervalMs: config.skillEvolutionCuratorIntervalHours * 60 * 60 * 1000,
-    runtime: skillEvolution,
-    now: clock,
-  });
-  const planner = new DueWorkPlanner({
-    learningEpisodeStorePath: config.learningEpisodeStorePath,
-    reviewQueuePath: config.skillEvolutionReviewQueuePath,
-    curatorStatePath: config.skillEvolutionCuratorStatePath,
-    curatorIntervalMs: config.skillEvolutionCuratorIntervalHours * 60 * 60 * 1000,
-    semanticReassessmentManifestPath: config.skillEvolutionReassessmentManifestPath,
-  });
-  return new RuntimeLearning({
-    workingDirectory,
-    evidenceIngestor,
-    learningEpisodeStore,
-    skillEvolution,
-    curator,
-    planner,
-    // Explicit backfill supplies its own XurlExternalBackfillSource; avoid
-    // constructing continuous external adapters for this one-shot owner.
-    sessionLogSources: [],
-    clock,
-  });
 }
 
 function resolveBackfillLimits(options: ExternalSourceCommandOptions): {

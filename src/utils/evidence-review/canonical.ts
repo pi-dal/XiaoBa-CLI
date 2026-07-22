@@ -36,4 +36,3 @@ export function sha256Hex(text: string): string {
 export function hashEvidenceContent(content: string): string {
   return sha256Hex(content);
 }
-

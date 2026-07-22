@@ -9,10 +9,4 @@ export type ExternalAdmissionLane = typeof EXTERNAL_ADMISSION_LANES[number];
 
 export type ExternalSourceWorkLane = Exclude<ExternalAdmissionLane, 'backfill'>;
 
-export const EXTERNAL_CATCH_UP_ACTIONS = [
-  'inventory',
-  'stability',
-  'page',
-] as const;
-
-export type ExternalCatchUpAction = typeof EXTERNAL_CATCH_UP_ACTIONS[number];
+export type ExternalCatchUpAction = 'inventory' | 'stability' | 'page';

@@ -59,6 +59,7 @@ import {
   type ExternalSourceReader,
   type SessionLogSourceResource,
 } from '../src/utils/session-log-source';
+import { acceptReviewObligations } from './evidence-review-test-fixtures';
 
 /** Seed an operational recovery job in the job store (replaces legacy addOrUpdateOperationalFailure). */
 function seedOperationalFailure(
@@ -417,7 +418,7 @@ function setupEnv(
         },
       };
     }),
-    verifierFixture: fixtures.verifierFixture ?? (({ draft }) => {
+    verifierFixture: fixtures.verifierFixture ?? (({ bundle, draft }) => {
       branchCalls.verifier++;
       assert.equal(draft.envelope.routingName, 'test-report-delivery');
       return {
@@ -425,6 +426,7 @@ function setupEnv(
         transition: 'create_current_skill' as const,
         issues: [],
         rationale: 'The bounded report workflow is supported by the fixed artifact evidence.',
+        obligationDispositions: acceptReviewObligations(bundle),
       };
     }),
   };
@@ -739,11 +741,12 @@ describe('RuntimeLearning — AC3: Due Review', () => {
           },
         };
       },
-      verifierFixture: ({ draft }) => ({
+      verifierFixture: ({ bundle, draft }) => ({
         decision: 'accept' as const,
         transition: draft.envelope.decision,
         issues: [],
         rationale: 'The bounded proposal is supported by the fixed bundle.',
+        obligationDispositions: acceptReviewObligations(bundle),
       }),
     });
     const makeEpisode = (episodeId: string, semanticObservations: LearningEpisode['semanticObservations']): LearningEpisode => ({
@@ -786,7 +789,10 @@ describe('RuntimeLearning — AC3: Due Review', () => {
       const jobs = loadEvidenceReviewJobStore(
         evidenceReviewJobStorePathForReviewQueue(customEnv.reviewQueuePath),
       );
-      const deferred = Object.values(jobs.jobs).find(job => job.disposition === 'deferred');
+      const deferred = Object.values(jobs.jobs).find(job => (
+        job.disposition === 'deferred'
+        && job.bundle.bundleId.includes('episode-unobserved')
+      ));
       assert.ok(deferred);
       assert.match(deferred.deferState?.reason ?? '', /semantic observation/i);
     } finally {
@@ -1547,12 +1553,17 @@ describe('RuntimeLearning — semantic reassessment wake', () => {
           },
         };
       },
-      verifierFixture: () => {
+      verifierFixture: ({ bundle }) => {
         verifierCalls++;
         return {
           decision: 'reject' as const,
           issues: [{ code: 'no-change', message: 'No migration is needed.', severity: 'warning' as const }],
           rationale: 'The current capability remains sufficient.',
+          obligationDispositions: acceptReviewObligations(bundle).map(disposition => ({
+            ...disposition,
+            decision: 'rejected' as const,
+            rationale: 'Explicitly rejected because no migration is needed.',
+          })),
         };
       },
     });
@@ -1612,8 +1623,14 @@ describe('RuntimeLearning — semantic reassessment wake', () => {
         body: 'Use the report delivery capability.',
         envelope: { decision: 'migrate_skill_route', targetCapabilityHandle: 'legacy', routingName: 'report-delivery', description: 'Deliver reports.' },
       }),
-      verifierFixture: () => verifierAvailable
-        ? ({ decision: 'accept', transition: 'migrate_skill_route', issues: [], rationale: 'Bounded route migration.' })
+      verifierFixture: ({ bundle }) => verifierAvailable
+        ? ({
+            decision: 'accept',
+            transition: 'migrate_skill_route',
+            issues: [],
+            rationale: 'Bounded route migration.',
+            obligationDispositions: acceptReviewObligations(bundle),
+          })
         : (() => { throw new Error('temporary verifier outage'); })(),
     });
     const skillPath = path.join(env.outputDir, 'legacy', 'SKILL.md');
@@ -2058,6 +2075,19 @@ describe('Issue 4 — Heartbeat single-write', () => {
     assert.ok(record.backlog.eligibleEpisodes >= 0);
     assert.ok(record.cumulativeReviewFailureCount >= record.lastReviewFailureCount);
     assert.ok(record.cumulativeReviewTimeoutCount >= record.lastReviewTimeoutCount);
+  });
+
+  test('projects operational backlog from the authoritative Evidence Review Job store', () => {
+    seedOperationalFailure(
+      env.reviewQueuePath,
+      runtimeReviewBundle('heartbeat-operational-backlog'),
+      'Pending operational recovery',
+      new Date('2099-01-01T00:00:00.000Z'),
+    );
+
+    env.runtimeLearning.markHeartbeatStatus('quiet');
+
+    assert.equal(env.runtimeLearning.loadHeartbeatRecord().backlog.operationalReviews, 1);
   });
 
   test('failed heartbeat status persists not-ready diagnostics and later success recovers', () => {

@@ -13,7 +13,6 @@ import {
 import { createEvidenceReviewJob } from '../src/utils/evidence-review-graph';
 import {
   evidenceReviewJobStorePathForReviewQueue,
-  importLegacyReviewQueue,
   loadEvidenceReviewJobStore,
   saveEvidenceReviewJobStore,
 } from '../src/utils/evidence-review-job-store';
@@ -129,187 +128,17 @@ function assertUniqueSuccessor(runtime: SkillEvolutionRuntime, staleJobId: strin
 }
 
 describe('Evidence Review Job single-owner consolidation', () => {
-  test('legacy queue migration is durable, idempotent, and preserves terminal collisions', () => {
-    const env = setup();
-    try {
-      const operationalBundle = bundle('legacy-operational');
-      const deferredBundle = bundle('legacy-deferred');
-      const historical = createEvidenceReviewJob({
-        bundle: operationalBundle,
-        candidate: operationalBundle.episode as DistilledKnowledgeCandidate,
-        workClass: 'live_learning',
-      });
-      historical.disposition = 'completed';
-      const initial = loadEvidenceReviewJobStore(env.jobStorePath);
-      initial.jobs[historical.jobId] = historical;
-      saveEvidenceReviewJobStore(env.jobStorePath, initial);
-
-      fs.mkdirSync(path.dirname(env.reviewQueuePath), { recursive: true });
-      fs.writeFileSync(env.reviewQueuePath, JSON.stringify({
-        schemaVersion: 1,
-        operational: [{
-          entryId: 'op-1', candidateCapabilityId: 'legacy-operational',
-          bundleId: operationalBundle.bundleId, bundle: operationalBundle,
-          candidate: operationalBundle.episode,
-          failureKind: 'branch_timeout', failureMessage: 'provider timed out',
-          failureTranscripts: ['author.jsonl'], attempts: 3, currentDelayMs: 400,
-          nextRetryAt: '2026-07-20T00:01:00.000Z', createdAt: NOW, updatedAt: NOW,
-        }],
-        deferred: [{
-          entryId: 'defer-1', candidateCapabilityId: 'legacy-deferred',
-          bundleId: deferredBundle.bundleId, bundle: deferredBundle,
-          candidate: deferredBundle.episode, relevantReadSet: [{ handle: 'cap-a', revision: 2 }],
-          evidenceFingerprint: 'legacy-fingerprint', reviewerVersion: 'reviewer-v1',
-          reason: 'needs evidence', createdAt: NOW, updatedAt: NOW,
-        }],
-      }));
-
-      const migrated = importLegacyReviewQueue(env.reviewQueuePath, env.jobStorePath);
-      assert.equal(migrated.status, 'migrated');
-      assert.equal(migrated.imported, 2);
-      const state = loadEvidenceReviewJobStore(env.jobStorePath);
-      assert.equal(Object.keys(state.jobs).length, 3, 'terminal history must not discard live legacy work');
-      const operational = Object.values(state.jobs).find(job =>
-        job.bundle.bundleId === operationalBundle.bundleId && job.disposition === 'active');
-      const retry = Object.values(operational!.quanta).find(quantum => quantum.state === 'retry_wait');
-      assert.deepEqual(
-        [retry?.attempts, retry?.currentDelayMs, retry?.failureKind, retry?.nextRetryAt],
-        [3, 400, 'branch_timeout', '2026-07-20T00:01:00.000Z'],
-      );
-      const deferred = Object.values(state.jobs).find(job => job.bundle.bundleId === deferredBundle.bundleId)!;
-      assert.equal(deferred.disposition, 'deferred');
-      assert.equal(deferred.deferState?.reviewerVersion, 'reviewer-v1');
-
-      // Simulate crash after the atomic store write but before source archive.
-      fs.renameSync(migrated.archivePath, env.reviewQueuePath);
-      const replay = importLegacyReviewQueue(env.reviewQueuePath, env.jobStorePath);
-      assert.equal(replay.status, 'migrated');
-      assert.equal(replay.imported, 0);
-      assert.equal(Object.keys(loadEvidenceReviewJobStore(env.jobStorePath).jobs).length, 3);
-    } finally {
-      env.cleanup();
-    }
-  });
-
-  test('migration hydrates released dual-written Jobs instead of discarding queue-only state', () => {
-    const env = setup();
-    try {
-      const operationalBundle = bundle('dual-written-operational');
-      const operational = createEvidenceReviewJob({
-        bundle: operationalBundle,
-        candidate: operationalBundle.episode as DistilledKnowledgeCandidate,
-        workClass: 'live_learning',
-        now: new Date(NOW),
-      });
-      const retryQuantum = Object.values(operational.quanta)
-        .find(quantum => quantum.dependencyQuantumIds.length === 0)!;
-      retryQuantum.state = 'retry_wait';
-      retryQuantum.attempts = 1;
-      retryQuantum.currentDelayMs = 100;
-      retryQuantum.nextRetryAt = '2026-07-20T00:00:30.000Z';
-      operational.nextDueAt = retryQuantum.nextRetryAt;
-
-      const deferredBundle = bundle('dual-written-deferred');
-      const deferred = createEvidenceReviewJob({
-        bundle: deferredBundle,
-        candidate: deferredBundle.episode as DistilledKnowledgeCandidate,
-        workClass: 'live_learning',
-        now: new Date(NOW),
-      });
-      deferred.disposition = 'deferred';
-
-      const state = loadEvidenceReviewJobStore(env.jobStorePath);
-      state.jobs[operational.jobId] = operational;
-      state.jobs[deferred.jobId] = deferred;
-      saveEvidenceReviewJobStore(env.jobStorePath, state);
-
-      fs.mkdirSync(path.dirname(env.reviewQueuePath), { recursive: true });
-      fs.writeFileSync(env.reviewQueuePath, JSON.stringify({
-        schemaVersion: 1,
-        operational: [{
-          entryId: 'dual-op', candidateCapabilityId: 'dual-written-operational',
-          bundleId: operationalBundle.bundleId, bundle: operationalBundle,
-          candidate: operationalBundle.episode,
-          failureKind: 'branch_timeout', failureMessage: 'released timeout',
-          failureTranscripts: ['released-author.jsonl'], attempts: 3, currentDelayMs: 400,
-          nextRetryAt: '2026-07-20T00:01:00.000Z', createdAt: NOW, updatedAt: NOW,
-        }],
-        deferred: [{
-          entryId: 'dual-defer', candidateCapabilityId: 'dual-written-deferred',
-          bundleId: deferredBundle.bundleId, bundle: deferredBundle,
-          candidate: deferredBundle.episode, relevantReadSet: [{ handle: 'cap-a', revision: 7 }],
-          evidenceFingerprint: 'released-evidence-fingerprint', reviewerVersion: 'reviewer-v1',
-          reason: 'released deferred state',
-          createdAt: NOW, updatedAt: NOW,
-        }],
-      }));
-
-      const migrated = importLegacyReviewQueue(env.reviewQueuePath, env.jobStorePath);
-      assert.equal(migrated.status, 'migrated');
-      assert.equal(migrated.imported, 2);
-      const hydrated = loadEvidenceReviewJobStore(env.jobStorePath);
-      assert.equal(Object.keys(hydrated.jobs).length, 2, 'migration must not duplicate existing owners');
-      const hydratedOperational = hydrated.jobs[operational.jobId]!;
-      const hydratedRetry = Object.values(hydratedOperational.quanta)
-        .find(quantum => quantum.state === 'retry_wait')!;
-      assert.deepEqual(
-        [hydratedOperational.workClass, hydratedRetry.attempts, hydratedRetry.currentDelayMs,
-          hydratedRetry.nextRetryAt, hydratedRetry.failureKind, hydratedRetry.transcriptPaths],
-        ['operational_recovery', 3, 400, '2026-07-20T00:01:00.000Z',
-          'branch_timeout', ['released-author.jsonl']],
-      );
-      const hydratedDeferred = hydrated.jobs[deferred.jobId]!;
-      assert.deepEqual(hydratedDeferred.deferState, {
-        reviewerVersion: 'reviewer-v1',
-        reason: 'released deferred state',
-        deferredAt: NOW,
-        registryReadSet: [{ handle: 'cap-a', revision: 7 }],
-        evidenceFingerprint: 'released-evidence-fingerprint',
-      });
-    } finally {
-      env.cleanup();
-    }
-  });
-
-  test('corrupt legacy input and corrupt authoritative state both fail closed', () => {
-    const corruptLegacy = setup();
-    try {
-      fs.mkdirSync(path.dirname(corruptLegacy.reviewQueuePath), { recursive: true });
-      fs.writeFileSync(corruptLegacy.reviewQueuePath, '{broken');
-      assert.throws(() => new SkillEvolutionRuntime(corruptLegacy.options), /corrupt|quarantined/i);
-      assert.equal(fs.existsSync(corruptLegacy.reviewQueuePath), false);
-      assert.equal(fs.existsSync(`${corruptLegacy.reviewQueuePath}.state-corrupt`), true);
-      assert.ok(fs.readdirSync(path.dirname(corruptLegacy.reviewQueuePath)).some(name => name.includes('.corrupt.')));
-      assert.throws(
-        () => new SkillEvolutionRuntime(corruptLegacy.options),
-        /corrupt|quarantined/i,
-        'the sidecar must keep a second startup fail-closed after quarantine moved the source',
-      );
-    } finally {
-      corruptLegacy.cleanup();
-    }
-
+  test('corrupt authoritative state stays latched and cannot be overwritten', () => {
     const corruptStore = setup();
     try {
-      fs.mkdirSync(path.dirname(corruptStore.reviewQueuePath), { recursive: true });
-      fs.writeFileSync(corruptStore.reviewQueuePath, JSON.stringify({ schemaVersion: 1, operational: [], deferred: [] }));
+      fs.mkdirSync(path.dirname(corruptStore.jobStorePath), { recursive: true });
       fs.writeFileSync(corruptStore.jobStorePath, '{broken');
-      assert.throws(
-        () => importLegacyReviewQueue(corruptStore.reviewQueuePath, corruptStore.jobStorePath),
-        /job store was corrupt/i,
-      );
-      assert.equal(fs.existsSync(corruptStore.reviewQueuePath), true, 'legacy source remains recoverable');
-      assert.equal(fs.existsSync(`${corruptStore.jobStorePath}.state-corrupt`), true);
       const latched = loadEvidenceReviewJobStore(corruptStore.jobStorePath);
       assert.equal(latched.stateCorrupt, true);
+      assert.equal(fs.existsSync(`${corruptStore.jobStorePath}.state-corrupt`), true);
       assert.throws(
         () => saveEvidenceReviewJobStore(corruptStore.jobStorePath, latched),
         /corruption is latched/i,
-      );
-      assert.throws(
-        () => new SkillEvolutionRuntime(corruptStore.options),
-        /job store is corrupt/i,
-        'a second startup must not replace quarantined authoritative state with an empty store',
       );
     } finally {
       corruptStore.cleanup();

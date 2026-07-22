@@ -34,7 +34,6 @@ export {
 } from './canonical';
 
 export {
-  DEFAULT_SHARD_HARD_LIMIT_BYTES,
   DEFAULT_SHARD_SOFT_LIMIT_BYTES,
   hashEvidenceBundle,
   makeShardId,
@@ -64,7 +63,6 @@ export { buildDossierDifferenceIndex } from './difference-index';
 export {
   OBLIGATION_FINDING_CLASSES,
   allObligationsResolvedForCommit,
-  buildExplicitObligationDispositions,
   buildReviewObligations,
   validateObligationDispositions,
 } from './obligations';

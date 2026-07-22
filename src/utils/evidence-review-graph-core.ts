@@ -8,7 +8,6 @@
  * scope (#108 / #109).
  */
 
-import * as crypto from 'node:crypto';
 import {
   EVIDENCE_REVIEW_JOB_SCHEMA_VERSION,
   EVIDENCE_REVIEW_POLICY_VERSION,
@@ -21,6 +20,9 @@ import {
   type ReviewQuantumRecord,
   type ReviewWorkClass,
 } from './evidence-review-types';
+import { sha256Hex, stableStringify } from './evidence-review/canonical';
+
+export { sha256Hex, stableStringify };
 
 /**
  * Minimal structural view of a job for graph-core read/mutate functions.
@@ -38,28 +40,6 @@ export interface GraphJobView {
 // ---------------------------------------------------------------------------
 // Canonical hashing / identity
 // ---------------------------------------------------------------------------
-
-export function sha256Hex(text: string): string {
-  return crypto.createHash('sha256').update(text, 'utf8').digest('hex');
-}
-
-function canonicalize(value: unknown): unknown {
-  if (Array.isArray(value)) return value.map(canonicalize);
-  if (value && typeof value === 'object') {
-    const record = value as Record<string, unknown>;
-    const out: Record<string, unknown> = {};
-    for (const key of Object.keys(record).sort((a, b) => a.localeCompare(b, 'en'))) {
-      out[key] = canonicalize(record[key]);
-    }
-    return out;
-  }
-  return value;
-}
-
-/** Deterministic JSON for content-identified hashes. */
-export function stableStringify(value: unknown): string {
-  return JSON.stringify(canonicalize(value));
-}
 
 /**
  * Content hash over Quantum inputs. Callers must include every input that

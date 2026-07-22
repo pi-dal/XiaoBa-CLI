@@ -60,6 +60,7 @@ describe('dashboard readiness and service preflight API', () => {
     'FEISHU_APP_SECRET',
     'WEIXIN_TOKEN',
     'XIAOBA_CONFIG_PATH',
+    'XIAOBA_RUNTIME_ROOT',
     'XIAOBA_RUNTIME_PROFILE_PATH',
     'XIAOBA_EXTERNAL_SESSION_LOG_SOURCES_ENABLED',
     'XIAOBA_EXTERNAL_SESSION_LOG_ENABLED_PROVIDERS',
@@ -79,6 +80,7 @@ describe('dashboard readiness and service preflight API', () => {
       delete process.env[key];
     }
     process.env.XIAOBA_CONFIG_PATH = path.join(testRoot, 'user-config.json');
+    process.env.XIAOBA_RUNTIME_ROOT = testRoot;
     process.env.XIAOBA_RUNTIME_PROFILE_PATH = path.join(testRoot, 'runtime-profile.json');
 
     const app = express();

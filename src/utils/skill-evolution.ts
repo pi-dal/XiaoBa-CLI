@@ -18,8 +18,6 @@ import { SkillParser } from '../skills/skill-parser';
 import {
   findDeferredJobByBundleId,
   findOperationalJobByBundleId,
-  importLegacyReviewQueue,
-  loadEvidenceReviewJobStore,
   upsertEvidenceReviewJob,
 } from './evidence-review-job-store';
 
@@ -42,7 +40,7 @@ import type {
   ReviewWorkClass,
   EvidenceReviewJob,
 } from './evidence-review-types';
-import { buildExplicitObligationDispositions, hashEvidenceBundle } from './evidence-review';
+import { hashEvidenceBundle } from './evidence-review';
 import { createEvidenceReviewJob } from './evidence-review-graph';
 import { detectDuplicateCapabilityCreation } from './capability-update-guidance';
 import {
@@ -175,6 +173,37 @@ export interface SkillVerifierResult {
   registryReadSet?: CapabilityReadSetEntry[];
   /** Explicit final dispositions over Evidence Review obligations. */
   obligationDispositions?: ObligationDisposition[];
+}
+
+const VERIFIER_DECISION_STRICTNESS: Record<SkillVerifierResult['decision'], number> = {
+  accept: 0,
+  revise: 1,
+  defer: 2,
+  reject: 3,
+};
+
+function stricterVerifierDecision(
+  left: SkillVerifierResult['decision'],
+  right: SkillVerifierResult['decision'],
+): SkillVerifierResult['decision'] {
+  return VERIFIER_DECISION_STRICTNESS[left] >= VERIFIER_DECISION_STRICTNESS[right]
+    ? left
+    : right;
+}
+
+function applyVerifierDecisionGate(
+  verification: SkillVerifierResult,
+  gate: SkillVerifierResult,
+): SkillVerifierResult {
+  return {
+    decision: stricterVerifierDecision(verification.decision, gate.decision),
+    issues: [...gate.issues, ...verification.issues],
+    rationale: `${verification.rationale} ${gate.rationale}`.trim(),
+    ...(verification.registryReadSet ? { registryReadSet: verification.registryReadSet } : {}),
+    ...(verification.obligationDispositions
+      ? { obligationDispositions: verification.obligationDispositions }
+      : {}),
+  };
 }
 
 export interface CapabilityReadSetEntry {
@@ -550,7 +579,6 @@ export class SkillEvolutionRuntime {
     this.options = options;
     fs.mkdirSync(options.outputDir, { recursive: true });
     recoverTransitionJournal(options);
-    this.maybeMigrateLegacyReviewQueue();
   }
 
   /** Durable Evidence Review Job engine (ADR 0045). Created lazily. */
@@ -1028,9 +1056,11 @@ export class SkillEvolutionRuntime {
       obligations: input.obligations,
     });
 
-    // Legacy parity: runtime draft gate short-circuits the Verifier branch.
     // Retryable schema issues with a queue already threw from skill_author.
+    // Other draft gates may tighten the final decision, but only the Verifier
+    // may explicitly disposition obligations and cite their supporting spans.
     const draftIssues = validateDraft(input.draft, reviewBundle, this.getManualSkillNames());
+    let draftGate: SkillVerifierResult | undefined;
     if (draftIssues.length > 0) {
       const isDuplicate = draftIssues.some(i => i.code === 'duplicate-capability-creation');
       if (
@@ -1052,22 +1082,11 @@ export class SkillEvolutionRuntime {
       const canRevise = input.round < MAX_AUTHOR_VERIFIER_ROUNDS;
       const decision = isDuplicate && canRevise ? 'revise' :
         draftIssues.some(issue => issue.severity === 'danger') ? 'reject' : 'defer';
-      const forced: SkillVerifierResult = {
+      draftGate = {
         decision,
         issues: draftIssues,
         rationale: `Runtime ${decision === 'revise' ? 'revision requested' : decision === 'reject' ? 'rejected' : 'deferred'} the author envelope before persistence: ${draftIssues.map(i => i.message).join(' ')}`,
       };
-      // Non-accept runtime gates still need explicit cited dispositions so the
-      // engine can complete as semantic defer/reject/revise instead of schema failure.
-      const dispositionDecision: ObligationDisposition['decision'] =
-        decision === 'revise' ? 'deferred' : decision === 'reject' ? 'rejected' : 'deferred';
-      const dispositions = buildExplicitObligationDispositions(
-        input.obligations,
-        Object.values(input.job.shards),
-        dispositionDecision,
-        forced.rationale,
-      );
-      return { verifier: forced, dispositions, transcriptPaths: [] };
     }
 
     const attemptDeadlineMs = this.getEffectiveConfig().reviewAttemptDeadlineMs;
@@ -1095,12 +1114,10 @@ export class SkillEvolutionRuntime {
     if (verifier.transcriptPath) {
       assertHealthyBranchTranscript(verifier.transcriptPath, 'skill-verifier', this.options.branchLogRoot);
     }
-    const dispositions = resolveVerifierObligationDispositions({
-      verification,
-      obligations: input.obligations,
-      job: input.job,
-      allowFixtureAcceptSynthesis: !!this.options.verifierFixture,
-    });
+    if (draftGate) {
+      verification = applyVerifierDecisionGate(verification, draftGate);
+    }
+    const dispositions = verification.obligationDispositions ?? [];
     return { verifier: verification, dispositions, transcriptPaths };
   }
 
@@ -1178,7 +1195,7 @@ export class SkillEvolutionRuntime {
         );
       }
       const danger = draftIssues.some(issue => issue.severity === 'danger');
-      const forced: SkillVerifierResult = {
+      const gate: SkillVerifierResult = {
         decision: danger ? 'reject' : 'defer',
         issues: draftIssues,
         rationale: `Runtime ${danger ? 'rejected' : 'deferred'} the author envelope before persistence: ${draftIssues.map(i => i.message).join(' ')}`,
@@ -1186,7 +1203,7 @@ export class SkillEvolutionRuntime {
       return this.applyReviewedTransition(
         reviewBundle,
         input.draft,
-        forced,
+        applyVerifierDecisionGate(input.verifier, gate),
         input.round,
         [...input.branchTranscriptPaths],
       );
@@ -1720,27 +1737,6 @@ export class SkillEvolutionRuntime {
     };
   }
 
-  /** Import released v1 queue state before any deadline planning reads the job store. */
-  private maybeMigrateLegacyReviewQueue(): void {
-    const queuePath = this.options.reviewQueuePath;
-    const jobStorePath = resolveEvidenceReviewJobStorePath(this.options);
-    if (loadEvidenceReviewJobStore(jobStorePath).stateCorrupt) {
-      throw new Error(
-        `Evidence Review Job store is corrupt; review startup stopped: ${jobStorePath}`,
-      );
-    }
-    if (!queuePath) return;
-    const migrated = importLegacyReviewQueue(
-      queuePath,
-      jobStorePath,
-    );
-    if (migrated.status === 'quarantined') {
-      throw new Error(
-        `Legacy review queue was corrupt and quarantined at ${migrated.quarantinePath}; review startup stopped.`,
-      );
-    }
-  }
-
   private isDeferredReviewEligible(job: EvidenceReviewJob, candidateBundle?: EvidenceBundle): boolean {
     if (job.disposition !== 'deferred') return false;
     if (job.deferState
@@ -1752,18 +1748,10 @@ export class SkillEvolutionRuntime {
       return true;
     }
     const registry = this.getRegistry();
-    const eligibilityReadSet = job.deferState?.registryReadSet ?? job.basis.registryReadSet;
-    if (eligibilityReadSet.some(entry => registry.capabilities[entry.handle]?.revision !== entry.revision)) {
+    if (job.basis.registryReadSet.some(entry => registry.capabilities[entry.handle]?.revision !== entry.revision)) {
       return true;
     }
     if (!candidateBundle) return false;
-    if (job.deferState?.evidenceFingerprint) {
-      const refs = [...candidateBundle.completionEvidence, ...candidateBundle.settlementEvidence]
-        .map(item => item.ref)
-        .filter((ref): ref is string => typeof ref === 'string')
-        .sort();
-      return sha256(JSON.stringify(refs)) !== job.deferState.evidenceFingerprint;
-    }
     return hashEvidenceBundle(candidateBundle) !== job.basis.evidenceBundleHash;
   }
 
@@ -1989,20 +1977,6 @@ export class SkillEvolutionRuntime {
       contentFingerprint: record.guidanceHash,
     }));
     return [...manual, ...generated];
-  }
-
-  private refreshRegistryContext(bundle: EvidenceBundle): EvidenceBundle {
-    const registry = loadCurrentSkillRegistry(this.options.registryPath);
-    return {
-      ...bundle,
-      relatedCurrentSkills: Object.values(registry.capabilities).map(record => ({
-        handle: record.handle,
-        revision: record.revision,
-        routingName: record.routingName,
-        description: record.description,
-        guidanceHash: record.guidanceHash,
-      })),
-    };
   }
 
   getEffectiveConfig(): SkillEvolutionEffectiveConfig {
@@ -2392,26 +2366,6 @@ function isPathInside(childPath: string, parentPath: string): boolean {
   );
 }
 
-async function mapWithConcurrency<T, R>(
-  items: readonly T[],
-  concurrency: number,
-  worker: (item: T, index: number) => Promise<R>,
-): Promise<R[]> {
-  const results = new Array<R>(items.length);
-  let nextIndex = 0;
-  const workerCount = Math.min(Math.max(1, concurrency), items.length);
-
-  await Promise.all(Array.from({ length: workerCount }, async () => {
-    while (true) {
-      const index = nextIndex++;
-      if (index >= items.length) return;
-      results[index] = await worker(items[index]!, index);
-    }
-  }));
-
-  return results;
-}
-
 export interface ApplyTransitionInput extends SkillEvolutionPaths {
   bundle: EvidenceBundle;
   draft: SkillDraft;
@@ -2508,13 +2462,6 @@ export class CurrentSkillRegistrySchemaError extends Error {
   }
 }
 
-export class CurrentSkillRegistryMigrationError extends Error {
-  constructor(cause: unknown) {
-    super(`Generated-skill Registry migration write failed: ${cause instanceof Error ? cause.message : String(cause)}`);
-    this.name = 'CurrentSkillRegistryMigrationError';
-  }
-}
-
 export class CurrentSkillRegistryValidationError extends Error {
   constructor(message: string) {
     super(`Invalid generated-skill Registry state: ${message}`);
@@ -2548,22 +2495,14 @@ export function loadCurrentSkillRegistry(filePath: string): CurrentSkillRegistry
       `could not parse Registry JSON: ${cause instanceof Error ? cause.message : String(cause)}`,
     );
   }
-  if (parsed.schemaVersion !== 1 && parsed.schemaVersion !== SKILL_EVOLUTION_SCHEMA_VERSION) {
+  if (parsed.schemaVersion !== SKILL_EVOLUTION_SCHEMA_VERSION) {
     throw new CurrentSkillRegistrySchemaError(parsed.schemaVersion);
   }
   if (!isRecord(parsed.capabilities)) {
     throw new CurrentSkillRegistryValidationError('capabilities must be an object');
   }
   validateRegistryState(parsed);
-  const migrated = sanitizeRegistry(parsed as CurrentSkillRegistryState);
-  if (parsed.schemaVersion === 1) {
-    try {
-      writeJsonAtomic(filePath, migrated);
-    } catch (cause) {
-      throw new CurrentSkillRegistryMigrationError(cause);
-    }
-  }
-  return migrated;
+  return sanitizeRegistry(parsed as CurrentSkillRegistryState);
 }
 
 /**
@@ -3756,7 +3695,7 @@ class FinishSkillVerificationTool implements Tool {
           },
         },
       },
-      required: ['decision', 'issues', 'rationale'],
+      required: ['decision', 'issues', 'rationale', 'obligationDispositions'],
     },
   };
 
@@ -3833,10 +3772,6 @@ function writeFileAtomic(filePath: string, content: string): void {
   const temp = `${filePath}.${process.pid}.${randomUUID()}.tmp`;
   fs.writeFileSync(temp, content, { encoding: 'utf8', mode: 0o600 });
   fs.renameSync(temp, filePath);
-}
-
-function quarantine(filePath: string, suffix: string): void {
-  try { fs.renameSync(filePath, `${filePath}.${suffix}.${Date.now()}`); } catch { /* best effort */ }
 }
 
 function yamlString(value: string): string {
@@ -3951,45 +3886,6 @@ function attachVerifierReviewContext(
         reviewObligations: context.obligations,
       };
   return freezeClone({ ...bundle, episode });
-}
-
-/**
- * Resolve obligation dispositions for the skill_verifier quantum.
- *
- * - Explicit verifier-provided dispositions always win.
- * - Non-accept outcomes may synthesize cited deferred/rejected dispositions so
- *   semantic defer/reject is not collapsed into invalid_completion_schema.
- * - Accept remains fail-closed in production: only explicit test fixtures may
- *   synthesize accepted dispositions. Live model accepts must cite every
- *   obligation themselves.
- */
-function resolveVerifierObligationDispositions(input: {
-  verification: SkillVerifierResult;
-  obligations: readonly ReviewObligation[];
-  job: EvidenceReviewJob;
-  allowFixtureAcceptSynthesis: boolean;
-}): ObligationDisposition[] {
-  if (input.verification.obligationDispositions !== undefined) {
-    return input.verification.obligationDispositions;
-  }
-  const shards = Object.values(input.job.shards);
-  if (input.verification.decision === 'accept') {
-    if (!input.allowFixtureAcceptSynthesis) return [];
-    return buildExplicitObligationDispositions(
-      input.obligations,
-      shards,
-      'accepted',
-      input.verification.rationale || 'Explicit verifier fixture accepted the cited obligation.',
-    );
-  }
-  const decision: ObligationDisposition['decision'] =
-    input.verification.decision === 'defer' ? 'deferred' : 'rejected';
-  return buildExplicitObligationDispositions(
-    input.obligations,
-    shards,
-    decision,
-    input.verification.rationale || `Explicit ${decision} disposition for non-accept verifier outcome.`,
-  );
 }
 
 function inferReviewWorkClass(bundle: EvidenceBundle): ReviewWorkClass {

@@ -2,7 +2,6 @@ import { DistillationUnit } from './distillation-unit';
 import {
   extractLearningEpisodes,
   HistoricalEpisodeTargetRef,
-  LearningEpisode,
   LearningEpisodeStore,
   LearningEpisodeStoreState,
 } from './learning-episode';

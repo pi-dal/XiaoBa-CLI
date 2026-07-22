@@ -116,11 +116,16 @@ interface ReviewAttemptStep {
 
 class AbortAwareReviewAttemptAIService {
   private readonly callCountByTool = new Map<string, number>();
+  private readonly definitionByTool = new Map<string, ToolDefinition>();
 
   constructor(private readonly plan: Record<string, ReviewAttemptStep[]>) {}
 
   getCallCount(toolName: string): number {
     return this.callCountByTool.get(toolName) ?? 0;
+  }
+
+  getToolDefinition(toolName: string): ToolDefinition | undefined {
+    return this.definitionByTool.get(toolName);
   }
 
   async chatStream(
@@ -130,6 +135,7 @@ class AbortAwareReviewAttemptAIService {
     options: { signal?: AbortSignal } = {},
   ): Promise<{ content: string; toolCalls?: { id: string; type: 'function'; function: { name: string; arguments: string; } }[] }> {
     const toolName = tools?.[0]?.name ?? 'default';
+    if (tools?.[0]) this.definitionByTool.set(toolName, tools[0]);
     const planByTool = this.plan[toolName] ?? this.plan.default ?? [];
     const calls = this.callCountByTool.get(toolName) ?? 0;
     const step = planByTool[calls] ?? { content: '...' };
@@ -377,42 +383,6 @@ describe('V3 verified semantic Current Skills', () => {
     );
   });
 
-  test('migrates a v1 generated-skill Registry to route-aware schema v2 without losing capabilities', () => {
-    const env = setup();
-    try {
-      fs.mkdirSync(path.dirname(env.options.registryPath), { recursive: true });
-      fs.writeFileSync(env.options.registryPath, JSON.stringify({
-        schemaVersion: 1,
-        capabilities: {
-          cap_legacy: {
-            handle: 'cap_legacy',
-            revision: 4,
-            routingName: 'flashcard-image-delivery',
-            description: 'Deliver validated flashcard images.',
-            skillFilePath: path.join(env.options.outputDir, 'cap_legacy', 'SKILL.md'),
-            guidanceHash: 'guidance-legacy',
-            evidenceRefs: [{ ref: 'session.jsonl#12' }],
-            referencedSkills: [],
-            createdAt: '2026-01-01T00:00:00.000Z',
-            updatedAt: '2026-01-01T00:00:00.000Z',
-          },
-        },
-      }), 'utf8');
-
-      const migrated = loadCurrentSkillRegistry(env.options.registryPath);
-      assert.equal(migrated.schemaVersion, 2);
-      assert.equal(migrated.catalogRevision, 0);
-      assert.deepEqual(migrated.routeRedirects, {});
-      assert.equal(migrated.capabilities.cap_legacy?.routingName, 'flashcard-image-delivery');
-      const persisted = JSON.parse(fs.readFileSync(env.options.registryPath, 'utf8')) as { schemaVersion: number; catalogRevision: number; routeRedirects: Record<string, string> };
-      assert.equal(persisted.schemaVersion, 2);
-      assert.equal(persisted.catalogRevision, 0);
-      assert.deepEqual(persisted.routeRedirects, {});
-    } finally {
-      env.cleanup();
-    }
-  });
-
   test('fails closed on a future Registry schema without quarantining or overwriting it', () => {
     const env = setup();
     try {
@@ -505,9 +475,15 @@ describe('V3 verified semantic Current Skills', () => {
           evidenceRefs: ['session.jsonl#12', 'session.jsonl#13'],
         },
       });
-      env.options.verifierFixture = () => {
+      env.options.verifierFixture = ({ bundle }) => {
         verifierCalled = true;
-        return { decision: 'accept', transition: 'replace_current_skill', issues: [], rationale: 'not reached' };
+        return {
+          decision: 'accept',
+          transition: 'replace_current_skill',
+          issues: [],
+          rationale: 'The cited obligations are explicitly resolved.',
+          obligationDispositions: acceptReviewObligations(bundle),
+        };
       };
 
       const result = await runtime.reviewAndApply({
@@ -523,7 +499,7 @@ describe('V3 verified semantic Current Skills', () => {
       });
       assert.equal(result.transition, 'defer');
       assert.equal(result.verified, false);
-      assert.equal(verifierCalled, false);
+      assert.equal(verifierCalled, true);
       assert.match(loadTransitionAudit(env.options.auditPath).at(-1)?.rationale ?? '', /preserve.*route|migrate_skill_route/i);
     } finally {
       env.cleanup();
@@ -594,14 +570,20 @@ describe('V3 verified semantic Current Skills', () => {
           evidenceRefs: ['session.jsonl#12', 'session.jsonl#13'],
         },
       });
-      env.options.verifierFixture = () => {
+      env.options.verifierFixture = ({ bundle }) => {
         verifierCalled = true;
-        return { decision: 'accept', transition: 'create_current_skill', issues: [], rationale: 'not reached' };
+        return {
+          decision: 'accept',
+          transition: 'create_current_skill',
+          issues: [],
+          rationale: 'The cited obligations are explicitly resolved.',
+          obligationDispositions: acceptReviewObligations(bundle),
+        };
       };
       const result = await new SkillEvolutionRuntime(env.options).reviewAndApply(fixtureBundle());
       assert.equal(result.transition, 'defer');
       assert.equal(result.verified, false);
-      assert.equal(verifierCalled, false);
+      assert.equal(verifierCalled, true);
       assert.equal(Object.keys(loadCurrentSkillRegistry(env.options.registryPath).capabilities).length, 0);
       assert.equal(loadTransitionAudit(env.options.auditPath)[0]?.transition, 'defer');
     } finally {
@@ -622,21 +604,27 @@ describe('V3 verified semantic Current Skills', () => {
           evidenceRefs: ['session.jsonl#12', 'session.jsonl#13'],
         },
       });
-      env.options.verifierFixture = () => {
+      env.options.verifierFixture = ({ bundle }) => {
         verifierCalled = true;
-        return { decision: 'accept', transition: 'create_current_skill', issues: [], rationale: 'not reached' };
+        return {
+          decision: 'accept',
+          transition: 'create_current_skill',
+          issues: [],
+          rationale: 'The cited obligations are explicitly resolved.',
+          obligationDispositions: acceptReviewObligations(bundle),
+        };
       };
       const result = await new SkillEvolutionRuntime(env.options).reviewAndApply(fixtureBundle());
       assert.equal(result.transition, 'defer');
       assert.equal(result.verified, false);
-      assert.equal(verifierCalled, false);
+      assert.equal(verifierCalled, true);
       assert.deepEqual(loadCurrentSkillRegistry(env.options.registryPath).capabilities, {});
     } finally {
       env.cleanup();
     }
   });
 
-  test('durably defers a semantic proposal when the production bundle has no observations', async () => {
+  test('runtime draft gate defers after Verifier explicitly dispositions obligations', async () => {
     const env = setup();
     try {
       env.options.reviewQueuePath = path.join(env.root, 'data', 'review-queue.json');
@@ -650,9 +638,15 @@ describe('V3 verified semantic Current Skills', () => {
           evidenceRefs: ['session.jsonl#12', 'session.jsonl#13'],
         },
       });
-      env.options.verifierFixture = () => {
+      env.options.verifierFixture = ({ bundle }) => {
         verifierCalled = true;
-        return { decision: 'accept', transition: 'create_current_skill', issues: [], rationale: 'not reached' };
+        return {
+          decision: 'accept',
+          transition: 'create_current_skill',
+          issues: [],
+          rationale: 'The cited obligations are explicitly resolved.',
+          obligationDispositions: acceptReviewObligations(bundle),
+        };
       };
 
       const result = await new SkillEvolutionRuntime(env.options).reviewAndApply({
@@ -663,13 +657,54 @@ describe('V3 verified semantic Current Skills', () => {
       assert.equal(result.transition, 'defer');
       assert.equal(result.verified, false);
       assert.equal(result.queued, 'deferred');
-      assert.equal(verifierCalled, false);
+      assert.equal(verifierCalled, true);
       assert.deepEqual(loadCurrentSkillRegistry(env.options.registryPath).capabilities, {});
       const queueState = loadEvidenceReviewJobStore(jobStorePathForReviewQueue(env.options.reviewQueuePath));
-      const deferredJobs = Object.values(queueState.jobs).filter(j => j.disposition === 'deferred');
-      assert.equal(deferredJobs.length, 1);
-      assert.match(deferredJobs[0]!.deferState?.reason ?? '', /semantic observation/i);
-      assert.equal(loadTransitionAudit(env.options.auditPath)[0]?.transition, 'defer');
+      const deferred = Object.values(queueState.jobs)
+        .find(job => job.bundle.bundleId === 'episode-no-observations');
+      assert.equal(deferred?.disposition, 'deferred');
+      assert.equal(loadTransitionAudit(env.options.auditPath).at(-1)?.transition, 'defer');
+    } finally {
+      env.cleanup();
+    }
+  });
+
+  test('runtime draft gate never weakens an explicit Verifier rejection', async () => {
+    const env = setup();
+    try {
+      env.options.authorFixture = () => ({
+        body: 'Use the bounded report workflow.',
+        envelope: {
+          decision: 'create_current_skill',
+          routingName: 'validated-report-delivery',
+          description: 'Deliver a validated report.',
+          evidenceRefs: ['session.jsonl#12', 'session.jsonl#13'],
+        },
+      });
+      env.options.verifierFixture = ({ bundle }) => ({
+        decision: 'reject',
+        issues: [{
+          code: 'affirmative-invalidity',
+          message: 'The proposal is affirmatively invalid.',
+          severity: 'danger',
+        }],
+        rationale: 'Verifier rejected the proposal.',
+        obligationDispositions: acceptReviewObligations(bundle).map(disposition => ({
+          ...disposition,
+          decision: 'rejected' as const,
+          rationale: 'The cited obligation proves affirmative invalidity.',
+        })),
+      });
+
+      const result = await new SkillEvolutionRuntime(env.options).reviewAndApply({
+        ...fixtureCandidateBundle(fixtureCandidate(), 'episode-rejected-with-draft-gate'),
+        semanticObservations: [],
+      });
+
+      assert.equal(result.transition, 'reject_candidate');
+      assert.equal(result.verifier?.decision, 'reject');
+      assert.equal(result.verified, false);
+      assert.deepEqual(loadCurrentSkillRegistry(env.options.registryPath).capabilities, {});
     } finally {
       env.cleanup();
     }
@@ -768,10 +803,15 @@ describe('V3 verified semantic Current Skills', () => {
           evidenceRefs: ['session.jsonl#12', 'session.jsonl#13'],
         },
       });
-      env.options.verifierFixture = () => ({
+      env.options.verifierFixture = ({ bundle }) => ({
         decision: 'defer',
         issues: [{ code: 'awaiting-evidence', message: 'Needs stronger material evidence.', severity: 'warning' }],
         rationale: 'Deferring until additional material evidence appears.',
+        obligationDispositions: acceptReviewObligations(bundle).map(disposition => ({
+          ...disposition,
+          decision: 'deferred' as const,
+          rationale: 'Explicitly deferred pending stronger material evidence.',
+        })),
       });
 
       const runtime = new SkillEvolutionRuntime({ ...env.options });
@@ -870,6 +910,11 @@ describe('V3 verified semantic Current Skills', () => {
       assert.equal(Object.keys(registry.capabilities).length, 1);
       assert.equal(service.getCallCount('finish_skill_authoring'), 2);
       assert.equal(service.getCallCount('finish_skill_verification'), 2);
+      assert.ok(
+        service.getToolDefinition('finish_skill_verification')?.parameters.required
+          ?.includes('obligationDispositions'),
+        'the live Verifier tool must require explicit obligation dispositions',
+      );
     } finally {
       env.cleanup();
     }
@@ -1175,11 +1220,12 @@ describe('V3 verified semantic Current Skills', () => {
           },
         };
       };
-      env.options.verifierFixture = () => ({
+      env.options.verifierFixture = ({ bundle }) => ({
         decision: 'accept',
         transition: 'create_current_skill',
         issues: [],
         rationale: 'Continuing peer candidate.',
+        obligationDispositions: acceptReviewObligations(bundle),
       });
 
       const runtime = new SkillEvolutionRuntime(env.options);
@@ -1342,6 +1388,50 @@ describe('V3 verified semantic Current Skills', () => {
       assert.ok(entry);
       assert.equal(operationalFailure(entry)?.failureKind, 'invalid_completion_schema');
       assert.match(operationalFailure(entry)?.failureMessage ?? '', /rationale/);
+      assert.deepEqual(loadCurrentSkillRegistry(env.options.registryPath).capabilities, {});
+    } finally {
+      env.cleanup();
+    }
+  });
+
+  test('queues missing verifier obligation dispositions for operational retry', async () => {
+    const env = setup();
+    try {
+      const reviewQueuePath = path.join(env.root, 'data', 'review-queue.json');
+      env.options.reviewQueuePath = reviewQueuePath;
+      env.options.readerFixture = ({ shard, lane }) => ({
+        findingSet: {
+          shardId: shard.shardId,
+          contentHash: shard.contentHash,
+          lane,
+          coverage: 'covered',
+          findings: [{
+            findingId: `${lane}:risk:${shard.shardId}`,
+            classification: 'risk',
+            summary: 'The cited evidence carries an explicit review risk.',
+            spans: [{ start: 0, end: Math.min(1, shard.byteLength) }],
+          }],
+        },
+      });
+      env.options.verifierFixture = () => ({
+        decision: 'accept',
+        transition: 'create_current_skill',
+        issues: [],
+        rationale: 'Verifier omitted the required obligation dispositions.',
+      });
+
+      const result = await new SkillEvolutionRuntime(env.options).reviewAndApply(
+        fixtureCandidateBundle(fixtureCandidate(), 'missing-obligation-dispositions'),
+      );
+
+      assert.equal(result.queued, 'operational');
+      const entry = findOperationalJobByBundleId(
+        loadEvidenceReviewJobStore(jobStorePathForReviewQueue(reviewQueuePath)),
+        'missing-obligation-dispositions',
+      );
+      assert.ok(entry);
+      assert.equal(operationalFailure(entry)?.failureKind, 'invalid_completion_schema');
+      assert.match(operationalFailure(entry)?.failureMessage ?? '', /Missing disposition/);
       assert.deepEqual(loadCurrentSkillRegistry(env.options.registryPath).capabilities, {});
     } finally {
       env.cleanup();

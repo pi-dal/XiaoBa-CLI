@@ -15,7 +15,10 @@ import {
 import { DistillationHeartbeatScheduler } from './distillation-heartbeat-scheduler';
 import { defaultDistilledOutputDir } from './path-resolver';
 import { bootstrapSemanticReassessmentOnce } from './distilled-skill-bootstrap';
-import { getDistillationHeartbeatConfig } from './distillation-heartbeat-config';
+import {
+  getDistillationHeartbeatConfig,
+  type DistillationHeartbeatConfig,
+} from './distillation-heartbeat-config';
 import { LearningEpisodeStore } from './learning-episode';
 import { EvidenceIngestor } from './evidence-ingestor';
 import { PathResolver } from './path-resolver';
@@ -25,7 +28,7 @@ import { SkillEvolutionOptions, SkillEvolutionRuntime } from './skill-evolution'
 import { SkillUsageCurator } from './skill-usage-curator';
 import { SkillUsageLedger } from './skill-usage-ledger';
 import { DueWorkPlanner } from './due-work-planner';
-import { RuntimeLearning } from './runtime-learning';
+import { RuntimeLearning, type RuntimeLearningOptions } from './runtime-learning';
 
 export interface RuntimeCommandSupportOptions {
   /**
@@ -35,6 +38,78 @@ export interface RuntimeCommandSupportOptions {
   skillEvolutionOptions?: Pick<SkillEvolutionOptions, 'authorFixture' | 'verifierFixture'>;
   /** Injectable runtime clock for curator cadence tests. */
   clock?: () => Date;
+}
+
+export interface RuntimeLearningStackOptions {
+  clock?: () => Date;
+  skillEvolutionOptions?: Pick<
+    SkillEvolutionOptions,
+    'authorFixture' | 'verifierFixture' | 'logEnabled'
+  >;
+  sessionLogSources?: RuntimeLearningOptions['sessionLogSources'];
+}
+
+export interface RuntimeLearningStack {
+  runtimeLearning: RuntimeLearning;
+  skillEvolution: SkillEvolutionRuntime;
+  learningEpisodeStore: LearningEpisodeStore;
+}
+
+/** Construct the one canonical Runtime Learning object graph. */
+export function buildRuntimeLearningStack(
+  workingDirectory: string,
+  config: DistillationHeartbeatConfig,
+  options: RuntimeLearningStackOptions = {},
+): RuntimeLearningStack {
+  const skillsRoot = PathResolver.getSkillsPath();
+  const skillEvolution = new SkillEvolutionRuntime({
+    workingDirectory,
+    branchLogRoot: config.branchLogRoot,
+    outputDir: defaultDistilledOutputDir(skillsRoot),
+    registryPath: config.skillEvolutionRegistryPath,
+    auditPath: config.skillEvolutionAuditPath,
+    journalPath: config.skillEvolutionJournalPath,
+    reviewQueuePath: config.skillEvolutionReviewQueuePath,
+    aiService: new AIService(),
+    settlementWindowMs: config.skillEvolutionSettlementWindowHours * 60 * 60 * 1000,
+    reviewerConcurrency: config.skillEvolutionReviewerConcurrency,
+    operationalRetryMs: config.skillEvolutionOperationalRetryMinutes * 60 * 1000,
+    operationalRetryMaxMs: config.skillEvolutionOperationalRetryMaxHours * 60 * 60 * 1000,
+    reviewAttemptDeadlineMs: config.skillEvolutionReviewAttemptDeadlineMinutes * 60 * 1000,
+    authorModel: config.skillEvolutionAuthorModel,
+    verifierModel: config.skillEvolutionVerifierModel,
+    ...options.skillEvolutionOptions,
+  });
+  const learningEpisodeStore = new LearningEpisodeStore(config.learningEpisodeStorePath);
+  const evidenceIngestor = new EvidenceIngestor({
+    episodeStore: learningEpisodeStore,
+    settlementWindowMs: config.skillEvolutionSettlementWindowHours * 60 * 60 * 1000,
+  });
+  const curator = new SkillUsageCurator({
+    ledger: new SkillUsageLedger(config.skillUsageLedgerPath),
+    statePath: config.skillEvolutionCuratorStatePath,
+    intervalMs: config.skillEvolutionCuratorIntervalHours * 60 * 60 * 1000,
+    runtime: skillEvolution,
+    now: options.clock,
+  });
+  const planner = new DueWorkPlanner({
+    learningEpisodeStorePath: config.learningEpisodeStorePath,
+    reviewQueuePath: config.skillEvolutionReviewQueuePath,
+    curatorStatePath: config.skillEvolutionCuratorStatePath,
+    curatorIntervalMs: config.skillEvolutionCuratorIntervalHours * 60 * 60 * 1000,
+    semanticReassessmentManifestPath: config.skillEvolutionReassessmentManifestPath,
+  });
+  const runtimeLearning = new RuntimeLearning({
+    workingDirectory,
+    evidenceIngestor,
+    learningEpisodeStore,
+    skillEvolution,
+    curator,
+    planner,
+    clock: options.clock,
+    sessionLogSources: options.sessionLogSources,
+  });
+  return { runtimeLearning, skillEvolution, learningEpisodeStore };
 }
 
 interface ActiveRuntimeSupport {
@@ -108,9 +183,6 @@ export async function startRuntimeCommandSupport(
       const currentHeartbeatScheduler = (): DistillationHeartbeatScheduler | null => distillationHeartbeatScheduler;
 
       const config = getDistillationHeartbeatConfig(workingDirectory);
-      const skillsRoot = PathResolver.getSkillsPath();
-      const outputDir = defaultDistilledOutputDir(skillsRoot);
-
       // Only build V3 runtime components (RuntimeLearning + scheduler) when
       // the heartbeat master switch is on AND skill evolution is enabled.
       // When V3 is disabled, background learning is fully suppressed — no
@@ -127,26 +199,14 @@ export async function startRuntimeCommandSupport(
           try {
             // The owner lease fences Journal recovery performed by this
             // constructor and every durable module built below it.
-            const skillEvolution = new SkillEvolutionRuntime({
-              workingDirectory,
-              branchLogRoot: config.branchLogRoot,
-              outputDir,
-              registryPath: config.skillEvolutionRegistryPath,
-              auditPath: config.skillEvolutionAuditPath,
-              journalPath: config.skillEvolutionJournalPath,
-              reviewQueuePath: config.skillEvolutionReviewQueuePath,
-              aiService: new AIService(),
-              settlementWindowMs: config.skillEvolutionSettlementWindowHours * 60 * 60 * 1000,
-              reviewerConcurrency: config.skillEvolutionReviewerConcurrency,
-              operationalRetryMs: config.skillEvolutionOperationalRetryMinutes * 60 * 1000,
-              operationalRetryMaxMs: config.skillEvolutionOperationalRetryMaxHours * 60 * 60 * 1000,
-              reviewAttemptDeadlineMs: config.skillEvolutionReviewAttemptDeadlineMinutes * 60 * 1000,
-              authorModel: config.skillEvolutionAuthorModel,
-              verifierModel: config.skillEvolutionVerifierModel,
-              ...options.skillEvolutionOptions,
+            const {
+              runtimeLearning: builtRuntimeLearning,
+              skillEvolution,
+              learningEpisodeStore,
+            } = buildRuntimeLearningStack(workingDirectory, config, {
+              clock: options.clock,
+              skillEvolutionOptions: options.skillEvolutionOptions,
             });
-
-            const learningEpisodeStore = new LearningEpisodeStore(config.learningEpisodeStorePath);
 
             try {
               await bootstrapSemanticReassessmentOnce({
@@ -159,33 +219,6 @@ export async function startRuntimeCommandSupport(
               Logger.warning(`Semantic skill reassessment bootstrap failed: ${message}`);
             }
 
-            const evidenceIngestor = new EvidenceIngestor({
-              episodeStore: learningEpisodeStore,
-              settlementWindowMs: config.skillEvolutionSettlementWindowHours * 60 * 60 * 1000,
-            });
-            const curator = new SkillUsageCurator({
-              ledger: new SkillUsageLedger(config.skillUsageLedgerPath),
-              statePath: config.skillEvolutionCuratorStatePath,
-              intervalMs: config.skillEvolutionCuratorIntervalHours * 60 * 60 * 1000,
-              runtime: skillEvolution,
-              now: options.clock,
-            });
-            const planner = new DueWorkPlanner({
-              learningEpisodeStorePath: config.learningEpisodeStorePath,
-              reviewQueuePath: config.skillEvolutionReviewQueuePath,
-              curatorStatePath: config.skillEvolutionCuratorStatePath,
-              curatorIntervalMs: config.skillEvolutionCuratorIntervalHours * 60 * 60 * 1000,
-              semanticReassessmentManifestPath: config.skillEvolutionReassessmentManifestPath,
-            });
-            const builtRuntimeLearning = new RuntimeLearning({
-              workingDirectory,
-              evidenceIngestor,
-              learningEpisodeStore,
-              skillEvolution,
-              curator,
-              planner,
-              clock: options.clock,
-            });
             builtScheduler = new DistillationHeartbeatScheduler(
               workingDirectory,
               builtRuntimeLearning,

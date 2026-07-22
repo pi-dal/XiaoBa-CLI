@@ -275,10 +275,6 @@ export interface EvidenceReviewJob {
     reviewerVersion: string;
     reason: string;
     deferredAt: string;
-    /** Released queue baseline retained only when importing pre-consolidation state. */
-    registryReadSet?: readonly CapabilityReadSetEntry[];
-    /** SHA-256 of sorted completion/settlement refs from the released queue. */
-    evidenceFingerprint?: string;
   };
 
   /** Opaque extension bag for pure-graph compatibility. */
@@ -292,13 +288,6 @@ export interface EvidenceReviewJobStoreState {
     nextWorkClass: ReviewWorkClass;
     classCursors: Partial<Record<ReviewWorkClass, string>>;
     jobCursors: Partial<Record<string, string>>;
-  };
-  /** Durable receipts for one-time imports into this authoritative store. */
-  migrations?: {
-    legacyReviewQueueV1?: {
-      sourceHash: string;
-      importedAt: string;
-    };
   };
   /** Set when a corrupt state file was quarantined on load (fail-closed). */
   stateCorrupt?: boolean;

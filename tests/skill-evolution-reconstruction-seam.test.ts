@@ -36,6 +36,7 @@ import { loadEvidenceReviewJobStore, findDeferredJobByBundleId } from '../src/ut
 import type { DistilledKnowledgeCandidate } from '../src/utils/capability-distiller';
 import { readShardStructurally } from '../src/utils/evidence-review-engine';
 import type { EvidenceReviewJob } from '../src/utils/evidence-review-types';
+import { acceptReviewObligations } from './evidence-review-test-fixtures';
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -152,11 +153,16 @@ type VerifierPlan = Array<{
   transition?: SkillEvolutionResult['transition'];
 }>;
 
-function makeVerifierFixture(plan: VerifierPlan): (input: { round: number }) => SkillVerifierResult {
+function makeVerifierFixture(plan: VerifierPlan): NonNullable<SkillEvolutionOptions['verifierFixture']> {
   let i = 0;
-  return () => {
+  return ({ bundle }) => {
     const step = plan[Math.min(i, plan.length - 1)]!;
     i++;
+    const dispositionDecision = step.decision === 'accept'
+      ? 'accepted'
+      : step.decision === 'defer'
+        ? 'deferred'
+        : 'rejected';
     return {
       decision: step.decision,
       ...(step.transition ? { transition: step.transition } : {}),
@@ -168,6 +174,11 @@ function makeVerifierFixture(plan: VerifierPlan): (input: { round: number }) => 
           : step.decision === 'defer'
             ? 'Defer for more evidence.'
             : 'Reject the candidate.',
+      obligationDispositions: acceptReviewObligations(bundle).map(disposition => ({
+        ...disposition,
+        decision: dispositionDecision,
+        rationale: `Test verifier explicitly ${dispositionDecision} this cited obligation.`,
+      })),
     };
   };
 }

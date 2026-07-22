@@ -43,7 +43,6 @@ describe('flashcard specialized bundle preservation (progressive trust)', () => 
     };
     const bundle = buildFlashcardEvidenceBundle(
       makeFlashcardEpisode(),
-      'session.jsonl',
       referencedSkill,
     );
 
@@ -65,7 +64,7 @@ describe('flashcard specialized bundle preservation (progressive trust)', () => 
       evidence => evidence.kind !== 'artifact-validation',
     );
     assert.throws(
-      () => buildFlashcardEvidenceBundle(episode, 'session.jsonl', referencedSkill),
+      () => buildFlashcardEvidenceBundle(episode, referencedSkill),
       /Flashcard evidence bundle requires validation, delivery, and acceptance evidence\./,
     );
   });

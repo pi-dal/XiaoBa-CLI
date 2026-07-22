@@ -242,8 +242,6 @@ export interface ExternalAdmissionCoordinatorOptions {
   readonly stateFilePath: string;
   /** Injected commit function (single-writer boundary). */
   readonly commitFn: ExternalAdmissionCommitFn;
-  /** Optional clock for timestamps (tests inject deterministic clocks). */
-  readonly clock?: () => Date;
 }
 
 /**
@@ -256,14 +254,11 @@ export interface ExternalAdmissionCoordinatorOptions {
 export class ExternalAdmissionCoordinator {
   private readonly stateFilePath: string;
   private readonly commitFn: ExternalAdmissionCommitFn;
-  private readonly clock: () => Date;
-
   private state: ExternalAdmissionCoordinatorState;
 
   constructor(options: ExternalAdmissionCoordinatorOptions) {
     this.stateFilePath = options.stateFilePath;
     this.commitFn = options.commitFn;
-    this.clock = options.clock ?? (() => new Date());
     this.state = this.loadState();
   }
 

@@ -485,7 +485,8 @@ export class EvidenceReviewEngine {
         job = live;
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
-        const operationalKind = extractOperationalKind(error);
+        const operationalKind = extractOperationalKind(error)
+          ?? (message.startsWith('invalid_completion_schema:') ? 'invalid_completion_schema' : undefined);
         const operationalTranscripts = extractOperationalTranscripts(error);
         lastError = {
           message,

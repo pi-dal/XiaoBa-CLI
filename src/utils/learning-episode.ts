@@ -19,7 +19,6 @@ import { DistilledKnowledgeCandidate } from './capability-distiller';
 import {
   EvidenceBundle,
   ReferencedSkillSnapshot,
-  SkillEvolutionRuntime,
   SkillEvidenceRef,
 } from './skill-evolution';
 
@@ -337,7 +336,7 @@ export function extractLearningEpisodes(
     const episodeId = makeEpisodeId(deliverySourceFilePath, deliveryTurn);
     const next = turns[index + 1];
     const signal = next ? detectContradiction(deliverySourceFilePath, deliveryTurn, next, unit.filePath) : undefined;
-    const accepted = next ? detectAcceptance(turnSourceFilePath(next, unit.filePath), deliveryTurn, next) : undefined;
+    const accepted = next ? detectAcceptance(turnSourceFilePath(next, unit.filePath), next) : undefined;
     const hadInitialDeliveryEvidence = hasDeliveryEvidence(evidence);
     if (signal) {
       // Validation-only activity is not a delivery and must not create a
@@ -439,7 +438,7 @@ export function extractLearningEpisodes(
       contradictions.push(signal);
       continue;
     }
-    const accepted = detectAcceptance(turnSourceFilePath(correction, unit.filePath), delivery, correction);
+    const accepted = detectAcceptance(turnSourceFilePath(correction, unit.filePath), correction);
     if (accepted) {
       if (!hasDeliveryEvidence(deliveryEvidence)) {
         const assistantResponse = detectAssistantResponseEvidence(deliverySourceFilePath, delivery);
@@ -842,7 +841,6 @@ function detectContradiction(
 
 function detectAcceptance(
   filePath: string,
-  delivery: CompletedTurn,
   next: CompletedTurn,
 ): EpisodeEvidenceRef | undefined {
   const message = next.user.text.trim();
@@ -952,9 +950,8 @@ export interface LearningEpisodeStoreState {
 
 export interface LearningEpisodeStoreOptions {
   /**
-   * Injectable atomic writer used by both `load()` migration and `save()`.
-   * Defaults to a temp-file + rename atomic write. Tests inject a deterministic
-   * writer to simulate migration I/O failure without leaving partial state.
+   * Injectable atomic writer used by `save()` and `recover()`.
+   * Defaults to a temp-file + rename atomic write.
    */
   atomicWrite?: (filePath: string, state: LearningEpisodeStoreState) => void;
   /**
@@ -998,12 +995,22 @@ export class LearningEpisodeStore {
       );
     }
 
-    let parsed: LearningEpisodeStoreState & { schemaVersion?: number };
+    let parsed: LearningEpisodeStoreState;
     try {
-      parsed = JSON.parse(raw) as unknown as typeof parsed;
-      if (!parsed.episodes || typeof parsed.episodes !== 'object') throw new Error('invalid episode store');
-      const persistedVersion: number | undefined = parsed.schemaVersion;
-      if (persistedVersion !== undefined && persistedVersion !== 1 && persistedVersion !== 2 && persistedVersion !== 3) {
+      parsed = JSON.parse(raw) as LearningEpisodeStoreState;
+      if (
+        !parsed
+        || typeof parsed !== 'object'
+        || parsed.schemaVersion !== LEARNING_EPISODE_SCHEMA_VERSION
+        || !parsed.episodes
+        || typeof parsed.episodes !== 'object'
+        || Object.values(parsed.episodes).some(episode => (
+          !episode
+          || typeof episode !== 'object'
+          || episode.schemaVersion !== LEARNING_EPISODE_SCHEMA_VERSION
+          || !Array.isArray(episode.semanticObservations)
+        ))
+      ) {
         throw new Error('invalid episode store');
       }
     } catch (error) {
@@ -1015,52 +1022,7 @@ export class LearningEpisodeStore {
       return { ...emptyEpisodeStoreState(), stateCorrupt: true };
     }
 
-    const persistedVersion: number | undefined = parsed.schemaVersion;
-    const persistingV1 = persistedVersion === undefined || persistedVersion === 1;
-    if (persistedVersion === 3) {
-      for (const episode of Object.values(parsed.episodes)) {
-        if (!Array.isArray(episode.semanticObservations)) episode.semanticObservations = [];
-        episode.schemaVersion = LEARNING_EPISODE_SCHEMA_VERSION;
-      }
-      return parsed as LearningEpisodeStoreState;
-    }
-
-    if (!persistingV1 && persistedVersion !== 2) {
-      return parsed as LearningEpisodeStoreState;
-    }
-
-    // v1/v2 → v3 migration: the store-level schemaVersion AND each nested
-    // episode schemaVersion must be upgraded together. Legacy status labels
-    // 'promoted' → 'eligible' and 'rejected' → 'contradicted' are migrated in
-    // the same pass. Evidence, settlement deadline, and predecessor/retry
-    // linkage are preserved untouched. Missing observations remain an empty
-    // array so legacy input is explicit incomplete semantic input, not a
-    // fabricated observation set.
-    for (const episode of Object.values(parsed.episodes)) {
-      const rawStatus = episode.status as string;
-      if (rawStatus === 'promoted') {
-        episode.status = 'eligible' as const;
-      } else if (rawStatus === 'rejected') {
-        episode.status = 'contradicted' as const;
-      }
-      episode.schemaVersion = LEARNING_EPISODE_SCHEMA_VERSION;
-      if (!Array.isArray(episode.semanticObservations)) episode.semanticObservations = [];
-    }
-    parsed.schemaVersion = LEARNING_EPISODE_SCHEMA_VERSION;
-
-    // Durable migration write. A structurally valid legacy store whose atomic
-    // migration write fails must NOT return an empty state that a later caller
-    // could overwrite — report a durable migration I/O failure instead so the
-    // source evidence is retained for diagnosis and retry.
-    try {
-      this.atomicWrite(parsed as LearningEpisodeStoreState);
-    } catch (cause) {
-      throw new Error(
-        `Learning Episode store migration write failed: ${cause instanceof Error ? cause.message : String(cause)}`,
-      );
-    }
-
-    return parsed as LearningEpisodeStoreState;
+    return parsed;
   }
 
   save(state: LearningEpisodeStoreState): void {
@@ -1334,7 +1296,6 @@ function hasContinuationSignal(text: string): boolean {
 
 export function buildFlashcardEvidenceBundle(
   episode: LearningEpisode,
-  sourceFilePath: string,
   referencedSkill: ReferencedSkillSnapshot,
 ): EvidenceBundle {
   const settlementEvidence = episode.completionEvidence.filter(evidence => evidence.kind === 'user-acceptance');

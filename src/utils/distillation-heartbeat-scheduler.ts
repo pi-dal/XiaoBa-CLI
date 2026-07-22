@@ -30,12 +30,6 @@ import type {
 // Public types
 // ---------------------------------------------------------------------------
 
-export type HeartbeatReason = RuntimeLearningReason;
-
-export interface HeartbeatRunResult extends RuntimeLearningHeartbeatResult {
-  // Same shape as RuntimeLearningHeartbeatResult — re-exported for compat.
-}
-
 // ---------------------------------------------------------------------------
 // Constants and helpers
 // ---------------------------------------------------------------------------
@@ -53,7 +47,7 @@ const MAX_TIMEOUT_MS = 2_147_483_647;
 const MIN_NEXT_WAKE_BACKOFF_MS = 30 * 1000;
 const MAX_NEXT_WAKE_BACKOFF_MS = 10 * 60 * 1000;
 
-function emptyWakeResult(ran = false): HeartbeatRunResult {
+function emptyWakeResult(ran = false): RuntimeLearningHeartbeatResult {
   return {
     unitsProcessed: 0,
     advancedFiles: 0,
@@ -93,11 +87,10 @@ export class DistillationHeartbeatScheduler {
   private readonly runtimeLearning: RuntimeLearning;
   private readonly ownerLock: HeartbeatSchedulerOwnerLock | null;
   private timer: NodeJS.Timeout | null = null;
-  private running = false;
   private started = false;
   private stopped = false;
-  private readonly pendingWakeReasons = new Set<HeartbeatReason>();
-  private activeWake: Promise<HeartbeatRunResult> | null = null;
+  private readonly pendingWakeReasons = new Set<RuntimeLearningReason>();
+  private activeWake: Promise<RuntimeLearningHeartbeatResult> | null = null;
   private scheduledWake: Promise<void> | null = null;
   /**
    * Consecutive count of reschedules where the planner returned a due
@@ -173,8 +166,6 @@ export class DistillationHeartbeatScheduler {
     })();
     this.trackScheduledWake(startupWake);
 
-    // For legacy scheduling, track the startup wake explicitly since the legacy
-    // path does not assign into activeWake.
   }
 
   async stop(): Promise<boolean> {
@@ -298,10 +289,9 @@ export class DistillationHeartbeatScheduler {
   /**
    * Run one heartbeat cycle.
    *
-   * Production: delegates all work to `RuntimeLearning.wake()`.
-   * Legacy: runs the old session-scanning and hook-based logic.
+   * Delegates all work to `RuntimeLearning.wake()`.
    */
-  async runHeartbeat(reason: HeartbeatReason = 'manual'): Promise<HeartbeatRunResult> {
+  async runHeartbeat(reason: RuntimeLearningReason = 'manual'): Promise<RuntimeLearningHeartbeatResult> {
     if (
       this.stopped
       || !DistillationHeartbeatScheduler.shouldStartForCurrentRuntime(this.workingDirectory)
@@ -327,12 +317,10 @@ export class DistillationHeartbeatScheduler {
 
     this.pendingWakeReasons.add(reason);
     this.persistPendingWakeReasons();
-    const wakeCycle = async (): Promise<HeartbeatRunResult> => {
-      this.running = true;
-      try {
-        let lastResult = emptyWakeResult(true);
-        let isCoalescedWake = false;
-        while (!this.stopped && this.pendingWakeReasons.size > 0) {
+    const wakeCycle = async (): Promise<RuntimeLearningHeartbeatResult> => {
+      let lastResult = emptyWakeResult(true);
+      let isCoalescedWake = false;
+      while (!this.stopped && this.pendingWakeReasons.size > 0) {
           const nextReasons = [...this.pendingWakeReasons];
           this.pendingWakeReasons.clear();
           this.persistPendingWakeReasons();
@@ -357,11 +345,8 @@ export class DistillationHeartbeatScheduler {
             Logger.warning(`[DistillationHeartbeat] runtime wake failed: ${error.message}`);
             return emptyWakeResult(false);
           }
-        }
-        return lastResult;
-      } finally {
-        this.running = false;
       }
+      return lastResult;
     };
 
     this.activeWake = wakeCycle();
@@ -395,7 +380,7 @@ export class DistillationHeartbeatScheduler {
     );
 
     let nextDelay: number;
-    let wakeReason: HeartbeatReason;
+    let wakeReason: RuntimeLearningReason;
     let isImmediateReschedule = false;
     try {
       const plan = this.getActivePlanner().plan();
@@ -403,7 +388,7 @@ export class DistillationHeartbeatScheduler {
         const deadlineDelta = Math.max(0, plan.nextWakeTime - plan.now.getTime());
         if (deadlineDelta < intervalDelay) {
           nextDelay = deadlineDelta;
-          wakeReason = plan.nextWakeReason as HeartbeatReason;
+          wakeReason = plan.nextWakeReason as RuntimeLearningReason;
           if (deadlineDelta === 0) {
             isImmediateReschedule = true;
           }

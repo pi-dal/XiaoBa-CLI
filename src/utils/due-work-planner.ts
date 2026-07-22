@@ -314,8 +314,8 @@ export class DueWorkPlanner {
 
   private readEarliestOperationalRetryDeadline(): number | null {
     // After Round 9 consolidation, the Evidence Review Job store is the single
-    // durable owner of operational retry state. Legacy review-queue.json
-    // entries are migrated by SkillEvolutionRuntime construction before planning.
+    // durable owner of operational retry state; legacy review-queue.json files
+    // are not imported.
     let earliest: number | null = null;
     try {
       const jobStorePath = evidenceReviewJobStorePathForReviewQueue(this.sources.reviewQueuePath);

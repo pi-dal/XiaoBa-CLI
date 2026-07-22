@@ -1,5 +1,4 @@
 import * as fs from 'fs';
-import * as path from 'path';
 import {
   isSessionTurnEntry,
   ParsedSessionLogEntry,
@@ -11,7 +10,6 @@ import {
   getCursor,
   loadLogCursorState,
   LogCursorEntry,
-  LogCursorState,
   markCursorFailed,
   saveLogCursorState,
 } from './log-cursor-state';
@@ -446,8 +444,6 @@ function readContinuityTailFromPath(
 ): DistillationTurn[] {
   const fileSize = fs.statSync(filePath).size;
   if (fileSize <= 0 || maxBytes <= 0) return [];
-  const readLen = Math.min(maxBytes, fileSize);
-  const readStart = fileSize - readLen;
   const fd = fs.openSync(filePath, 'r');
   try {
     return readContinuityTailFromFile(fd, fileSize, maxBytes);

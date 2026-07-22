@@ -27,7 +27,7 @@ import { getDistillationHeartbeatConfig, DistillationHeartbeatConfig } from './d
 import type { ExternalHistoryMode } from './distillation-heartbeat-config';
 import { LearningEpisodeStore, LearningEpisode, buildLearningEpisodeCandidate } from './learning-episode';
 import { SkillEvolutionRuntime, CapabilityTransitionKind } from './skill-evolution';
-import { SkillUsageCurator, CuratorRunResult } from './skill-usage-curator';
+import { SkillUsageCurator } from './skill-usage-curator';
 import type { GeneratedSkillLoadFact } from './skill-usage-ledger';
 import { Logger } from './logger';
 import { bootstrapSemanticReassessmentOnce } from './distilled-skill-bootstrap';
@@ -842,7 +842,6 @@ export class RuntimeLearning {
         'external-admission-coordinator-state.json',
       ),
       commitFn: (page) => this.commitExternalEvidencePage(page),
-      clock: this.clock,
     });
   }
 
@@ -2952,10 +2951,6 @@ export class RuntimeLearning {
       return skippedCurationReport();
     }
 
-    // Override the dueWork flags if observations since planning triggered
-    // a new expedited wake.
-    const effectiveExpeditedDue = dueWork.expeditedCuratorDue || hasExpedited;
-
     try {
       const result = await this.curator.runDue();
       const transitionsByKind: Partial<Record<CapabilityTransitionKind, number>> = {};
@@ -3981,10 +3976,6 @@ export class RuntimeLearning {
     }
 
     // Use the coordinator's round-robin selection for external source ordering.
-    // Ready providers are those that are enabled and not drained.
-    const readyExternalProviderIds = external
-      .filter(adapter => adapter.isEnabled())
-      .map(adapter => adapter.identity.provider);
     const ordered: SessionLogSourceAdapter[] = [];
     const remaining = new Set(external);
 
@@ -5165,11 +5156,11 @@ export class RuntimeLearning {
       reviewContinuationEpisodes = episodeCount + reviewJobCount;
     } catch { /* missing continuation means zero */ }
     try {
-      const queue = JSON.parse(fs.readFileSync(this.config.skillEvolutionReviewQueuePath, 'utf8')) as {
-        operational?: unknown;
-      };
-      operationalReviews = Array.isArray(queue.operational) ? queue.operational.length : 0;
-    } catch { /* missing queue means zero */ }
+      const jobs = this.skillEvolution.getEvidenceReviewEngine().loadStore().jobs;
+      operationalReviews = Object.values(jobs)
+        .filter(job => job.disposition === 'active' && job.workClass === 'operational_recovery')
+        .length;
+    } catch { /* missing job store means zero */ }
     const nextWakeMs = nextWakeAt ? Date.parse(nextWakeAt) : Number.NaN;
     return {
       eligibleEpisodes,
@@ -5354,22 +5345,4 @@ function toStablePathComponent(value: string): string {
   const normalized = value.trim();
   if (!normalized) return 'backfill';
   return encodeURIComponent(normalized).replace(/%/g, '_');
-}
-
-function resolveSessionLogsRoot(logsRoot: string): string {
-  const normalizedRoot = path.resolve(logsRoot);
-  return path.basename(normalizedRoot) === 'sessions'
-    ? normalizedRoot
-    : path.join(normalizedRoot, 'sessions');
-}
-
-function collectJsonlFiles(dir: string): string[] {
-  if (!fs.existsSync(dir)) return [];
-  const files: string[] = [];
-  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-    const fullPath = path.join(dir, entry.name);
-    if (entry.isDirectory()) files.push(...collectJsonlFiles(fullPath));
-    else if (entry.isFile() && entry.name.endsWith('.jsonl')) files.push(fullPath);
-  }
-  return files.sort();
 }
