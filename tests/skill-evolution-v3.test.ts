@@ -6,9 +6,12 @@ import * as os from 'os';
 import * as path from 'path';
 import { Message, ToolDefinition } from '../src/types';
 import { SkillManager } from '../src/skills/skill-manager';
+import { SkillParser } from '../src/skills/skill-parser';
 import type { DistilledKnowledgeCandidate } from '../src/utils/capability-distiller';
+import { semanticPriorGuidanceEvidenceRef } from '../src/utils/evidence-bundle-authority';
 import {
   computeCurrentSkillRegistryHash,
+  CurrentSkillRecord,
   emptyCurrentSkillRegistryState,
   EvidenceBundle,
   isLifecycleOrGenericRoutingName,
@@ -215,6 +218,7 @@ class StreamingOnlyReviewAIService extends AbortAwareReviewAttemptAIService {
 function fixtureBundle(): EvidenceBundle {
   return {
     bundleId: 'episode-flashcard-1',
+    authority: { kind: 'flashcard', episodeId: 'episode-flashcard-1' },
     episode: { problem: 'Make a flashcard artifact', completion: 'artifact delivered' },
     completionEvidence: [{ ref: 'session.jsonl#12' }],
     settlementEvidence: [{ ref: 'session.jsonl#13' }],
@@ -261,6 +265,66 @@ function fixtureCandidate(): DistilledKnowledgeCandidate {
     ],
     generatedAt: '2026-07-10T00:00:00.000Z',
     sourceUnit: { filePath: 'session.jsonl', byteRange: { start: 0, end: 20 }, generatedAt: '2026-07-10T00:00:00.000Z' },
+  };
+}
+
+function semanticMaintenanceBundle(
+  record: CurrentSkillRecord,
+  bundleId: string,
+): EvidenceBundle {
+  const base = fixtureBundle();
+  const guidanceRef = semanticPriorGuidanceEvidenceRef(record.handle, record.guidanceHash);
+  const guidanceBody = SkillParser.parse(record.skillFilePath).content.trim();
+  return {
+    ...base,
+    bundleId,
+    authority: {
+      kind: 'semantic-reassessment',
+      targetCapabilityHandle: record.handle,
+    },
+    episode: {
+      ...fixtureCandidate(),
+      capabilityHandle: record.handle,
+    },
+    completionEvidence: [
+      {
+        ref: guidanceRef,
+        sourceFilePath: record.skillFilePath,
+        turn: 0,
+      },
+      ...base.completionEvidence,
+    ],
+    referencedSkills: [],
+    relatedCurrentSkills: [{
+      handle: record.handle,
+      revision: record.revision,
+      routingName: record.routingName,
+      description: record.description,
+      guidanceHash: record.guidanceHash,
+    }],
+    sourceEvidence: [
+      {
+        ref: guidanceRef,
+        role: 'problem-action',
+        content: guidanceBody,
+        sourceFilePath: record.skillFilePath,
+        turn: 0,
+      },
+      ...base.completionEvidence.map((evidence, index) => ({
+        ref: evidence.ref,
+        role: 'problem-action' as const,
+        content: `Frozen semantic action observation ${index + 1}.`,
+        ...(evidence.sourceFilePath ? { sourceFilePath: evidence.sourceFilePath } : {}),
+        ...(evidence.turn !== undefined ? { turn: evidence.turn } : {}),
+      })),
+      ...base.settlementEvidence.map((evidence, index) => ({
+        ref: evidence.ref,
+        role: 'verification' as const,
+        content: `Frozen semantic observation ${index + 1}.`,
+        ...(evidence.sourceFilePath ? { sourceFilePath: evidence.sourceFilePath } : {}),
+        ...(evidence.turn !== undefined ? { turn: evidence.turn } : {}),
+      })),
+    ],
   };
 }
 
@@ -409,6 +473,132 @@ describe('V3 verified semantic Current Skills', () => {
     }
   });
 
+  test('new review admission and direct mutation reject missing or malformed authority', async () => {
+    const env = setup();
+    try {
+      const bundle: EvidenceBundle = {
+        ...fixtureBundle(),
+        authority: undefined,
+        bundleId: 'legacy-v3:spoofed-generic-authority',
+      };
+      const runtime = new SkillEvolutionRuntime(env.options);
+
+      await assert.rejects(
+        runtime.reviewAndApply(bundle),
+        /Evidence Bundle authority is missing/,
+      );
+      assert.throws(
+        () => applyCapabilityTransition({
+          ...env.options,
+          bundle,
+          draft: {
+            body: 'Attempt a direct mutation without explicit authority.',
+            envelope: {
+              decision: 'create_current_skill',
+              routingName: 'missing-authority-mutation',
+              description: 'Must never be installed.',
+              evidenceRefs: ['session.jsonl#12', 'session.jsonl#13'],
+            },
+          },
+          transition: 'create_current_skill',
+          verifier: {
+            decision: 'accept',
+            transition: 'create_current_skill',
+            issues: [],
+            rationale: 'Fixture acceptance must not bypass runtime authority.',
+          },
+          branchTranscriptPaths: [],
+          reviewerVersion: 'test',
+          promptVersion: 'test',
+        }),
+        /Evidence Bundle authority is missing/,
+      );
+      await assert.rejects(
+        runtime.reviewAndApply({
+          ...fixtureBundle(),
+          authority: {
+            kind: 'learning-episode',
+            targetCapabilityHandle: 'cap_wrong_identity_field',
+          } as any,
+        }),
+        /Evidence Bundle authority is malformed/,
+      );
+      assert.deepEqual(runtime.getRegistry().capabilities, {});
+    } finally {
+      env.cleanup();
+    }
+  });
+
+  test('flashcard authority permits creation but rejects cross-capability mutation', async () => {
+    const env = setup();
+    try {
+      const runtime = new SkillEvolutionRuntime(env.options);
+      const current = (await runtime.reviewAndApply(fixtureBundle())).record!;
+      const bundle: EvidenceBundle = {
+        ...fixtureBundle(),
+        bundleId: 'episode-flashcard-cross-capability',
+        authority: {
+          kind: 'flashcard',
+          episodeId: 'episode-flashcard-cross-capability',
+        },
+        relatedCurrentSkills: [{
+          handle: current.handle,
+          revision: current.revision,
+          routingName: current.routingName,
+          description: current.description,
+          guidanceHash: current.guidanceHash,
+        }],
+      };
+      env.options.authorFixture = () => ({
+        body: 'Attempt to append evidence through the flashcard compatibility path.',
+        envelope: {
+          decision: 'append_evidence',
+          targetCapabilityHandle: current.handle,
+          evidenceRefs: ['session.jsonl#12', 'session.jsonl#13'],
+        },
+      });
+      env.options.verifierFixture = () => ({
+        decision: 'accept',
+        transition: 'append_evidence',
+        issues: [],
+        rationale: 'Exercise the authority boundary.',
+      });
+
+      const reviewed = await runtime.reviewAndApply(bundle);
+      assert.equal(reviewed.transition, 'defer');
+      assert.equal(reviewed.verified, false);
+
+      assert.throws(
+        () => applyCapabilityTransition({
+          ...env.options,
+          bundle,
+          draft: {
+            body: 'Attempt a direct flashcard evidence append.',
+            envelope: {
+              decision: 'append_evidence',
+              targetCapabilityHandle: current.handle,
+              evidenceRefs: ['session.jsonl#12', 'session.jsonl#13'],
+            },
+          },
+          transition: 'append_evidence',
+          verifier: {
+            decision: 'accept',
+            transition: 'append_evidence',
+            issues: [],
+            rationale: 'Direct callers must observe the same authority boundary.',
+          },
+          registryReadSet: [{ handle: current.handle, revision: current.revision }],
+          branchTranscriptPaths: [],
+          reviewerVersion: 'test',
+          promptVersion: 'test',
+        }),
+        /flashcard authority permits Current Skill creation only/,
+      );
+    } finally {
+      env.cleanup();
+    }
+  });
+
   test('passes fixed semantic observations to Author and Verifier without making Runtime name the capability', async () => {
     const env = setup();
     try {
@@ -444,6 +634,10 @@ describe('V3 verified semantic Current Skills', () => {
       const bundle = {
         ...fixtureBundle(),
         bundleId: 'v3:learning-episode:episode-single-observation',
+        authority: {
+          kind: 'learning-episode' as const,
+          episodeId: 'episode-single-observation',
+        },
       };
       env.options.verifierFixture = () => ({
         decision: 'accept',
@@ -473,6 +667,10 @@ describe('V3 verified semantic Current Skills', () => {
       const bundle: EvidenceBundle = {
         ...fixtureBundle(),
         bundleId: 'v3:learning-episode:episode-unloaded-target',
+        authority: {
+          kind: 'learning-episode',
+          episodeId: 'episode-unloaded-target',
+        },
         referencedSkills: [],
         referencedSkillProvenance: {
           kind: 'runtime-owned-generated-skill-load-v1',
@@ -480,6 +678,14 @@ describe('V3 verified semantic Current Skills', () => {
           agentTurnEpisodeId: 'turn-unloaded-target',
           referencedSkills: [],
         },
+        semanticObservations: [
+          ...(fixtureBundle().semanticObservations ?? []),
+          {
+            kind: 'user-intent',
+            value: `Append bounded evidence to ${current.routingName}.`,
+            sourceRefs: ['session.jsonl#12'],
+          },
+        ],
         relatedCurrentSkills: [{
           handle: current.handle,
           revision: current.revision,
@@ -509,6 +715,58 @@ describe('V3 verified semantic Current Skills', () => {
       assert.equal(result.transition, 'append_evidence');
       assert.equal(result.verified, true);
       assert.equal(loadCurrentSkillRegistry(env.options.registryPath).capabilities[current.handle]!.revision, current.revision + 1);
+
+      const updated = loadCurrentSkillRegistry(
+        env.options.registryPath,
+      ).capabilities[current.handle]!;
+      const unboundedBundle: EvidenceBundle = {
+        ...bundle,
+        bundleId: 'v3:learning-episode:episode-unbounded-target',
+        authority: {
+          kind: 'learning-episode',
+          episodeId: 'episode-unbounded-target',
+        },
+        semanticObservations: fixtureBundle().semanticObservations,
+        relatedCurrentSkills: [{
+          handle: updated.handle,
+          revision: updated.revision,
+          routingName: updated.routingName,
+          description: updated.description,
+          guidanceHash: updated.guidanceHash,
+        }],
+      };
+      assert.throws(
+        () => applyCapabilityTransition({
+          ...env.options,
+          bundle: unboundedBundle,
+          draft: {
+            body: 'Attempt to append outside the bounded related set.',
+            envelope: {
+              decision: 'append_evidence',
+              targetCapabilityHandle: current.handle,
+              evidenceRefs: ['session.jsonl#12', 'session.jsonl#13'],
+            },
+          },
+          transition: 'append_evidence',
+          verifier: {
+            decision: 'accept',
+            transition: 'append_evidence',
+            issues: [],
+            rationale: 'Direct mutation must still enforce bundle authority.',
+          },
+          branchTranscriptPaths: [],
+          reviewerVersion: 'test',
+          promptVersion: 'test',
+        }),
+        /learning-episode authority permits create or evidence-proven bounded-target append only/,
+      );
+      const unbounded = await runtime.reviewAndApply(unboundedBundle);
+      assert.equal(unbounded.transition, 'defer');
+      assert.equal(unbounded.verifier.issues[0]?.code, 'learning-episode-scope');
+      assert.equal(
+        loadCurrentSkillRegistry(env.options.registryPath).capabilities[current.handle]!.revision,
+        current.revision + 1,
+      );
     } finally {
       env.cleanup();
     }
@@ -567,6 +825,10 @@ describe('V3 verified semantic Current Skills', () => {
         const result = await runtime.reviewAndApply({
           ...fixtureBundle(),
           bundleId: `v3:learning-episode:episode-structural-${index}`,
+          authority: {
+            kind: 'learning-episode',
+            episodeId: `episode-structural-${index}`,
+          },
           relatedCurrentSkills,
         });
 
@@ -686,23 +948,22 @@ describe('V3 verified semantic Current Skills', () => {
           evidenceRefs: ['session.jsonl#12', 'session.jsonl#13'],
         },
       });
-      env.options.verifierFixture = ({ draft }) => {
+      env.options.verifierFixture = ({ bundle, draft }) => {
         verifierCalled = true;
         assert.equal(draft.envelope.routingName, 'settled-artifact-delivery');
-        return { decision: 'accept', transition: 'replace_current_skill', issues: [], rationale: 'The legacy route is preserved while the bounded guidance is revised.' };
+        return {
+          decision: 'accept',
+          transition: 'replace_current_skill',
+          issues: [],
+          rationale: 'The legacy route is preserved while the bounded guidance is revised.',
+          obligationDispositions: acceptReviewObligations(bundle),
+        };
       };
 
-      const result = await runtime.reviewAndApply({
-        ...fixtureBundle(),
-        bundleId: 'legacy-route-replacement',
-        relatedCurrentSkills: [{
-          handle: created.record!.handle,
-          revision: registry.capabilities[created.record!.handle]!.revision,
-          routingName: 'settled-artifact-delivery',
-          description: registry.capabilities[created.record!.handle]!.description,
-          guidanceHash: registry.capabilities[created.record!.handle]!.guidanceHash,
-        }],
-      });
+      const result = await runtime.reviewAndApply(semanticMaintenanceBundle(
+        registry.capabilities[created.record!.handle]!,
+        `semantic-reassessment:${created.record!.handle}:legacy-route-replacement`,
+      ));
       assert.equal(result.transition, 'replace_current_skill');
       assert.equal(result.verified, true);
       assert.equal(verifierCalled, true);
@@ -903,20 +1164,20 @@ describe('V3 verified semantic Current Skills', () => {
           registryReadSet: [],
           issues: [],
           rationale: 'The replacement is supported by the fixed Evidence Bundle.',
+          obligationDispositions: acceptReviewObligations(bundle),
         };
-      };
-      const currentContext = {
-        handle: initial.handle,
-        revision: initial.revision,
-        routingName: initial.routingName,
-        description: initial.description,
-        guidanceHash: initial.guidanceHash,
       };
       // Two concurrent public wakes freeze the same declared revision. Exactly one
       // may commit; the loser is stale-before-fence and must not write journal/audit.
       const [first, second] = await Promise.all([
-        runtime.reviewAndApply({ ...fixtureBundle(), bundleId: 'replace-a', relatedCurrentSkills: [currentContext] }),
-        runtime.reviewAndApply({ ...fixtureBundle(), bundleId: 'replace-b', relatedCurrentSkills: [currentContext] }),
+        runtime.reviewAndApply(semanticMaintenanceBundle(
+          initial,
+          `semantic-reassessment:${initial.handle}:replace-a`,
+        )),
+        runtime.reviewAndApply(semanticMaintenanceBundle(
+          initial,
+          `semantic-reassessment:${initial.handle}:replace-b`,
+        )),
       ]);
 
       const outcomes = [first, second];
@@ -1883,8 +2144,10 @@ describe('V3 verified semantic Current Skills', () => {
       const create = await new SkillEvolutionRuntime(env.options).reviewAndApply(bundle);
       const first = create.record!;
       const migrationBundle: EvidenceBundle = {
-        ...bundle,
-        bundleId: 'episode-flashcard-route-migration',
+        ...semanticMaintenanceBundle(
+          first,
+          `semantic-reassessment:${first.handle}:route-migration`,
+        ),
         semanticObservations: [
           ...(bundle.semanticObservations ?? []),
           {
@@ -1920,9 +2183,13 @@ describe('V3 verified semantic Current Skills', () => {
       assert.equal(registry.capabilities[first.handle]!.skillFilePath, first.skillFilePath);
       assert.equal(loadTransitionAudit(env.options.auditPath).at(-1)!.priorRoutingName, first.routingName);
       assert.equal(loadTransitionAudit(env.options.auditPath).at(-1)!.resultingRoutingName, 'flashcard-image-generation');
+      const secondMigrationBundle = semanticMaintenanceBundle(
+        migrated.record!,
+        `semantic-reassessment:${first.handle}:route-migration-v2`,
+      );
       const secondMigration = applyCapabilityTransition({
         ...env.options,
-        bundle: migrationBundle,
+        bundle: secondMigrationBundle,
         draft: { body: 'The same capability with a clearer public route.', envelope: {
           decision: 'migrate_skill_route',
           targetCapabilityHandle: first.handle,
@@ -1970,10 +2237,14 @@ describe('V3 verified semantic Current Skills', () => {
       };
       const created = await new SkillEvolutionRuntime(env.options).reviewAndApply(bundle);
       const generated = created.record!;
+      const generatedMigrationBundle = semanticMaintenanceBundle(
+        generated,
+        `semantic-reassessment:${generated.handle}:invalid-route`,
+      );
 
       assert.throws(() => applyCapabilityTransition({
         ...env.options,
-        bundle,
+        bundle: generatedMigrationBundle,
         draft: { body: 'A valid body.', envelope: {
           decision: 'migrate_skill_route',
           targetCapabilityHandle: generated.handle,
@@ -2005,10 +2276,14 @@ describe('V3 verified semantic Current Skills', () => {
         updatedAt: new Date(0).toISOString(),
       };
       saveCurrentSkillRegistry(env.options.registryPath, registry);
+      const manualMigrationBundle = semanticMaintenanceBundle(
+        registry.capabilities.manual!,
+        'semantic-reassessment:manual:route-migration',
+      );
 
       assert.throws(() => applyCapabilityTransition({
         ...env.options,
-        bundle,
+        bundle: manualMigrationBundle,
         draft: { body: 'Do not rename manual skills.', envelope: {
           decision: 'migrate_skill_route',
           targetCapabilityHandle: 'manual',
@@ -2029,9 +2304,13 @@ describe('V3 verified semantic Current Skills', () => {
       const activeRegistry = loadCurrentSkillRegistry(env.options.registryPath);
       activeRegistry.routeRedirects['retired-route'] = generated.handle;
       saveCurrentSkillRegistry(env.options.registryPath, activeRegistry);
+      const collisionBundle = semanticMaintenanceBundle(
+        activeRegistry.capabilities[generated.handle]!,
+        `semantic-reassessment:${generated.handle}:retired-route`,
+      );
       assert.throws(() => applyCapabilityTransition({
         ...env.options,
-        bundle,
+        bundle: collisionBundle,
         draft: { body: 'Route resurrection is forbidden.', envelope: {
           decision: 'migrate_skill_route',
           targetCapabilityHandle: generated.handle,
@@ -2049,7 +2328,7 @@ describe('V3 verified semantic Current Skills', () => {
     }
   });
 
-  test('applies append, replace, merge, and retire as active-only transitions with audit hashes', async () => {
+  test('applies bounded append/replace and operator retirement while rejecting merge without dedicated authority', async () => {
     const env = setup();
     try {
       const bundle = fixtureBundle();
@@ -2059,9 +2338,13 @@ describe('V3 verified semantic Current Skills', () => {
         issues: [],
         rationale: `accepted ${transition}`,
       });
-      const apply = (draft: SkillDraft, transition: Parameters<typeof accepted>[0]) => applyCapabilityTransition({
+      const apply = (
+        transitionBundle: EvidenceBundle,
+        draft: SkillDraft,
+        transition: Parameters<typeof accepted>[0],
+      ) => applyCapabilityTransition({
         ...env.options,
-        bundle,
+        bundle: transitionBundle,
         draft,
         transition,
         verifier: accepted(transition),
@@ -2075,7 +2358,11 @@ describe('V3 verified semantic Current Skills', () => {
       assert.equal(create.audit!.priorGuidanceHash, null);
       assert.equal(create.audit!.resultingGuidanceHash, first.guidanceHash);
 
-      const append = apply({ body: 'unchanged body', envelope: {
+      const appendBundle = semanticMaintenanceBundle(
+        first,
+        `semantic-reassessment:${first.handle}:append`,
+      );
+      const append = apply(appendBundle, { body: 'unchanged body', envelope: {
         decision: 'append_evidence',
         targetCapabilityHandle: first.handle,
         evidenceRefs: ['session.jsonl#12', 'session.jsonl#13'],
@@ -2087,7 +2374,11 @@ describe('V3 verified semantic Current Skills', () => {
       assert.equal(afterAppend.revision, first.revision + 1, 'every Registry mutation advances the optimistic-concurrency revision');
 
       const previousActiveContent = fs.readFileSync(first.skillFilePath, 'utf8');
-      const replace = apply({ body: 'Replacement guidance with a validated boundary.', envelope: {
+      const replaceBundle = semanticMaintenanceBundle(
+        afterAppend,
+        `semantic-reassessment:${first.handle}:replace`,
+      );
+      const replace = apply(replaceBundle, { body: 'Replacement guidance with a validated boundary.', envelope: {
         decision: 'replace_current_skill',
         targetCapabilityHandle: first.handle,
         routingName: first.routingName,
@@ -2104,35 +2395,74 @@ describe('V3 verified semantic Current Skills', () => {
       assert.equal(fs.readFileSync(historyPath, 'utf8'), previousActiveContent);
       assert.notEqual(fs.readFileSync(replaced.skillFilePath, 'utf8'), previousActiveContent);
 
-      const second = apply({ body: 'Second independent guidance.', envelope: {
+      const secondBundle = {
+        ...bundle,
+        bundleId: 'episode-flashcard-second',
+        authority: { kind: 'flashcard' as const, episodeId: 'episode-flashcard-second' },
+      };
+      const second = apply(secondBundle, { body: 'Second independent guidance.', envelope: {
         decision: 'create_current_skill',
         routingName: 'second-workflow',
         description: 'A second active workflow.',
         evidenceRefs: ['session.jsonl#12', 'session.jsonl#13'],
       } }, 'create_current_skill').record!;
-      const merge = apply({ body: 'Merge metadata only.', envelope: {
-        decision: 'merge_into_capability',
-        targetCapabilityHandle: first.handle,
-        sourceCapabilityHandle: second.handle,
-        evidenceRefs: ['session.jsonl#12'],
-      } }, 'merge_into_capability');
-      assert.equal(merge.audit.priorGuidanceHash, second.guidanceHash);
-      assert.equal(merge.audit.resultingGuidanceHash, replaced.guidanceHash);
-      const mergedRegistry = loadCurrentSkillRegistry(env.options.registryPath);
-      assert.deepEqual(Object.keys(mergedRegistry.capabilities), [first.handle]);
-      assert.equal(fs.existsSync(second.skillFilePath), false);
-      assert.equal(fs.existsSync(mergedRegistry.capabilities[first.handle]!.skillFilePath), true);
+      const mergeBundle = semanticMaintenanceBundle(
+        replaced,
+        `semantic-reassessment:${first.handle}:merge`,
+      );
+      assert.throws(
+        () => apply(mergeBundle, { body: 'Merge metadata only.', envelope: {
+          decision: 'merge_into_capability',
+          targetCapabilityHandle: first.handle,
+          sourceCapabilityHandle: second.handle,
+          evidenceRefs: ['session.jsonl#12'],
+        } }, 'merge_into_capability'),
+        /authority|dedicated/i,
+      );
+      const beforeRetire = loadCurrentSkillRegistry(env.options.registryPath);
+      assert.ok(beforeRetire.capabilities[second.handle]);
+      assert.ok(fs.existsSync(beforeRetire.capabilities[second.handle]!.skillFilePath));
 
-      const retire = apply({ body: 'Retirement record.', envelope: {
+      const retirementDraft: SkillDraft = { body: 'Retirement record.', envelope: {
         decision: 'retire_capability',
         targetCapabilityHandle: first.handle,
-      } }, 'retire_capability');
-      assert.equal(retire.audit.priorGuidanceHash, mergedRegistry.capabilities[first.handle]!.guidanceHash);
+      } };
+      assert.throws(
+        () => apply(mergeBundle, retirementDraft, 'retire_capability'),
+        /authority/,
+      );
+      const operatorBundle: EvidenceBundle = {
+        ...semanticMaintenanceBundle(
+          beforeRetire.capabilities[first.handle]!,
+          `operator-retire:${first.handle}:test`,
+        ),
+        authority: {
+          kind: 'operator-control',
+          targetCapabilityHandle: first.handle,
+        },
+        episode: {
+          kind: 'operator-skill-control',
+          action: 'retire',
+          capabilityHandle: first.handle,
+        },
+      };
+      const retire = applyCapabilityTransition({
+        ...env.options,
+        bundle: operatorBundle,
+        draft: retirementDraft,
+        transition: 'retire_capability',
+        verifier: accepted('retire_capability'),
+        branchTranscriptPaths: [],
+        reviewerVersion: 'test-reviewer',
+        promptVersion: 'test-prompt',
+        manualSkillNames: ['manual-skill'],
+      });
+      assert.equal(retire.audit.priorGuidanceHash, beforeRetire.capabilities[first.handle]!.guidanceHash);
       assert.equal(retire.audit.resultingGuidanceHash, null);
-      assert.deepEqual(loadCurrentSkillRegistry(env.options.registryPath).capabilities, {});
-      assert.equal(fs.existsSync(mergedRegistry.capabilities[first.handle]!.skillFilePath), false);
+      assert.deepEqual(Object.keys(loadCurrentSkillRegistry(env.options.registryPath).capabilities), [second.handle]);
+      assert.equal(fs.existsSync(beforeRetire.capabilities[first.handle]!.skillFilePath), false);
       assert.deepEqual(loadTransitionAudit(env.options.auditPath).map(entry => entry.transition), [
-        'create_current_skill', 'append_evidence', 'replace_current_skill', 'create_current_skill', 'merge_into_capability', 'retire_capability',
+        'create_current_skill', 'append_evidence', 'replace_current_skill', 'create_current_skill', 'retire_capability',
       ]);
     } finally {
       env.cleanup();
@@ -2173,6 +2503,115 @@ describe('V3 verified semantic Current Skills', () => {
       assert.equal(loadTransitionAudit(env.options.auditPath).length, 2);
       assert.equal(recoverTransitionJournal(env.options), false);
       assert.equal(loadTransitionAudit(env.options.auditPath).length, 2, 'recovery is idempotent');
+    } finally {
+      env.cleanup();
+    }
+  });
+
+  test('refuses a new journal when the Registry moved beyond its prior and target states', () => {
+    const env = setup();
+    try {
+      const priorRegistry = emptyCurrentSkillRegistryState();
+      const targetRegistry = {
+        ...priorRegistry,
+        catalogRevision: 1,
+      };
+      const concurrentRegistry = {
+        ...priorRegistry,
+        catalogRevision: 2,
+      };
+      saveCurrentSkillRegistry(env.options.registryPath, concurrentRegistry);
+      const transitionId = 'transition-registry-precondition';
+      const journal: TransitionJournal = {
+        schemaVersion: 2,
+        transitionId,
+        priorRegistryHash: computeCurrentSkillRegistryHash(priorRegistry),
+        targetRegistryHash: computeCurrentSkillRegistryHash(targetRegistry),
+        targetRegistry,
+        skillOperations: [],
+        audit: { transitionId } as TransitionAuditEntry,
+      };
+      fs.mkdirSync(path.dirname(env.options.journalPath), { recursive: true });
+      fs.writeFileSync(env.options.journalPath, JSON.stringify(journal), 'utf8');
+
+      assert.throws(
+        () => recoverTransitionJournal(env.options),
+        /Registry precondition no longer matches/,
+      );
+      assert.equal(loadCurrentSkillRegistry(env.options.registryPath).catalogRevision, 2);
+      assert.equal(fs.existsSync(env.options.journalPath), true);
+    } finally {
+      env.cleanup();
+    }
+  });
+
+  test('refuses a new delete operation when its file changed after planning', async () => {
+    const env = setup();
+    try {
+      const created = await new SkillEvolutionRuntime(env.options).reviewAndApply(fixtureBundle());
+      const record = created.record!;
+      const priorRegistry = loadCurrentSkillRegistry(env.options.registryPath);
+      const targetRegistry = emptyCurrentSkillRegistryState();
+      fs.writeFileSync(record.skillFilePath, 'changed after the transition was planned', 'utf8');
+      const transitionId = 'transition-file-precondition';
+      const journal: TransitionJournal = {
+        schemaVersion: 2,
+        transitionId,
+        priorRegistryHash: computeCurrentSkillRegistryHash(priorRegistry),
+        targetRegistryHash: computeCurrentSkillRegistryHash(targetRegistry),
+        targetRegistry,
+        skillOperations: [{
+          path: record.skillFilePath,
+          priorHash: record.guidanceHash,
+          delete: true,
+        }],
+        audit: { transitionId } as TransitionAuditEntry,
+      };
+      fs.mkdirSync(path.dirname(env.options.journalPath), { recursive: true });
+      fs.writeFileSync(env.options.journalPath, JSON.stringify(journal), 'utf8');
+
+      assert.throws(
+        () => recoverTransitionJournal(env.options),
+        /file precondition no longer matches/,
+      );
+      assert.equal(fs.readFileSync(record.skillFilePath, 'utf8'), 'changed after the transition was planned');
+      assert.equal(loadCurrentSkillRegistry(env.options.registryPath).capabilities[record.handle]?.routingName, record.routingName);
+      assert.equal(fs.existsSync(env.options.journalPath), true);
+    } finally {
+      env.cleanup();
+    }
+  });
+
+  test('refuses a journal whose declared content hash does not match its payload', () => {
+    const env = setup();
+    try {
+      new SkillEvolutionRuntime(env.options);
+      const targetRegistry = loadCurrentSkillRegistry(env.options.registryPath);
+      const operationPath = path.join(env.options.outputDir, 'cap-tampered', 'SKILL.md');
+      const transitionId = 'transition-content-hash-mismatch';
+      const journal: TransitionJournal = {
+        schemaVersion: 2,
+        transitionId,
+        priorRegistryHash: computeCurrentSkillRegistryHash(targetRegistry),
+        targetRegistryHash: computeCurrentSkillRegistryHash(targetRegistry),
+        targetRegistry,
+        skillOperations: [{
+          path: operationPath,
+          content: 'tampered journal payload',
+          expectedHash: crypto.createHash('sha256').update('different payload').digest('hex'),
+          priorHash: null,
+        }],
+        audit: { transitionId } as TransitionAuditEntry,
+      };
+      fs.mkdirSync(path.dirname(env.options.journalPath), { recursive: true });
+      fs.writeFileSync(env.options.journalPath, JSON.stringify(journal), 'utf8');
+
+      assert.throws(
+        () => recoverTransitionJournal(env.options),
+        /unsafe or malformed Skill operation/,
+      );
+      assert.equal(fs.existsSync(operationPath), false);
+      assert.equal(fs.existsSync(env.options.journalPath), true);
     } finally {
       env.cleanup();
     }
@@ -2231,7 +2670,10 @@ describe('V3 verified semantic Current Skills', () => {
       const priorContent = fs.readFileSync(first.skillFilePath, 'utf8');
       const replacement = applyCapabilityTransition({
         ...env.options,
-        bundle,
+        bundle: semanticMaintenanceBundle(
+          first,
+          `semantic-reassessment:${first.handle}:restore-source`,
+        ),
         draft: { body: 'Replacement body.', envelope: {
           decision: 'replace_current_skill',
           targetCapabilityHandle: first.handle,
@@ -2253,6 +2695,7 @@ describe('V3 verified semantic Current Skills', () => {
       });
       assert.equal(restored.audit.transition, 'restore_capability_revision');
       assert.equal(restored.record!.guidanceHash, first.guidanceHash);
+      assert.equal(restored.record!.guidanceContentHash, first.guidanceContentHash);
       assert.equal(fs.readFileSync(first.skillFilePath, 'utf8'), priorContent);
       assert.equal(loadCurrentSkillRegistry(env.options.registryPath).capabilities[first.handle]!.revision, replacement.record!.revision + 1);
       assert.equal(loadTransitionAudit(env.options.auditPath).at(-1)!.transition, 'restore_capability_revision');
@@ -2270,7 +2713,7 @@ describe('V3 verified semantic Current Skills', () => {
       const priorContent = fs.readFileSync(first.skillFilePath, 'utf8');
       const replacementInput = {
         ...env.options,
-        bundle: { ...bundle, bundleId: 'material-revision-retry' },
+        bundle: semanticMaintenanceBundle(first, 'material-revision-retry'),
         draft: { body: 'Replacement guidance with a validated boundary.', envelope: {
           decision: 'replace_current_skill' as const,
           targetCapabilityHandle: first.handle,
@@ -2309,7 +2752,7 @@ describe('V3 verified semantic Current Skills', () => {
       const priorContent = fs.readFileSync(first.skillFilePath, 'utf8');
       const replacement = applyCapabilityTransition({
         ...env.options,
-        bundle: { ...bundle, bundleId: 'restore-source-replacement' },
+        bundle: semanticMaintenanceBundle(first, 'restore-source-replacement'),
         draft: { body: 'Replacement body.', envelope: {
           decision: 'replace_current_skill',
           targetCapabilityHandle: first.handle,
@@ -2369,6 +2812,10 @@ describe('V3 verified semantic Current Skills', () => {
 
       const usageBundle: EvidenceBundle = {
         bundleId: `usage-curation:${current.handle}:usage-fact-1`,
+        authority: {
+          kind: 'usage-reassessment',
+          targetCapabilityHandle: current.handle,
+        },
         episode: {
           kind: 'usage-reassessment',
           capabilityHandle: current.handle,
@@ -2392,6 +2839,33 @@ describe('V3 verified semantic Current Skills', () => {
         }],
       };
 
+      assert.throws(
+        () => applyCapabilityTransition({
+          ...env.options,
+          bundle: usageBundle,
+          draft: {
+            body: 'Attempt a usage-driven guidance rewrite.',
+            envelope: {
+              decision: 'replace_current_skill',
+              targetCapabilityHandle: current.handle,
+              routingName: current.routingName,
+              description: current.description,
+              evidenceRefs: ['ledger:load-fact', 'ledger:replace-fact'],
+            },
+          },
+          transition: 'replace_current_skill',
+          verifier: {
+            decision: 'accept',
+            transition: 'replace_current_skill',
+            issues: [],
+            rationale: 'Direct mutation must still enforce bundle authority.',
+          },
+          branchTranscriptPaths: [],
+          reviewerVersion: 'test',
+          promptVersion: 'test',
+        }),
+        /usage-reassessment authority permits exact-target evidence append only/,
+      );
       const result = await runtime.reviewUsageAndApply(usageBundle);
       assert.equal(result.transition, 'append_evidence');
       assert.equal(result.verified, true);
@@ -2407,7 +2881,7 @@ describe('V3 verified semantic Current Skills', () => {
     }
   });
 
-  test('reviewUsageAndApply can replace the affected Current Skill after an explicit contradiction', async () => {
+  test('reviewUsageAndApply rejects replacement without the prior guidance in the fixed review basis', async () => {
     const env = setup();
     try {
       const runtime = new SkillEvolutionRuntime(env.options);
@@ -2430,6 +2904,10 @@ describe('V3 verified semantic Current Skills', () => {
       });
       const usageBundle: EvidenceBundle = {
         bundleId: `usage-curation:${current.handle}:replace-fact`,
+        authority: {
+          kind: 'usage-reassessment',
+          targetCapabilityHandle: current.handle,
+        },
         episode: {
           kind: 'usage-reassessment',
           capabilityHandle: current.handle,
@@ -2451,9 +2929,68 @@ describe('V3 verified semantic Current Skills', () => {
 
       const result = await runtime.reviewUsageAndApply(usageBundle);
 
-      assert.equal(result.transition, 'replace_current_skill');
-      assert.equal(result.record!.handle, current.handle);
-      assert.notEqual(result.record!.guidanceHash, current.guidanceHash);
+      assert.equal(result.transition, 'reject_candidate');
+      assert.equal(result.record, undefined);
+      const unchanged = runtime.getRegistry().capabilities[current.handle]!;
+      assert.equal(unchanged.guidanceHash, current.guidanceHash);
+      assert.equal(unchanged.revision, current.revision);
+    } finally {
+      env.cleanup();
+    }
+  });
+
+  test('reviewUsageAndApply rejects automatic retirement without a bounded correction snapshot', async () => {
+    const env = setup();
+    try {
+      const runtime = new SkillEvolutionRuntime(env.options);
+      const current = (await runtime.reviewAndApply(fixtureBundle())).record!;
+      env.options.authorFixture = ({ bundle }) => ({
+        body: 'Retire the affected Skill after the contradicted usage outcome.',
+        envelope: {
+          decision: 'retire_capability',
+          targetCapabilityHandle: current.handle,
+          evidenceRefs: [...bundle.completionEvidence, ...bundle.settlementEvidence].map(ref => ref.ref),
+        },
+      });
+      env.options.verifierFixture = ({ draft }) => ({
+        decision: 'accept',
+        transition: draft.envelope.decision,
+        issues: [],
+        rationale: 'Fixture accepts retirement so the runtime authority gate is exercised.',
+      });
+      const usageBundle: EvidenceBundle = {
+        bundleId: `usage-curation:${current.handle}:retire-fact`,
+        authority: {
+          kind: 'usage-reassessment',
+          targetCapabilityHandle: current.handle,
+        },
+        episode: {
+          kind: 'usage-reassessment',
+          capabilityHandle: current.handle,
+          routingName: current.routingName,
+          factualOutcomes: [{ outcome: 'contradicted' }],
+        },
+        completionEvidence: [{ ref: 'ledger:load-fact' }],
+        settlementEvidence: [{ ref: 'ledger:retire-fact' }],
+        boundedContinuity: [],
+        referencedSkills: [],
+        relatedCurrentSkills: [{
+          handle: current.handle,
+          revision: current.revision,
+          routingName: current.routingName,
+          description: current.description,
+          guidanceHash: current.guidanceHash,
+        }],
+      };
+
+      const result = await runtime.reviewUsageAndApply(usageBundle);
+
+      assert.equal(result.transition, 'reject_candidate');
+      assert.equal(result.record, undefined);
+      const unchanged = runtime.getRegistry().capabilities[current.handle]!;
+      assert.equal(unchanged.guidanceHash, current.guidanceHash);
+      assert.equal(unchanged.revision, current.revision);
+      assert.equal(fs.existsSync(current.skillFilePath), true);
     } finally {
       env.cleanup();
     }
@@ -2494,6 +3031,10 @@ describe('V3 verified semantic Current Skills', () => {
 
       const usageBundle = (factId: string): EvidenceBundle => ({
         bundleId: `usage-curation:${affected.handle}:${factId}`,
+        authority: {
+          kind: 'usage-reassessment',
+          targetCapabilityHandle: affected.handle,
+        },
         episode: {
           kind: 'usage-reassessment',
           capabilityHandle: affected.handle,
@@ -2553,6 +3094,277 @@ describe('V3 verified semantic Current Skills', () => {
     }
   });
 
+  test('semantic reassessment rejects structural and cross-target transitions', async () => {
+    const env = setup();
+    try {
+      const runtime = new SkillEvolutionRuntime(env.options);
+      const target = (await runtime.reviewAndApply(fixtureBundle())).record!;
+
+      env.options.authorFixture = ({ bundle }) => ({
+        body: 'Use the separate observed workflow.',
+        envelope: {
+          decision: 'create_current_skill',
+          routingName: 'separate-observed-workflow',
+          description: 'Apply a separate observed workflow.',
+          evidenceRefs: [...bundle.completionEvidence, ...bundle.settlementEvidence].map(ref => ref.ref),
+        },
+      });
+      env.options.verifierFixture = ({ bundle, draft }) => ({
+        decision: 'accept',
+        transition: draft.envelope.decision,
+        issues: [],
+        rationale: 'Fixture acceptance exercises the runtime authority boundary.',
+        obligationDispositions: acceptReviewObligations(bundle),
+      });
+      const other = (await runtime.reviewAndApply({
+        ...fixtureBundle(),
+        bundleId: 'episode-separate-semantic-target',
+        relatedCurrentSkills: [{
+          handle: target.handle,
+          revision: target.revision,
+          routingName: target.routingName,
+          description: target.description,
+          guidanceHash: target.guidanceHash,
+        }],
+      })).record!;
+
+      const semanticBundle = (
+        suffix: string,
+        bundleTargetHandle = target.handle,
+        episodeTargetHandle = target.handle,
+        includeUnrelated = false,
+      ): EvidenceBundle => ({
+        ...fixtureBundle(),
+        bundleId: `semantic-reassessment:${bundleTargetHandle}:guidance-${suffix}:observations-${suffix}`,
+        authority: {
+          kind: 'semantic-reassessment',
+          targetCapabilityHandle: bundleTargetHandle,
+        },
+        episode: {
+          ...fixtureCandidate(),
+          capabilityHandle: episodeTargetHandle,
+        },
+        referencedSkills: [],
+        relatedCurrentSkills: [
+          {
+            handle: target.handle,
+            revision: target.revision,
+            routingName: target.routingName,
+            description: target.description,
+            guidanceHash: target.guidanceHash,
+          },
+          ...(includeUnrelated
+            ? [{
+                handle: other.handle,
+                revision: other.revision,
+                routingName: other.routingName,
+                description: other.description,
+                guidanceHash: other.guidanceHash,
+              }]
+            : []),
+        ],
+      });
+      const attempt = async (
+        suffix: string,
+        envelope: SkillDraft['envelope'],
+        bundleTargetHandle = target.handle,
+        episodeTargetHandle = target.handle,
+        includeUnrelated = false,
+      ) => {
+        env.options.authorFixture = ({ bundle }) => ({
+          body: 'Apply only the bounded semantic observations.',
+          envelope: {
+            ...envelope,
+            evidenceRefs: [...bundle.completionEvidence, ...bundle.settlementEvidence].map(ref => ref.ref),
+          },
+        });
+        return runtime.reviewAndApply(
+          semanticBundle(suffix, bundleTargetHandle, episodeTargetHandle, includeUnrelated),
+        );
+      };
+
+      const results = [
+        await attempt('create', {
+          decision: 'create_current_skill',
+          routingName: 'semantic-derived-workflow',
+          description: 'A new workflow inferred during reassessment.',
+        }),
+        await attempt('merge', {
+          decision: 'merge_into_capability',
+          targetCapabilityHandle: target.handle,
+          sourceCapabilityHandle: other.handle,
+        }),
+        await attempt('retire', {
+          decision: 'retire_capability',
+          targetCapabilityHandle: target.handle,
+        }),
+        await attempt('replace-without-prior-guidance', {
+          decision: 'replace_current_skill',
+          targetCapabilityHandle: target.handle,
+          routingName: target.routingName,
+          description: target.description,
+        }),
+        await attempt('migrate-without-prior-guidance', {
+          decision: 'migrate_skill_route',
+          targetCapabilityHandle: target.handle,
+          routingName: 'semantic-migration-without-prior-guidance',
+          description: target.description,
+        }),
+        await attempt('cross-target', {
+          decision: 'append_evidence',
+          targetCapabilityHandle: other.handle,
+        }),
+        await attempt('bundle-target-mismatch', {
+          decision: 'append_evidence',
+          targetCapabilityHandle: target.handle,
+        }, other.handle),
+        await attempt('unrelated-read-set', {
+          decision: 'append_evidence',
+          targetCapabilityHandle: target.handle,
+        }, target.handle, target.handle, true),
+      ];
+
+      assert.deepEqual(results.map(result => result.transition), [
+        'reject_candidate',
+        'reject_candidate',
+        'reject_candidate',
+        'reject_candidate',
+        'reject_candidate',
+        'reject_candidate',
+        'reject_candidate',
+        'reject_candidate',
+      ]);
+      assert.equal(results.every(result => result.verifier.issues[0]?.code === 'semantic-reassessment-scope'), true);
+      const registry = runtime.getRegistry();
+      assert.equal(registry.capabilities[target.handle]!.revision, target.revision);
+      assert.equal(registry.capabilities[other.handle]!.revision, other.revision);
+    } finally {
+      env.cleanup();
+    }
+  });
+
+  test('semantic reassessment permits exact-target evidence append and route migration', async () => {
+    const env = setup();
+    try {
+      const runtime = new SkillEvolutionRuntime(env.options);
+      const target = (await runtime.reviewAndApply(fixtureBundle())).record!;
+      const semanticBundle = (
+        suffix: string,
+        record: typeof target,
+        freezePriorGuidance = false,
+      ): EvidenceBundle => {
+        const base: EvidenceBundle = {
+          ...fixtureBundle(),
+          bundleId: `semantic-reassessment:${record.handle}:${record.guidanceHash}:${suffix}`,
+          authority: {
+            kind: 'semantic-reassessment',
+            targetCapabilityHandle: record.handle,
+          },
+          episode: {
+            ...fixtureCandidate(),
+            capabilityHandle: record.handle,
+          },
+          referencedSkills: [],
+          relatedCurrentSkills: [{
+            handle: record.handle,
+            revision: record.revision,
+            routingName: record.routingName,
+            description: record.description,
+            guidanceHash: record.guidanceHash,
+          }],
+        };
+        if (!freezePriorGuidance) return base;
+        const guidanceRef = semanticPriorGuidanceEvidenceRef(record.handle, record.guidanceHash);
+        const guidanceBody = SkillParser.parse(record.skillFilePath).content.trim();
+        return {
+          ...base,
+          completionEvidence: [{
+            ref: guidanceRef,
+            sourceFilePath: record.skillFilePath,
+            turn: 0,
+          }],
+          sourceEvidence: [
+            {
+              ref: guidanceRef,
+              role: 'problem-action',
+              content: guidanceBody,
+              sourceFilePath: record.skillFilePath,
+              turn: 0,
+            },
+            ...base.settlementEvidence.map((evidence, index) => ({
+              ref: evidence.ref,
+              role: 'verification' as const,
+              content: `Frozen semantic observations ${index + 1}.`,
+              ...(evidence.sourceFilePath ? { sourceFilePath: evidence.sourceFilePath } : {}),
+              ...(evidence.turn !== undefined ? { turn: evidence.turn } : {}),
+            })),
+          ],
+        };
+      };
+      env.options.verifierFixture = ({ bundle, draft }) => ({
+        decision: 'accept',
+        transition: draft.envelope.decision,
+        issues: [],
+        rationale: 'The exact-target transition is supported by the bounded reassessment.',
+        obligationDispositions: acceptReviewObligations(bundle),
+      });
+
+      env.options.authorFixture = ({ bundle }) => ({
+        body: 'Keep the current guidance while retaining the new evidence.',
+        envelope: {
+          decision: 'append_evidence',
+          targetCapabilityHandle: target.handle,
+          evidenceRefs: [...bundle.completionEvidence, ...bundle.settlementEvidence].map(ref => ref.ref),
+        },
+      });
+      const appended = await runtime.reviewAndApply(semanticBundle('append', target));
+      assert.equal(appended.transition, 'append_evidence');
+      assert.equal(appended.verified, true);
+
+      const afterAppend = runtime.getRegistry().capabilities[target.handle]!;
+      const migrationDraft: SkillDraft = {
+        body: 'Apply the observed flashcard workflow and validate the delivered artifact.',
+        envelope: {
+          decision: 'migrate_skill_route',
+          targetCapabilityHandle: target.handle,
+          routingName: 'observed-flashcard-workflow',
+          description: afterAppend.description,
+        },
+      };
+      assert.throws(
+        () => applyCapabilityTransition({
+          ...env.options,
+          bundle: semanticBundle('direct-migrate-without-prior', afterAppend),
+          draft: migrationDraft,
+          transition: 'migrate_skill_route',
+          verifier: {
+            decision: 'accept',
+            transition: 'migrate_skill_route',
+            issues: [],
+            rationale: 'Direct mutation must still enforce frozen prior guidance.',
+          },
+          branchTranscriptPaths: [],
+          reviewerVersion: 'test',
+          promptVersion: 'test',
+        }),
+        /semantic guidance rewrite requires a matching frozen prior-guidance body/,
+      );
+      env.options.authorFixture = () => ({
+        ...migrationDraft,
+      });
+      const migrated = await runtime.reviewAndApply(
+        semanticBundle('migrate', afterAppend, true),
+      );
+
+      assert.equal(migrated.transition, 'migrate_skill_route');
+      assert.equal(migrated.verified, true);
+      assert.equal(migrated.record?.handle, target.handle);
+      assert.equal(migrated.record?.routingName, 'observed-flashcard-workflow');
+    } finally {
+      env.cleanup();
+    }
+  });
+
   test('reviewUsageAndApply surfaces durable operational retry instead of semantic rejection', async () => {
     for (const configureReviewQueue of [false, true]) {
       const env = setup();
@@ -2607,17 +3419,10 @@ describe('V3 verified semantic Current Skills', () => {
         rationale: 'Would accept if the declared Registry handle still existed.',
       });
 
-      const replaceBundle = {
-        ...fixtureBundle(),
-        bundleId: 'replace-after-delete',
-        relatedCurrentSkills: [{
-          handle: initial.handle,
-          revision: initial.revision,
-          routingName: initial.routingName,
-          description: initial.description,
-          guidanceHash: initial.guidanceHash,
-        }],
-      };
+      const replaceBundle = semanticMaintenanceBundle(
+        initial,
+        `semantic-reassessment:${initial.handle}:replace-after-delete`,
+      );
 
       // Delete the capability from the live Registry so the declared read set is stale.
       const registry = loadCurrentSkillRegistry(env.options.registryPath);
@@ -2711,17 +3516,10 @@ describe('V3 verified semantic Current Skills', () => {
       registry.catalogRevision += 1;
       saveCurrentSkillRegistry(env.options.registryPath, registry);
 
-      const replaceBundle = {
-        ...fixtureBundle(),
-        bundleId: 'replace-race-before-fence',
-        relatedCurrentSkills: [{
-          handle: initial.handle,
-          revision: initial.revision, // frozen declared revision (stale vs live)
-          routingName: initial.routingName,
-          description: initial.description,
-          guidanceHash: initial.guidanceHash,
-        }],
-      };
+      const replaceBundle = semanticMaintenanceBundle(
+        initial,
+        `semantic-reassessment:${initial.handle}:replace-race-before-fence`,
+      );
 
       const auditsBefore = loadTransitionAudit(env.options.auditPath).length;
       const result = await new SkillEvolutionRuntime(env.options).reviewAndApply(replaceBundle);
@@ -2772,13 +3570,14 @@ describe('V3 verified semantic Current Skills', () => {
           },
         };
       };
-      env.options.verifierFixture = ({ draft }) => {
+      env.options.verifierFixture = ({ bundle, draft }) => {
         verifierCalls += 1;
         return {
           decision: 'accept' as const,
           transition: draft.envelope.decision,
           issues: [],
           rationale: 'Accept under the frozen declared basis.',
+          obligationDispositions: acceptReviewObligations(bundle),
         };
       };
 
@@ -2794,16 +3593,14 @@ describe('V3 verified semantic Current Skills', () => {
       // loser hits Registry conflict / stale fence and must supersede — never
       // re-run Author/Verifier on the same durable job.
       const [first, second] = await Promise.all([
-        runtime.reviewAndApply({
-          ...fixtureBundle(),
-          bundleId: 'replace-conflict-a',
-          relatedCurrentSkills: [frozenContext],
-        }),
-        runtime.reviewAndApply({
-          ...fixtureBundle(),
-          bundleId: 'replace-conflict-b',
-          relatedCurrentSkills: [frozenContext],
-        }),
+        runtime.reviewAndApply(semanticMaintenanceBundle(
+          initial,
+          `semantic-reassessment:${initial.handle}:replace-conflict-a`,
+        )),
+        runtime.reviewAndApply(semanticMaintenanceBundle(
+          initial,
+          `semantic-reassessment:${initial.handle}:replace-conflict-b`,
+        )),
       ]);
 
       const outcomes = [first, second];
@@ -2827,7 +3624,16 @@ describe('V3 verified semantic Current Skills', () => {
       const jobs = Object.values(store.jobs);
       const supersededJob = jobs.find(j => j.disposition === 'superseded');
       const successor = jobs.find(j => j.parentJobId && j.disposition === 'active');
-      assert.ok(supersededJob, 'stale job must be marked superseded');
+      assert.ok(
+        supersededJob,
+        `stale job must be marked superseded: ${JSON.stringify(jobs.map(job => ({
+          bundleId: job.bundle.bundleId,
+          disposition: job.disposition,
+          parentJobId: job.parentJobId,
+          successorJobId: job.successorJobId,
+          terminalReason: job.terminalReason,
+        })))}`,
+      );
       assert.ok(successor, 'successor job freezes the live basis');
       assert.equal(successor!.parentJobId, supersededJob!.jobId);
       assert.notEqual(

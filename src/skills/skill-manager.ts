@@ -1,7 +1,7 @@
 import { Skill } from '../types/skill';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import { PathResolver } from '../utils/path-resolver';
+import { defaultDistilledOutputDir, PathResolver } from '../utils/path-resolver';
 import { SkillParser } from './skill-parser';
 import { Logger } from '../utils/logger';
 import {
@@ -168,7 +168,10 @@ export class SkillManager {
     const registryPath = PathResolver.getSkillEvolutionRegistryPath();
     const loaded = loadCurrentSkillRegistry(registryPath);
     // Fail closed / restore from authoritative history only. Never invent guidance.
-    const reconciled = reconcileActiveGeneratedSkillArtifacts(loaded);
+    const reconciled = reconcileActiveGeneratedSkillArtifacts(
+      loaded,
+      defaultDistilledOutputDir(PathResolver.getSkillsPath()),
+    );
     if (reconciled.repaired) {
       try {
         // Persist restored paths only after successful artifact recovery.

@@ -58,6 +58,22 @@ function makeEpisode(): LearningEpisode {
       { ref: 'session.jsonl#5:artifact-delivery', sourceFilePath: 'session.jsonl', turn: 5, kind: 'artifact-delivery' },
     ],
     contradictionSignals: [],
+    sourceEvidence: [
+      {
+        ref: 'session.jsonl#4:problem-action',
+        role: 'problem-action',
+        content: 'User:\nApply the generated helper.\n\nAssistant:\nI loaded the helper.',
+        sourceFilePath: 'session.jsonl',
+        turn: 4,
+      },
+      {
+        ref: 'session.jsonl#5:artifact-delivery',
+        role: 'problem-action',
+        content: 'User:\nDeliver the result.\n\nAssistant:\nThe result was delivered.',
+        sourceFilePath: 'session.jsonl',
+        turn: 5,
+      },
+    ],
     semanticObservations: [
       { kind: 'user-intent', value: 'apply the generated helper', sourceRefs: ['session.jsonl#4:problem-action'] },
     ],

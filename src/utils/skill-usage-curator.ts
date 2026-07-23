@@ -104,6 +104,44 @@ export class SkillUsageCurator {
     return Object.values(this.loadState().expedited);
   }
 
+  /**
+   * Rebuild expedited wake state from durable ledger facts.
+   *
+   * The outcome append and curator-state rename are separate durable writes.
+   * A process can stop between them, so the JSONL ledger is the source of
+   * truth and the wake map is a rebuildable scheduling projection.
+   */
+  recoverExpeditedWakes(): void {
+    const state = this.loadState();
+    const facts = this.options.ledger.listFacts();
+    const loads = new Map(
+      facts
+        .filter((fact): fact is GeneratedSkillLoadFact => fact.kind === 'generated-skill-load')
+        .map(fact => [fact.factId, fact]),
+    );
+    let changed = false;
+
+    for (const outcome of facts) {
+      if (
+        outcome.kind !== 'episode-outcome'
+        || outcome.outcome !== 'contradicted'
+        || state.reviewedOutcomeFactIds.includes(outcome.factId)
+      ) continue;
+      const load = loads.get(outcome.loadFactId);
+      if (!load) continue;
+      const existing = state.expedited[load.skill.capabilityHandle];
+      if (existing?.outcomeFactIds.includes(outcome.factId)) continue;
+      state.expedited[load.skill.capabilityHandle] = {
+        capabilityHandle: load.skill.capabilityHandle,
+        outcomeFactIds: [...new Set([...(existing?.outcomeFactIds ?? []), outcome.factId])],
+        requestedAt: existing?.requestedAt ?? this.now().toISOString(),
+      };
+      changed = true;
+    }
+
+    if (changed) this.saveState(state);
+  }
+
   async runDue(): Promise<CuratorRunResult> {
     const state = this.loadState();
     const now = this.now();
@@ -137,6 +175,22 @@ export class SkillUsageCurator {
       };
       entry.outcomes.push(outcome);
       selected.set(load.skill.capabilityHandle, entry);
+    }
+
+    // `reviewedOutcomeFactIds` suppresses identical wake/review work; it must
+    // not erase factual contradiction history after a semantic defer. Once a
+    // new outcome triggers this handle, rebuild the fixed bundle from every
+    // contradiction still bound to the active revision so evidence accumulates
+    // without adding a second curator lifecycle or retry ledger.
+    for (const [capabilityHandle, selection] of selected) {
+      selection.outcomes = outcomes.filter(outcome => {
+        const load = loads.get(outcome.loadFactId);
+        const currentSkill = load && current[capabilityHandle];
+        return !!load
+          && load.skill.capabilityHandle === capabilityHandle
+          && !!currentSkill
+          && isCurrentSkillIdentity(currentSkill, load.skill);
+      });
     }
 
     // Ledger facts remain durable historical evidence, but outcomes linked to
@@ -196,6 +250,10 @@ export class SkillUsageCurator {
     ];
     return {
       bundleId: `usage-curation:${skill.capabilityHandle}:${outcomes.map(item => item.factId).sort().join(',')}`,
+      authority: {
+        kind: 'usage-reassessment',
+        targetCapabilityHandle: skill.capabilityHandle,
+      },
       episode: {
         kind: 'usage-reassessment',
         capabilityHandle: skill.capabilityHandle,
@@ -212,13 +270,16 @@ export class SkillUsageCurator {
       settlementEvidence,
       boundedContinuity: [],
       referencedSkills: record?.referencedSkills ?? [],
-      relatedCurrentSkills: Object.values(registry?.capabilities ?? {}).map(item => ({
-        handle: item.handle,
-        revision: item.revision,
-        routingName: item.routingName,
-        description: item.description,
-        guidanceHash: item.guidanceHash,
-      })),
+      // A usage correction is already bound to one runtime-owned load fact.
+      // Keep the fixed review basis single-target: unrelated Registry entries
+      // add prompt noise and can make the first entry look like the target.
+      relatedCurrentSkills: record ? [{
+        handle: record.handle,
+        revision: record.revision,
+        routingName: record.routingName,
+        description: record.description,
+        guidanceHash: record.guidanceHash,
+      }] : [],
       sourceEvidence,
     };
   }

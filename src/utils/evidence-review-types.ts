@@ -44,9 +44,18 @@ import type { DistilledKnowledgeCandidate } from './capability-distiller';
 export const EVIDENCE_REVIEW_JOB_SCHEMA_VERSION = 1 as const;
 
 /** Default prompt / policy version stamps included in Quantum identity. */
-export const EVIDENCE_REVIEW_PROMPT_VERSION = 'evidence-review-job-v4' as const;
+export const EVIDENCE_REVIEW_PROMPT_VERSION = 'evidence-review-job-v6' as const;
 /**
- * Policy v6:
+ * Policy v8:
+ *   - Usage correction outcomes require a stable-identity binding to the
+ *     affected Skill load; a single loaded generated Skill may inherit an
+ *     otherwise unqualified correction, while multiple loads require an
+ *     explicit identity and correction proximity is not causation.
+ *   - Usage reassessment cannot replace guidance without the prior guidance
+ *     body in its fixed review basis, and cannot retire a Skill without a
+ *     bounded correction snapshot; automatic usage reassessment only appends
+ *     evidence. Operator retirement remains a separate explicit path.
+ * Policy v6 established:
  *   - An eligible ordinary Learning Episode may create or append evidence
  *     without prior Skill use or explicit positive feedback; behavior-changing
  *     and structural catalog transitions use dedicated evidence paths.
@@ -68,7 +77,7 @@ export const EVIDENCE_REVIEW_PROMPT_VERSION = 'evidence-review-job-v4' as const;
  *   - Duplicate `create_current_skill` detection against relatedCurrentSkills.
  * Active jobs frozen under v3 must supersede to a successor on the v4 policy.
  */
-export const EVIDENCE_REVIEW_POLICY_VERSION = 'evidence-review-policy-v6' as const;
+export const EVIDENCE_REVIEW_POLICY_VERSION = 'evidence-review-policy-v8' as const;
 
 // ---------------------------------------------------------------------------
 // Shared quantum / job types

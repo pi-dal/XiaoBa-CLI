@@ -328,12 +328,7 @@ describe('External provenance — Evidence Capsule round-trip', () => {
       now: new Date('2026-07-15T12:00:00.000Z'),
     });
 
-    const bundle = reconstructBundleFromCapsule(capsule, [], {
-      schemaVersion: 2 as const,
-      catalogRevision: 0,
-      routeRedirects: {},
-      capabilities: {},
-    });
+    const bundle = reconstructBundleFromCapsule(capsule, [], []);
 
     assert.ok(bundle.episode.provenance.length >= 1, 'expected provenance refs');
     for (const ref of bundle.episode.provenance) {

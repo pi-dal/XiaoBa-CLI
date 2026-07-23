@@ -16,11 +16,13 @@ import {
   isSessionTurnEntry,
 } from './session-log-schema';
 import { DistilledKnowledgeCandidate } from './capability-distiller';
-import {
+import type {
+  BoundedSourceEvidence,
   EvidenceBundle,
   ReferencedSkillSnapshot,
   SkillEvidenceRef,
 } from './skill-evolution';
+import { validateFrozenSourceEvidence } from './frozen-source-evidence';
 
 /**
  * A completed production AgentTurn is the unit of learning, not a whole chat
@@ -33,6 +35,15 @@ export const LEARNING_EPISODE_SCHEMA_VERSION = 3 as const;
 export const MAX_SEMANTIC_OBSERVATIONS = 12 as const;
 export const MAX_SEMANTIC_OBSERVATION_VALUE_LENGTH = 512 as const;
 export const MAX_SEMANTIC_OBSERVATION_PAYLOAD_BYTES = 8192 as const;
+/**
+ * Maximum UTF-8 bytes retained for one local source-evidence transcript.
+ * The transcript is frozen at Episode admission; review never re-reads the
+ * source log. A balanced head/tail bound keeps both the request and outcome
+ * visible when a turn is unusually verbose.
+ */
+export const MAX_LEARNING_EPISODE_SOURCE_EVIDENCE_CONTENT_BYTES = 4096 as const;
+export const MAX_LEARNING_EPISODE_SOURCE_EVIDENCE_ENTRIES = 64 as const;
+export const MAX_LEARNING_EPISODE_SOURCE_EVIDENCE_PAYLOAD_BYTES = 128 * 1024;
 
 export type LearningEpisodeStatus =
   | 'settling'
@@ -63,6 +74,9 @@ export interface EpisodeEvidenceRef {
   turn: number;
   kind: CompletionEvidenceKind | 'contradiction';
   detail?: string;
+  /** Identity of the exact source turn captured when this ref was admitted. */
+  sourceAgentTurnEpisodeId?: string;
+  sourceRuntimeSessionId?: string;
 }
 
 export type SemanticObservationKind =
@@ -101,6 +115,12 @@ export interface LearningEpisode {
   deliveryTurn: number;
   completionEvidence: EpisodeEvidenceRef[];
   contradictionSignals: ContradictionSignal[];
+  /**
+   * Immutable, bounded transcript snapshots for completion refs. This is
+   * optional only for backwards compatibility with pre-snapshot records; review
+   * must fail closed when a local Episode does not carry it.
+   */
+  sourceEvidence?: BoundedSourceEvidence[];
   /** Durable bounded observations extracted at evidence admission. */
   semanticObservations: SemanticObservation[];
   predecessorEpisodeId?: string;
@@ -398,6 +418,7 @@ export function extractLearningEpisodes(
       && candidate.deliveryTurn < deliveryTurn.turn,
     );
     const semanticObservations = extractSemanticObservations(turns, index, evidence, signal, unit.filePath);
+    const sourceEvidence = freezeSourceEvidence(turns, evidence, unit.filePath, unit.byteRange);
 
     // create → verify/report → accept is one human task. If this turn did not
     // deliver a new artifact and the open predecessor still can settle, fold
@@ -412,6 +433,17 @@ export function extractLearningEpisodes(
         ...predecessor.completionEvidence,
         ...evidence,
       ]);
+      if (sourceEvidence) {
+        predecessor.sourceEvidence = mergeSourceEvidence([
+          ...(predecessor.sourceEvidence ?? []),
+          ...sourceEvidence,
+        ]);
+      } else if (predecessor.sourceEvidence) {
+        // Preserve the first-writer snapshot. The newly folded refs remain in
+        // completionEvidence and bundle construction will fail closed for any
+        // ref without a matching frozen source, but an ambiguous later turn
+        // must not erase earlier evidence that was already trustworthy.
+      }
       predecessor.semanticObservations = boundSemanticObservations([
         ...predecessor.semanticObservations,
         ...semanticObservations,
@@ -435,6 +467,7 @@ export function extractLearningEpisodes(
       deliveryTurn: deliveryTurn.turn,
       completionEvidence: evidence,
       contradictionSignals: signal ? [signal] : [],
+      ...(sourceEvidence ? { sourceEvidence } : {}),
       semanticObservations,
       ...(predecessor && { predecessorEpisodeId: predecessor.episodeId }),
       settlementDeadline: new Date(Date.parse(deliveryTurn.timestamp) + settlementWindowMs).toISOString(),
@@ -472,6 +505,17 @@ export function extractLearningEpisodes(
         if (!assistantResponse) continue;
         deliveryEvidence.push(assistantResponse);
       }
+      const acceptedEvidence = uniqueEvidence([
+        ...deliveryEvidence,
+        ...collectPrecedingWorkflowEvidence(turns, index, unit.filePath),
+        accepted,
+      ]);
+      const acceptedSourceEvidence = freezeSourceEvidence(
+        turns,
+        acceptedEvidence,
+        unit.filePath,
+        unit.byteRange,
+      );
       episodes.push({
         schemaVersion: LEARNING_EPISODE_SCHEMA_VERSION,
         episodeId: makeEpisodeId(deliverySourceFilePath, delivery),
@@ -479,12 +523,13 @@ export function extractLearningEpisodes(
         runtimeSessionId: runtimeSessionIdOf(delivery),
         sourceFilePath: deliverySourceFilePath,
         deliveryTurn: delivery.turn,
-        completionEvidence: uniqueEvidence([
-          ...deliveryEvidence,
-          ...collectPrecedingWorkflowEvidence(turns, index, unit.filePath),
-          accepted,
-        ]),
+        completionEvidence: acceptedEvidence,
         contradictionSignals: [],
+        ...(acceptedSourceEvidence
+          ? {
+            sourceEvidence: acceptedSourceEvidence,
+          }
+          : {}),
         semanticObservations: extractSemanticObservations(turns, index, [
           ...deliveryEvidence,
           ...collectPrecedingWorkflowEvidence(turns, index, unit.filePath),
@@ -507,7 +552,122 @@ function isNonProductionLearningUnit(unit: DistillationUnit): boolean {
     || unit.newTurns.some(turn => (
     NON_PRODUCTION_TOKEN.test(String(turn.session_id || ''))
     || /^(?:smoke|test|synthetic|replay)$/i.test(String(turn.session_type || '').trim())
-    ));
+  ));
+}
+
+/**
+ * Freeze the source material used by Author/Verifier for one Episode.
+ *
+ * Episode evidence refs are intentionally small control-plane records. Their
+ * `detail` field is useful for candidate hints, but it is not a replayable
+ * transcript and may omit the user's request or the assistant's response.
+ * Capture the matching turn while the Distillation Unit is still in memory so
+ * later review never depends on a mutable/deleted source log.
+ */
+function freezeSourceEvidence(
+  turns: readonly CompletedTurn[],
+  evidence: readonly EpisodeEvidenceRef[],
+  unitFilePath: string,
+  unitByteRange: { start: number; end: number },
+): BoundedSourceEvidence[] | undefined {
+  const relevant = uniqueEvidence(evidence.filter(item => item.kind !== 'contradiction'));
+  if (
+    relevant.length === 0
+    || relevant.length > MAX_LEARNING_EPISODE_SOURCE_EVIDENCE_ENTRIES
+  ) return undefined;
+  const frozen = new Map<string, BoundedSourceEvidence>();
+  for (const item of relevant) {
+    const turn = findUniqueEvidenceSourceTurn(turns, item, unitFilePath);
+    // A ref without a matching in-memory turn cannot be made auditable. Keep
+    // it absent; bundle construction will fail closed instead of fabricating
+    // source content from the summary detail.
+    if (!turn) return undefined;
+    const content = formatFrozenTurnEvidence(turn, item);
+    if (!content) return undefined;
+    const origin = (turn as DistillationTurn).origin;
+    const byteRange = origin?.byteRange
+      ?? (turnSourceFilePath(turn, unitFilePath) === unitFilePath ? unitByteRange : undefined);
+    if (frozen.has(item.ref)) continue;
+    frozen.set(item.ref, {
+      ref: item.ref,
+      role: 'problem-action',
+      content,
+      sourceFilePath: item.sourceFilePath,
+      turn: item.turn,
+      ...(byteRange ? { byteRange } : {}),
+    });
+  }
+  const result = [...frozen.values()];
+  return isSourceEvidencePayloadWithinBounds(result) ? result : undefined;
+}
+
+function findUniqueEvidenceSourceTurn(
+  turns: readonly CompletedTurn[],
+  evidence: EpisodeEvidenceRef,
+  unitFilePath: string,
+): CompletedTurn | undefined {
+  const candidates = turns.filter(candidate => (
+    candidate.turn === evidence.turn
+    && turnSourceFilePath(candidate, unitFilePath) === evidence.sourceFilePath
+    && runtimeSessionIdOf(candidate) === evidence.sourceRuntimeSessionId
+    && agentTurnEpisodeIdOf(candidate) === evidence.sourceAgentTurnEpisodeId
+  ));
+  if (candidates.length === 0) return undefined;
+
+  // Duplicate physical records are harmless only when their complete
+  // user/assistant evidence is identical. Divergent records under the same
+  // identity are ambiguous and must not be resolved by array order.
+  const unique = firstByKey(candidates, evidenceSourceTurnFingerprint);
+  return unique.length === 1 ? unique[0] : undefined;
+}
+
+function evidenceSourceTurnFingerprint(turn: CompletedTurn): string {
+  return hash(JSON.stringify({
+    runtimeSessionId: runtimeSessionIdOf(turn),
+    agentTurnEpisodeId: agentTurnEpisodeIdOf(turn),
+    user: turn.user,
+    assistant: turn.assistant,
+  }));
+}
+
+function isSourceEvidencePayloadWithinBounds(
+  evidence: readonly BoundedSourceEvidence[],
+): boolean {
+  return evidence.length <= MAX_LEARNING_EPISODE_SOURCE_EVIDENCE_ENTRIES
+    && Buffer.byteLength(JSON.stringify(evidence), 'utf8')
+      <= MAX_LEARNING_EPISODE_SOURCE_EVIDENCE_PAYLOAD_BYTES;
+}
+
+function formatFrozenTurnEvidence(
+  turn: CompletedTurn,
+  evidence: EpisodeEvidenceRef,
+): string {
+  const user = String(turn.user?.text ?? '').trim();
+  const assistant = String(turn.assistant?.text ?? '').trim();
+  const detail = String(evidence.detail ?? '').trim();
+  const sections: string[] = [];
+  if (user) sections.push(`User:\n${user}`);
+  if (assistant) sections.push(`Assistant:\n${assistant}`);
+  // Tool results and acceptance text are already captured in the ref detail;
+  // include them when they add information beyond the transcript itself.
+  if (detail && detail !== user && detail !== assistant && evidence.kind !== 'assistant-response') {
+    sections.push(`Observed ${evidence.kind}:\n${detail}`);
+  }
+  return boundSourceEvidenceContent(sections.join('\n\n'));
+}
+
+function boundSourceEvidenceContent(value: string): string {
+  const normalized = value.trim();
+  if (!normalized) return '';
+  if (Buffer.byteLength(normalized, 'utf8') <= MAX_LEARNING_EPISODE_SOURCE_EVIDENCE_CONTENT_BYTES) {
+    return normalized;
+  }
+  const marker = '\n[... middle omitted from bounded source evidence ...]\n';
+  const markerBytes = Buffer.byteLength(marker, 'utf8');
+  const contentBudget = Math.max(0, MAX_LEARNING_EPISODE_SOURCE_EVIDENCE_CONTENT_BYTES - markerBytes);
+  const headBudget = Math.floor(contentBudget / 2);
+  const tailBudget = contentBudget - headBudget;
+  return `${utf8Prefix(normalized, headBudget)}${marker}${utf8Tail(normalized, tailBudget)}`.trim();
 }
 
 /**
@@ -612,23 +772,25 @@ function detectCompletionEvidence(filePath: string, turn: CompletedTurn): Episod
     && !FAILURE_RESULT.test(tool.result || ''),
   );
   const workflowEvidence = hasArtifactCompletion ? detectWorkflowEvidence(filePath, turn) : [];
-  for (const tool of turn.assistant.tool_calls) {
+  for (const [toolIndex, tool] of turn.assistant.tool_calls.entries()) {
     const detail = toolDetail(tool);
     if (VALIDATION_TOOL.test(tool.name) && SUCCESS_RESULT.test(tool.result || '')) {
       evidence.push({
-        ref: evidenceRef(filePath, turn.turn, `validation:${tool.name}`),
+        ref: toolEvidenceRef(filePath, turn, toolIndex, `validation:${tool.name}`),
         sourceFilePath: filePath,
         turn: turn.turn,
         kind: 'artifact-validation',
         detail,
+        ...sourceTurnEvidenceIdentity(turn),
       });
     } else if (isDeliveryTool(tool) && !FAILURE_RESULT.test(tool.result || '')) {
       evidence.push({
-        ref: evidenceRef(filePath, turn.turn, `delivery:${tool.name}`),
+        ref: toolEvidenceRef(filePath, turn, toolIndex, `delivery:${tool.name}`),
         sourceFilePath: filePath,
         turn: turn.turn,
         kind: 'artifact-delivery',
         detail,
+        ...sourceTurnEvidenceIdentity(turn),
       });
     }
   }
@@ -637,13 +799,15 @@ function detectCompletionEvidence(filePath: string, turn: CompletedTurn): Episod
 
 function detectWorkflowEvidence(filePath: string, turn: CompletedTurn): EpisodeEvidenceRef[] {
   return turn.assistant.tool_calls
-    .filter(tool => isArtifactWorkflowTool(tool) && !FAILURE_RESULT.test(tool.result || ''))
-    .map(tool => ({
-      ref: evidenceRef(filePath, turn.turn, `workflow:${tool.name}`),
+    .map((tool, toolIndex) => ({ tool, toolIndex }))
+    .filter(({ tool }) => isArtifactWorkflowTool(tool) && !FAILURE_RESULT.test(tool.result || ''))
+    .map(({ tool, toolIndex }) => ({
+      ref: toolEvidenceRef(filePath, turn, toolIndex, `workflow:${tool.name}`),
       sourceFilePath: filePath,
       turn: turn.turn,
       kind: 'verified-tool-result' as const,
       detail: toolDetail(tool),
+      ...sourceTurnEvidenceIdentity(turn),
     }));
 }
 
@@ -742,7 +906,7 @@ function isDefinitelyNonLearningInteraction(turn: CompletedTurn): boolean {
 function uniqueContradictionSignals(
   signals: readonly ContradictionSignal[],
 ): ContradictionSignal[] {
-  return [...new Map(signals.map(signal => [signal.signalId, signal])).values()];
+  return firstByKey(signals, signal => signal.signalId);
 }
 
 /**
@@ -756,24 +920,33 @@ function isExternalCompleteFinalDelivery(turn: CompletedTurn): boolean {
   if (!assistantText) return false;
 
   // External timelines (notably Pi/xURL) may coalesce many progress updates
-  // into one assistant turn.  Non-empty text only proves that the agent spoke;
-  // it does not prove that the requested work reached a reusable outcome.
-  // Require an outcome near the tail, where Pi writes its final hand-off, and
-  // reject context-free continuation prompts that cannot name a capability.
+  // into one assistant turn. Reject only context-free continuations and an
+  // explicit unresolved terminal failure here; absence of a success keyword
+  // is not evidence that a substantive final is waste. Author/Verifier own the
+  // later, narrower judgment about whether the result is reusable.
   const userText = turn.user.text.replace(/\s+/g, ' ').trim();
   if (isContextFreeContinuation(userText)) return false;
 
   const tail = utf8Tail(assistantText, 2_000);
+  if (EXTERNAL_UNFINISHED_PROGRESS_TAIL.test(tail)) return false;
   // Order-sensitive terminal-outcome polarity: the LAST decisive outcome
   // determines whether the external tail is a successful final or a retry.
   // A corrected success (earlier failure → later success) admits; a final
   // blocker after an implementation (earlier positive → later negative)
   // rejects. Never manufacture success from an earlier positive word when
   // the terminal outcome is negative.
-  return lastPositiveOutcomeAfterLastNegative(tail);
+  return hasNoUnresolvedTerminalFailure(tail);
 }
 
 const EXTERNAL_TERMINAL_OUTCOME = /(?:\b(?:completed?|done|fixed|implemented|updated|created|removed|restored|verified|validated|delivered|committed|shipped)\b|\btests?\b[^\n]{0,80}\bpass(?:ed|ing)?\b|\ball\s+\d+[^\n]{0,40}\bpass(?:ed|ing)?\b|\bcommit\s+[0-9a-f]{7,40}\b|(?:已|已经)(?:完成|修复|修改|更新|删除|恢复|创建|实现|验证|提交|交付)|(?:改好|删掉|恢复完成|测试通过|验证通过))/iu;
+
+/**
+ * A final sentence that explicitly says the work is still underway or that a
+ * concrete implementation step comes next is progress narration, not a
+ * delivery. Keep this veto tail-anchored and narrow: earlier investigation
+ * does not erase a later substantive final, and no success keyword is needed.
+ */
+const EXTERNAL_UNFINISHED_PROGRESS_TAIL = /(?:^|[\n.!?。！？]\s*)(?:(?:i(?:'m| am)\s+)?(?:still\s+)?(?:exploring|investigating|working\s+on|looking\s+into|checking)\b|(?:(?:let\s+me|i(?:'ll|\s+will)|i(?:'m|\s+am)\s+going\s+to|next[,，:]?\s+i(?:'ll|\s+will))\s+(?:add|write|implement|fix|check|test|inspect|investigate|explore|update|create|run|continue|work)\b)|(?:正在|仍在)(?:检查|调查|探索|处理|修复|实现|编写|测试)|接下来(?:我)?(?:会|将|先)(?:检查|调查|探索|处理|修复|实现|编写|测试|添加|更新))[^\n.!?。！？]{0,240}[.!?。！？]?\s*$/iu;
 
 /**
  * Explicit non-success / negative-review or terminal-blocker markers.
@@ -781,7 +954,7 @@ const EXTERNAL_TERMINAL_OUTCOME = /(?:\b(?:completed?|done|fixed|implemented|upd
  * is never vetoed: bare words like "failed" or "fix" are NOT matched — only
  * explicit negative outcomes, directive-to-fix, or terminal blocking issues.
  */
-const EXTERNAL_NON_SUCCESS_TAIL = /\bnot\s+(?:ok(?:ay)?|verified|validated|done|completed|fixed|implemented|delivered|shipped|ready|correct|valid|pass(?:ed|ing)?)\b|\b(?:did|do|does|don'?t|doesn'?t|didn'?t|won'?t|cannot|can'?t|failed\s+to|did\s+not)\s+(?:not\s+)?(?:pass|verify|validated?|complete|deliver|ship)\b|\b(?:tests?|checks?)\s+(?:fail|fails|failed|are\s+failing|still\s+fail)\b|\bstill\s+(?:failing|broken|present|not\s+(?:passing|ok|verified))\b|\bfix\s+(?:the(?:se)?|this)\s+(?:issues?|problems?|bugs?|failures?)\b|\bis\s+not\s+(?:ok(?:ay)?|ready|correct|valid|verified)\b|\bblock(?:er|ing)(?:\s+issue)?\b|\bunsafe\b|\bneeds?\s+(?:further|more)\s+(?:work|review|changes?|fix)\b|(?:未|没有)(?:完成|修复|通过|验证|交付|实现)|(?:测试|验证)(?:未|没有)通过/iu;
+const EXTERNAL_NON_SUCCESS_TAIL = /\bnot\s+(?:ok(?:ay)?|verified|validated|done|completed|fixed|implemented|delivered|shipped|ready|correct|valid|pass(?:ed|ing)?)\b|\b(?:did|do|does|don'?t|doesn'?t|didn'?t|won'?t|cannot|can'?t|failed\s+to|did\s+not)\s+(?:not\s+)?(?:pass|verify|validated?|complete|deliver|ship)\b|\b(?:tests?|checks?)\s+(?:fail|fails|failed|are\s+failing|still\s+fail)\b|\bstill\s+(?:failing|broken|present|not\s+(?:passing|ok|verified))\b|\bfix\s+(?:the(?:se)?|this)\s+(?:issues?|problems?|bugs?|failures?)\b|\bis\s+not\s+(?:ok(?:ay)?|ready|correct|valid|verified)\b|\bblock(?:er|ing)(?:\s+issue)?\b|\bunsafe\b|\bneeds?\s+(?:further|more)\s+(?:work|review|changes?|fix)\b|(?:未|没有)(?:完成|修复|通过|验证|交付|实现)|(?:测试|验证)(?:未|没有)通过|(?:测试|验证)(?:失败|不通过)|(?:无法|不能|未能)(?:完成|修复|通过|验证|交付|实现)|(?:遇到|发生)(?:了)?(?:错误|问题|异常)/iu;
 
 /**
  * Order-sensitive terminal-outcome polarity: the LAST decisive outcome
@@ -792,9 +965,10 @@ const EXTERNAL_NON_SUCCESS_TAIL = /\bnot\s+(?:ok(?:ay)?|verified|validated|done|
  * prevents "tests failed ... tests pass" spans from collapsing to the same
  * start index.
  */
-function lastPositiveOutcomeAfterLastNegative(tail: string): boolean {
-  return lastMatchEndPosition(EXTERNAL_TERMINAL_OUTCOME, tail)
-    > lastMatchPosition(EXTERNAL_NON_SUCCESS_TAIL, tail);
+function hasNoUnresolvedTerminalFailure(tail: string): boolean {
+  const lastNegative = lastMatchPosition(EXTERNAL_NON_SUCCESS_TAIL, tail);
+  return lastNegative < 0
+    || lastMatchEndPosition(EXTERNAL_TERMINAL_OUTCOME, tail) > lastNegative;
 }
 
 function lastMatchPosition(re: RegExp, text: string): number {
@@ -847,6 +1021,7 @@ function detectAssistantResponseEvidence(
     turn: turn.turn,
     kind: 'assistant-response',
     detail: boundedAssistantResponseDetail(text),
+    ...sourceTurnEvidenceIdentity(turn),
   };
 }
 
@@ -885,6 +1060,7 @@ function detectContradiction(
     turn: next.turn,
     kind: 'contradiction',
     detail: message,
+    ...sourceTurnEvidenceIdentity(next),
   };
   return {
     signalId: makeSignalId(deliverySourceFilePath, correctionSourceFilePath, delivery.turn, next.turn),
@@ -914,6 +1090,7 @@ function detectAcceptance(
     turn: next.turn,
     kind: 'user-acceptance',
     detail: message,
+    ...sourceTurnEvidenceIdentity(next),
   };
 }
 
@@ -930,6 +1107,17 @@ export function agentTurnEpisodeIdOf(turn: CompletedTurn): string | undefined {
     : undefined;
 }
 
+function sourceTurnEvidenceIdentity(turn: CompletedTurn): Pick<
+  EpisodeEvidenceRef,
+  'sourceAgentTurnEpisodeId' | 'sourceRuntimeSessionId'
+> {
+  const sourceAgentTurnEpisodeId = agentTurnEpisodeIdOf(turn);
+  return {
+    ...(sourceAgentTurnEpisodeId ? { sourceAgentTurnEpisodeId } : {}),
+    sourceRuntimeSessionId: runtimeSessionIdOf(turn),
+  };
+}
+
 function turnSourceFilePath(turn: CompletedTurn, fallback: string): string {
   const origin = (turn as DistillationTurn).origin?.filePath;
   return typeof origin === 'string' && origin.trim() ? origin : fallback;
@@ -937,6 +1125,48 @@ function turnSourceFilePath(turn: CompletedTurn, fallback: string): string {
 
 function evidenceRef(filePath: string, turn: number, kind: string): string {
   return `${filePath}#turn-${turn}:${kind}`;
+}
+
+/**
+ * Preserve distinct same-name tool calls in one turn. Older logs and the
+ * common single-call case retain their original ref shape; only a duplicate
+ * group receives a stable call suffix, using the provider id when available
+ * and the same-name ordinal as a legacy fallback.
+ */
+function toolEvidenceRef(
+  filePath: string,
+  turn: CompletedTurn,
+  toolIndex: number,
+  kind: string,
+): string {
+  const tool = turn.assistant.tool_calls[toolIndex]!;
+  const domain = kind.split(':', 1)[0]!;
+  const group = turn.assistant.tool_calls
+    .map((candidate, index) => ({ candidate, index }))
+    .filter(({ candidate }) => (
+      candidate.name === tool.name
+      && isToolEvidenceDomainCandidate(candidate, domain)
+    ));
+  if (group.length <= 1) return evidenceRef(filePath, turn.turn, kind);
+  const ordinal = group.findIndex(item => item.index === toolIndex) + 1;
+  const providerId = typeof tool.id === 'string' && tool.id.trim()
+    ? `id-${hash(tool.id.trim()).slice(0, 12)}`
+    : `ordinal-${ordinal}`;
+  return evidenceRef(filePath, turn.turn, `${kind}:call-${providerId}-${ordinal}`);
+}
+
+function isToolEvidenceDomainCandidate(tool: SessionToolCallLog, domain: string): boolean {
+  if (domain === 'validation') {
+    return VALIDATION_TOOL.test(tool.name) && SUCCESS_RESULT.test(tool.result || '');
+  }
+  if (domain === 'delivery') {
+    return !(VALIDATION_TOOL.test(tool.name) && SUCCESS_RESULT.test(tool.result || ''))
+      && isDeliveryTool(tool)
+      && !FAILURE_RESULT.test(tool.result || '');
+  }
+  return domain === 'workflow'
+    && isArtifactWorkflowTool(tool)
+    && !FAILURE_RESULT.test(tool.result || '');
 }
 
 function makeEpisodeId(filePath: string, turn: CompletedTurn): string {
@@ -965,7 +1195,16 @@ function hash(value: string): string {
 }
 
 function uniqueEvidence(evidence: EpisodeEvidenceRef[]): EpisodeEvidenceRef[] {
-  return [...new Map(evidence.map(item => [item.ref, item])).values()];
+  return firstByKey(evidence, item => item.ref);
+}
+
+function firstByKey<T>(values: readonly T[], keyOf: (value: T) => string): T[] {
+  const first = new Map<string, T>();
+  for (const value of values) {
+    const key = keyOf(value);
+    if (!first.has(key)) first.set(key, value);
+  }
+  return [...first.values()];
 }
 
 function uniqueStrings(values: readonly string[]): string[] {
@@ -1072,6 +1311,7 @@ export class LearningEpisodeStore {
           || typeof episode !== 'object'
           || episode.schemaVersion !== LEARNING_EPISODE_SCHEMA_VERSION
           || !Array.isArray(episode.semanticObservations)
+          || (episode.sourceEvidence !== undefined && !isValidFrozenSourceEvidence(episode.sourceEvidence))
         ))
       ) {
         throw new Error('invalid episode store');
@@ -1163,9 +1403,10 @@ export class LearningEpisodeStore {
         && episode.deliveryTurn === signal.precedingDeliveryTurn,
       );
       if (!predecessor) continue;
-      predecessor.contradictionSignals = [...new Map(
-        [...predecessor.contradictionSignals, signal].map(item => [item.signalId, item]),
-      ).values()];
+      predecessor.contradictionSignals = uniqueContradictionSignals([
+        ...predecessor.contradictionSignals,
+        signal,
+      ]);
       // Historical evidence may link a contradiction before its immutable
       // target is complete. Keep the episode behind that target's review gate;
       // reconciliation applies the already-durable signal idempotently.
@@ -1247,6 +1488,35 @@ export class LearningEpisodeStore {
   }
 }
 
+function isValidFrozenSourceEvidence(value: unknown): value is BoundedSourceEvidence[] {
+  if (!Array.isArray(value)) return false;
+  if (value.some(item => (
+    !item
+    || typeof item !== 'object'
+    || (item as Partial<BoundedSourceEvidence>).role !== 'problem-action'
+  ))) return false;
+  const sourceEvidence = value as BoundedSourceEvidence[];
+  const failure = validateFrozenSourceEvidence(
+    {
+      completionEvidence: sourceEvidence.map(source => ({
+        ref: source.ref,
+        sourceFilePath: source.sourceFilePath,
+        turn: source.turn,
+        byteRange: source.byteRange,
+      })),
+      settlementEvidence: [],
+      sourceEvidence,
+    },
+    {
+      maxEntries: MAX_LEARNING_EPISODE_SOURCE_EVIDENCE_ENTRIES,
+      maxPayloadBytes: MAX_LEARNING_EPISODE_SOURCE_EVIDENCE_PAYLOAD_BYTES,
+      maxContentBytes: MAX_LEARNING_EPISODE_SOURCE_EVIDENCE_CONTENT_BYTES,
+      requireSettlementCoverage: false,
+    },
+  );
+  return !failure;
+}
+
 function emptyEpisodeStoreState(): LearningEpisodeStoreState {
   return { schemaVersion: LEARNING_EPISODE_SCHEMA_VERSION, episodes: {} };
 }
@@ -1272,7 +1542,15 @@ function mergeEpisode(existing: LearningEpisode | undefined, incoming: LearningE
       ? {}
       : { agentTurnEpisodeId: incoming.agentTurnEpisodeId }),
     completionEvidence: uniqueEvidence([...existing.completionEvidence, ...incoming.completionEvidence]),
-    contradictionSignals: [...new Map(signals.map(signal => [signal.signalId, signal])).values()],
+    contradictionSignals: uniqueContradictionSignals(signals),
+    ...(existing.sourceEvidence !== undefined || incoming.sourceEvidence !== undefined
+      ? {
+        sourceEvidence: mergeSourceEvidence([
+          ...(existing.sourceEvidence ?? []),
+          ...(incoming.sourceEvidence ?? []),
+        ]),
+      }
+      : {}),
     semanticObservations: mergeSemanticObservations(existing.semanticObservations, incoming.semanticObservations),
   };
   if (
@@ -1285,14 +1563,33 @@ function mergeEpisode(existing: LearningEpisode | undefined, incoming: LearningE
   return merged;
 }
 
+function mergeSourceEvidence(
+  evidence: readonly BoundedSourceEvidence[],
+): BoundedSourceEvidence[] | undefined {
+  // Episode replay may re-extract the same ref from a changed source log. The
+  // durable first snapshot remains authoritative; replay may only add a ref
+  // that was not present at original admission. If later refs would exceed a
+  // bound, retain the already-admitted prefix instead of erasing it.
+  const merged: BoundedSourceEvidence[] = [];
+  for (const item of firstByKey(evidence, candidate => candidate.ref)) {
+    const candidate = [...merged, item];
+    if (isSourceEvidencePayloadWithinBounds(candidate)) merged.push(item);
+  }
+  return merged.length > 0 ? merged : undefined;
+}
+
 function mergeSemanticObservations(
   existing: readonly SemanticObservation[] | undefined,
   incoming: readonly SemanticObservation[] | undefined,
 ): SemanticObservation[] {
-  return boundSemanticObservations([
+  const first = firstByKey([
     ...(existing ?? []),
     ...(incoming ?? []),
-  ]);
+  ], observation => JSON.stringify({
+    kind: observation.kind,
+    sourceRefs: [...observation.sourceRefs].sort(),
+  }));
+  return boundSemanticObservations(first);
 }
 
 function linkRetryToStoredPredecessor(
@@ -1374,6 +1671,7 @@ export function buildFlashcardEvidenceBundle(
     .map(toSkillEvidenceRef);
   return {
     bundleId: `flashcard-${episode.episodeId}`,
+    authority: { kind: 'flashcard', episodeId: episode.episodeId },
     episode: {
       ...episode,
       workflow: 'flashcard correction and verified retry',

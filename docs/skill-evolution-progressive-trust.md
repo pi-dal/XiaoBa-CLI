@@ -26,7 +26,9 @@ The posterior should change the scope of the hypothesis before it changes admiss
 - One bounded observation can support a narrow, reversible Current Skill.
 - More aligned observations can append evidence or justify clearer guidance.
 - Ambiguity or consequential risk can defer the proposal.
-- Contradiction can replace or retire the affected guidance.
+- Contradiction can narrow the affected capability through evidence append.
+  Replacement still requires a review basis containing the prior guidance
+  body; retirement remains an explicit operator action.
 
 The Skill Usage Ledger does not manufacture `verified-success` from settlement. Settlement only moves an Episode to its review decision point.
 
@@ -67,15 +69,13 @@ Sample scarcity, missing positive feedback, and absence of a prior Skill load ar
 
 ### Corrections
 
-Only explicit contradiction outcomes drive usage reassessment. Routine Curator cadence exists to recover a missed expedited wake, not to infer passive success.
+Only explicit contradiction outcomes bound to a loaded Skill's stable identity drive usage reassessment. A correction binds by exact capability handle, routing name, or requested routing alias; when exactly one generated Skill was loaded and the correction contains no loaded Skill identity, that single load may safely inherit the correction. With multiple loaded Skills, an unbound correction remains durable Episode evidence and does not turn every Skill in the Episode into a causal target. Routine Curator cadence exists to recover a missed expedited wake, not to infer passive success.
 
-A `usage-curation:*` transition must target the capability handle named by the correction bundle. It may:
+A `usage-curation:*` transition must target the capability handle bound by the correction bundle. With the current fixed bundle, automatic reassessment may only:
 
 - `append_evidence`
-- `replace_current_skill`
-- `retire_capability`
 
-It may not create a Skill, migrate a route, merge Skills, or target another capability. A separately completed corrected retry is an ordinary Episode and may teach the supported corrected pattern.
+It may not retire or replace guidance because the usage bundle does not contain a bounded correction snapshot or the prior guidance body needed to preserve unaffected behavior. Full retirement remains an explicit operator action. It also may not create a Skill, migrate a route, merge Skills, or target another capability. A separately completed corrected retry is an ordinary Episode and may teach the supported corrected pattern.
 
 ### Non-production evidence
 
@@ -94,19 +94,28 @@ Generated Skills are Registry-owned.
 
 Hiding generated metadata would make accumulated experience undiscoverable and prevent the use-correction loop that can improve it.
 
+Generated Current Skills have one audited operator control: `skill retire`. It
+removes the active Registry entry and routable artifact while retaining
+immutable history and the transition audit. Repeating the command is a durable
+no-op; this is retirement, not privacy purge. `skill remove` keeps its existing
+manual-Skill deletion behavior but rejects Registry-owned generated Skills and
+points the operator to `skill retire`.
+
 ## Evidence and dependency identity
 
 `EvidenceBundle.referencedSkills` contains only dependencies proven by runtime-owned generated-Skill load facts. It is not the global Skill catalog and is not populated from untrusted semantic content.
 
 Bundle construction joins a load fact to an Episode using both `agentTurnEpisodeId` and `runtimeSessionId`, then verifies `capabilityHandle`, `routingName`, and `guidanceHash`. Missing identities, stale guidance, route reuse, handle reuse, and cross-session Episode ID collisions fail closed.
 
-This identity rule governs dependency claims. It is not a prerequisite for reviewing an Episode or creating a new Skill. `relatedCurrentSkills` remains bounded Registry recall context; recall alone does not authorize structural transitions.
+This identity rule governs dependency claims. It is not a prerequisite for reviewing an Episode or creating a new Skill. `relatedCurrentSkills` contains only an active revision proven by a runtime load or named exactly by stable handle/route in frozen evidence; Registry membership alone is not relevance. An ordinary Episode may append only to a handle in that bounded set.
 
 ## Safety boundaries
 
 The following controls remain unchanged:
 
 - Evidence Bundle validation and payload bounds.
+- Explicit typed bundle authority at new review admission and every mutation;
+  bundle-ID inference exists only at the persisted-Job migration boundary.
 - External evidence redaction and capsule integrity.
 - Source-instruction and prompt-injection defenses.
 - Evidence-reference allowlisting.
@@ -120,7 +129,10 @@ Verification remains necessary because executing a task and generalizing an inst
 
 ## Non-goals
 
-This policy does not add a provisional Registry state, confidence score, promotion threshold, evaluation arena, HTTP API, Dashboard surface, Provider timeout change, or new command.
+This policy does not add a provisional Registry state, confidence score,
+promotion threshold, evaluation arena, HTTP API, Dashboard surface, or Provider
+timeout change. The small Registry-aware retirement command is an operator
+control, not a new learning lifecycle or promotion path.
 
 It also does not treat every Episode as a Skill. The existing Author and Verifier must still find a coherent transferable delta, and deterministic commit gates continue to fail closed.
 
@@ -141,4 +153,12 @@ Tests must verify these public boundaries:
 
 ## Rollout
 
-The bumped prompt and Evidence Review policy versions apply to new work and force stale active jobs to create a successor Review Basis before committing. Existing audit history remains immutable. Terminal rejections are not silently reopened; later bounded evidence or explicit operator action requires a new audited transition.
+The bumped prompt and Evidence Review policy versions apply to new work and
+force stale active jobs to create a successor Review Basis before committing.
+Legacy Learning Episode jobs without a frozen source snapshot are instead
+left dormant as explicit defers; they never re-read mutable logs. Existing
+pre-authority jobs whose family cannot be proven are likewise left dormant;
+unknown provenance is never promoted to a family-specific write authority. Existing
+audit history remains immutable. Terminal rejections are not silently
+reopened; later bounded evidence or explicit operator action requires a new
+audited transition.

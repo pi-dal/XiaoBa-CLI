@@ -116,7 +116,8 @@ describe('skill-evolution progressive-trust prompt policy', () => {
   test('Skill Author prompt binds one correction to the affected Skill', () => {
     const text = readRequiredDefaultPromptFile('subagents/skill-author.md');
     assert.match(text, /For a usage-curation correction bundle, the correction is negative evidence/);
-    assert.match(text, /may append evidence, replace the affected guidance with a narrower correction, or retire that Skill/);
+    assert.match(text, /automatic reassessment may append evidence only/);
+    assert.match(text, /must not retire or replace guidance because the bundle lacks a bounded correction snapshot and the prior guidance body/);
     assert.match(text, /must not create a Skill, migrate its route, merge Skills, or target any other Skill/);
     assert.match(text, /Never copy the failed action into guidance or promote the contradicted behavior/);
   });
@@ -145,7 +146,8 @@ describe('skill-evolution progressive-trust prompt policy', () => {
   test('Skill Verifier prompt describes correction episode handling', () => {
     const text = readRequiredDefaultPromptFile('subagents/skill-verifier.md');
     assert.match(text, /Usage-curation correction bundles/);
-    assert.match(text, /may append evidence, replace that Skill with narrower corrected guidance, or retire it/);
-    assert.match(text, /Reject create, migrate, merge, cross-Skill append/);
+    assert.match(text, /automatic correction-bound reassessment may append evidence only/);
+    assert.match(text, /Reject retirement and replacement because the bundle lacks a bounded correction snapshot and the prior guidance body/);
+    assert.match(text, /also reject create, migrate, merge, cross-Skill append/);
   });
 });

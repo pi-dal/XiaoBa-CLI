@@ -114,6 +114,21 @@ function readOrEmpty(filePath: string): any {
   } catch { return null; }
 }
 
+function frozenEpisodeSource(
+  ref: string,
+  sourceFilePath: string,
+  turn: number,
+  content = 'User:\nComplete the bounded task.\n\nAssistant:\nThe bounded task was completed.',
+): NonNullable<LearningEpisode['sourceEvidence']>[number] {
+  return {
+    ref,
+    role: 'problem-action',
+    content,
+    sourceFilePath,
+    turn,
+  };
+}
+
 function createDeferred<T = void>(): {
   promise: Promise<T>;
   resolve: (value: T | PromiseLike<T>) => void;
@@ -152,6 +167,7 @@ function runtimeReviewBundle(bundleId: string): EvidenceBundle {
   };
   return {
     bundleId,
+    authority: { kind: 'learning-episode', episodeId: bundleId },
     episode: candidate,
     completionEvidence: [{ ref: 'session.jsonl#12' }],
     settlementEvidence: [{ ref: 'session.jsonl#13' }],
@@ -161,6 +177,18 @@ function runtimeReviewBundle(bundleId: string): EvidenceBundle {
     boundedContinuity: [],
     referencedSkills: [],
     relatedCurrentSkills: [],
+    sourceEvidence: [
+      {
+        ref: 'session.jsonl#12',
+        role: 'problem-action',
+        content: 'The bounded workflow was requested and completed.',
+      },
+      {
+        ref: 'session.jsonl#13',
+        role: 'verification',
+        content: 'The bounded result was accepted.',
+      },
+    ],
   };
 }
 
@@ -1103,6 +1131,20 @@ describe('RuntimeLearning — AC3: Due Review', () => {
         detail: 'Thanks, that works perfectly!',
       }],
       contradictionSignals: [],
+      sourceEvidence: [
+        frozenEpisodeSource(
+          'existing-report.jsonl#turn-1:delivery:send_file',
+          'existing-report.jsonl',
+          1,
+          'User:\nDeliver the requested report.\n\nAssistant:\nThe report was sent.',
+        ),
+        frozenEpisodeSource(
+          'existing-report.jsonl#turn-2:acceptance',
+          'existing-report.jsonl',
+          2,
+          'User:\nThanks, that works perfectly!\n\nAssistant:\nYou are welcome.',
+        ),
+      ],
       semanticObservations: [{
         kind: 'user-intent',
         value: 'Deliver the requested report.',
@@ -1190,6 +1232,11 @@ describe('RuntimeLearning — AC3: Due Review', () => {
         detail: 'send_file: report sent',
       }],
       contradictionSignals: [],
+      sourceEvidence: [frozenEpisodeSource(
+        `${episodeId}#turn-1:delivery:send_file`,
+        `${episodeId}.jsonl`,
+        1,
+      )],
       semanticObservations,
       settlementDeadline: new Date(0).toISOString(),
       status: 'eligible',
@@ -1256,6 +1303,7 @@ describe('RuntimeLearning — AC3: Due Review', () => {
         detail: 'send_file: delivered',
       }],
       contradictionSignals: [],
+      sourceEvidence: [frozenEpisodeSource(`${episodeId}#1`, `${episodeId}.jsonl`, 1)],
       semanticObservations: [{
         kind: 'user-intent',
         value: `Deliver ${episodeId}.`,
@@ -1287,6 +1335,82 @@ describe('RuntimeLearning — AC3: Due Review', () => {
     );
     assert.equal(resumedPlan.due.settlementDue, true);
     assert.equal(resumedPlan.nextWakeReason, 'settlement-deadline');
+  });
+
+  test('legacy episode without frozen source evidence does not create a second durable defer owner', async () => {
+    const legacyEpisode: LearningEpisode = {
+      schemaVersion: 3,
+      episodeId: 'episode-legacy-no-source',
+      runtimeSessionId: 'runtime-legacy-no-source',
+      sourceFilePath: 'legacy-no-source.jsonl',
+      deliveryTurn: 1,
+      completionEvidence: [{
+        ref: 'legacy-no-source.jsonl#1',
+        sourceFilePath: 'legacy-no-source.jsonl',
+        turn: 1,
+        kind: 'artifact-delivery',
+        detail: 'send_file: delivered',
+      }],
+      contradictionSignals: [],
+      semanticObservations: [{
+        kind: 'user-intent',
+        value: 'Deliver the legacy artifact.',
+        sourceRefs: ['legacy-no-source.jsonl#intent'],
+      }],
+      settlementDeadline: new Date(0).toISOString(),
+      status: 'eligible',
+    };
+    env.runtimeLearning.getEpisodeStore().save({
+      schemaVersion: 3,
+      episodes: { [legacyEpisode.episodeId]: legacyEpisode },
+    });
+    const continuationPath = reviewContinuationPathForEpisodeStore(env.episodeStorePath);
+    fs.writeFileSync(continuationPath, JSON.stringify({
+      schemaVersion: 2,
+      episodeIds: [],
+      reviewJobIds: [],
+      nextAttemptAt: new Date(0).toISOString(),
+      updatedAt: new Date(0).toISOString(),
+      nextClass: 'live',
+      classCursors: {},
+      // Explicit compatibility input: the consolidated reader ignores this
+      // obsolete duplicate owner and never writes it back.
+      deferredEpisodeIds: [legacyEpisode.episodeId],
+    }), 'utf8');
+
+    const result = await env.runtimeLearning.wake('startup');
+    assert.equal(result.review.reviewedEpisodes, 0);
+    const continuation = JSON.parse(fs.readFileSync(
+      continuationPath,
+      'utf8',
+    )) as {
+      episodeIds: string[];
+      reviewJobIds: string[];
+      nextAttemptAt: string;
+      deferredEpisodeIds?: string[];
+    };
+    assert.deepEqual(continuation.episodeIds, []);
+    assert.deepEqual(continuation.reviewJobIds, []);
+    assert.equal(Object.hasOwn(continuation, 'deferredEpisodeIds'), false);
+
+    const resumedPlan = env.runtimeLearning.getPlanner().plan(
+      new Date(Date.parse(continuation.nextAttemptAt) + 1),
+    );
+    assert.equal(resumedPlan.due.settlementDue, false);
+
+    const second = await env.runtimeLearning.wake('manual');
+    assert.equal(second.review.reviewedEpisodes, 0);
+    const afterSecondWake = JSON.parse(fs.readFileSync(
+      continuationPath,
+      'utf8',
+    )) as {
+      episodeIds: string[];
+      reviewJobIds: string[];
+      deferredEpisodeIds?: string[];
+    };
+    assert.deepEqual(afterSecondWake.episodeIds, []);
+    assert.deepEqual(afterSecondWake.reviewJobIds, []);
+    assert.equal(Object.hasOwn(afterSecondWake, 'deferredEpisodeIds'), false);
   });
 
   test('runnable review jobs keep the restart-safe continuation scheduled', () => {
@@ -1327,6 +1451,11 @@ describe('RuntimeLearning — AC3: Due Review', () => {
         detail: 'send_file: delivered',
       }],
       contradictionSignals: [],
+      sourceEvidence: [frozenEpisodeSource(
+        'live-budget-admissible#1',
+        'live-budget-admissible.jsonl',
+        1,
+      )],
       semanticObservations: [{
         kind: 'user-intent',
         value: 'Deliver the small admissible review task.',
@@ -1367,12 +1496,25 @@ describe('RuntimeLearning — AC3: Due Review', () => {
     } as any;
     const largeRetryBundle = {
       bundleId: 'large-retry-bundle',
+      authority: { kind: 'learning-episode', episodeId: 'large-retry-bundle' },
       episode: largeRetryCandidate,
-      completionEvidence: [],
-      settlementEvidence: [],
+      completionEvidence: [{ ref: 'large-retry.jsonl#1' }],
+      settlementEvidence: [{ ref: 'large-retry.jsonl#2' }],
       boundedContinuity: [],
       referencedSkills: [],
       relatedCurrentSkills: [],
+      sourceEvidence: [
+        {
+          ref: 'large-retry.jsonl#1',
+          role: 'problem-action',
+          content: 'A large bounded retry became due.',
+        },
+        {
+          ref: 'large-retry.jsonl#2',
+          role: 'verification',
+          content: 'The retry remains eligible for semantic review.',
+        },
+      ],
     } as any;
     const serializedBytes = Buffer.byteLength(JSON.stringify(largeRetryBundle), 'utf8');
     assert.ok(serializedBytes >= 19_000);
@@ -1425,6 +1567,7 @@ describe('RuntimeLearning — AC3: Due Review', () => {
         detail: 'send_file: delivered',
       }],
       contradictionSignals: [],
+      sourceEvidence: [frozenEpisodeSource(`${episodeId}#1`, `${episodeId}.jsonl`, 1)],
       semanticObservations: [{
         kind: 'user-intent',
         value: `Deliver ${episodeId}.`,
@@ -1492,6 +1635,7 @@ describe('RuntimeLearning — AC3: Due Review', () => {
             detail: 'send_file: delivered',
           }],
           contradictionSignals: [],
+          sourceEvidence: [frozenEpisodeSource(`${episodeId}#1`, `${episodeId}.jsonl`, 1)],
           semanticObservations: [{
             kind: 'user-intent',
             value: 'Deliver the drain-safe report.',
@@ -1555,6 +1699,7 @@ describe('RuntimeLearning — AC3: Due Review', () => {
             detail: 'send_file: delivered',
           }],
           contradictionSignals: [],
+          sourceEvidence: [frozenEpisodeSource(`${episodeId}#1`, `${episodeId}.jsonl`, 1)],
           semanticObservations: [{
             kind: 'user-intent',
             value: 'Do not admit new review work after drain starts.',
@@ -1619,6 +1764,7 @@ describe('RuntimeLearning — AC3: Due Review', () => {
             detail: 'send_file: delivered',
           }],
           contradictionSignals: [],
+          sourceEvidence: [frozenEpisodeSource(`${episodeId}#1`, `${episodeId}.jsonl`, 1)],
           semanticObservations: [{
             kind: 'user-intent',
             value: 'Persist the retry before shutdown completes.',
@@ -1683,6 +1829,7 @@ describe('RuntimeLearning — AC3: Due Review', () => {
             detail: 'send_file: delivered',
           }],
           contradictionSignals: [],
+          sourceEvidence: [frozenEpisodeSource(`${episodeId}#1`, `${episodeId}.jsonl`, 1)],
           semanticObservations: [{
             kind: 'user-intent',
             value: 'Drain must stop new quantum leases after shutdown begins.',
@@ -1765,6 +1912,7 @@ describe('Issue 70 — Wake reason union and mask-free due-work', () => {
             detail: 'send_file: plan.md',
           }],
           contradictionSignals: [],
+          sourceEvidence: [frozenEpisodeSource('issue-70#1', env.logFile, 1)],
           semanticObservations: [],
           settlementDeadline: new Date(Date.now() - 60_000).toISOString(),
           status: 'settling',
@@ -2279,6 +2427,76 @@ describe('RuntimeLearning — Curation', () => {
       curator.observeEpisode(episodes[0]);
     }
   });
+
+  test('startup recovers a persisted contradiction after the in-memory observation queue is lost', async () => {
+    const agentTurnEpisodeId = 'turn-episode-curator-recovery';
+    const runtimeSessionId = 'runtime-curator-recovery';
+    recordReviewAdmissionLoad(env, agentTurnEpisodeId, runtimeSessionId);
+    const episode: LearningEpisode = {
+      schemaVersion: 3,
+      episodeId: 'episode-curator-recovery',
+      agentTurnEpisodeId,
+      runtimeSessionId,
+      sourceFilePath: 'curator-recovery.jsonl',
+      deliveryTurn: 1,
+      completionEvidence: [{
+        ref: 'curator-recovery.jsonl#turn-1:delivery',
+        sourceFilePath: 'curator-recovery.jsonl',
+        turn: 1,
+        kind: 'artifact-delivery',
+      }, {
+        ref: 'curator-recovery.jsonl#turn-2:contradiction',
+        sourceFilePath: 'curator-recovery.jsonl',
+        turn: 2,
+        kind: 'contradiction',
+      }],
+      contradictionSignals: [{
+        signalId: 'signal-curator-recovery',
+        kind: 'direct-correction',
+        message: 'The test-review-admission Skill used the wrong package manager.',
+        source: {
+          ref: 'curator-recovery.jsonl#turn-2:contradiction',
+          sourceFilePath: 'curator-recovery.jsonl',
+          turn: 2,
+          kind: 'contradiction',
+        },
+        precedingDeliveryTurn: 1,
+        precedingSourceFilePath: 'curator-recovery.jsonl',
+        runtimeSessionId,
+        preventsPromotion: true,
+      }],
+      sourceEvidence: [
+        frozenEpisodeSource(
+          'curator-recovery.jsonl#turn-1:delivery',
+          'curator-recovery.jsonl',
+          1,
+          'User:\nRun the package workflow.\n\nAssistant:\nThe workflow finished.',
+        ),
+        frozenEpisodeSource(
+          'curator-recovery.jsonl#turn-2:contradiction',
+          'curator-recovery.jsonl',
+          2,
+          'User:\nThe Skill used the wrong package manager.\n\nAssistant:\nUnderstood.',
+        ),
+      ],
+      semanticObservations: [],
+      settlementDeadline: new Date(0).toISOString(),
+      status: 'contradicted',
+    };
+    env.runtimeLearning.getEpisodeStore().save({
+      schemaVersion: 3,
+      episodes: { [episode.episodeId]: episode },
+    });
+
+    await env.runtimeLearning.wake('startup');
+    await env.runtimeLearning.wake('startup');
+
+    const outcomes = new SkillUsageLedger(path.join(env.root, 'data', 'skill-usage-ledger.jsonl'))
+      .listFacts()
+      .filter(fact => fact.kind === 'episode-outcome');
+    assert.equal(outcomes.length, 1, 'durable scan recovers once and ledger replay stays idempotent');
+    assert.equal(outcomes[0]!.outcome, 'contradicted');
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -2340,6 +2558,10 @@ describe('Issue 2 — Generic wake reconciliation', () => {
           completionEvidence: [
             { ref: 'ev-1', sourceFilePath: env.logFile, turn: 1, kind: 'artifact-delivery', detail: 'send_file:test.md' },
             { ref: 'ev-2', sourceFilePath: env.logFile, turn: 2, kind: 'user-acceptance' },
+          ],
+          sourceEvidence: [
+            frozenEpisodeSource('ev-1', env.logFile, 1),
+            frozenEpisodeSource('ev-2', env.logFile, 2),
           ],
           contradictionSignals: [],
           semanticObservations: [{
@@ -2588,7 +2810,9 @@ describe('Issue 4 — Heartbeat single-write', () => {
 });
 
 describe('Issue #83 — controlled production acceptance', () => {
-  test('audits a healthy transcript-linked creation while a hanging peer queues timeout and a targeted wake coalesces', async () => {
+  test('audits a healthy transcript-linked creation while a hanging peer queues timeout and a targeted wake coalesces', {
+    timeout: 5_000,
+  }, async () => {
     const env = setupEnv(0);
     const makeEpisode = (episodeId: string, intent: string): LearningEpisode => ({
       schemaVersion: 3,
@@ -2603,6 +2827,12 @@ describe('Issue #83 — controlled production acceptance', () => {
         kind: 'artifact-delivery',
         detail: 'send_file: report sent',
       }],
+      sourceEvidence: [frozenEpisodeSource(
+        `${episodeId}.jsonl#turn-1:delivery:send_file`,
+        `${episodeId}.jsonl`,
+        1,
+        `User:\n${intent}\n\nAssistant:\nThe report was sent.`,
+      )],
       contradictionSignals: [],
       semanticObservations: [{
         kind: 'user-intent',
@@ -2701,7 +2931,7 @@ describe('RuntimeLearning — fair wake pre-claim fencing', () => {
   beforeEach(() => { env = setupEnv(0); });
   afterEach(() => { env.restore(); env.teardown(); });
 
-  test('fences a policy-v2 active skill_author job before Author and advances only the normalized v3 successor', async () => {
+  test('fences a pre-authority policy-v2 Learning Episode job before Author and advances only the normalized v3 successor', async () => {
     const authorBundles: Array<{ bundleId: string; referencedSkills: string[] }> = [];
     env.skillEvolutionOptions.authorFixture = ({ bundle }) => {
       authorBundles.push({
@@ -2731,8 +2961,32 @@ describe('RuntimeLearning — fair wake pre-claim fencing', () => {
       rationale: 'Normalized fair wake successor looks bounded.',
     });
 
+    const legacyBundle = runtimeReviewBundle(
+      'v3:learning-episode:episode-candidate-active-v2',
+    );
     const bundle = {
-      ...runtimeReviewBundle('v3:session.jsonl:0:20:candidate-active-v2'),
+      ...legacyBundle,
+      authority: undefined,
+      episode: {
+        ...(legacyBundle.episode as DistilledKnowledgeCandidate),
+        capabilityId: 'episode-capability-candidate-active-v2',
+      },
+      sourceEvidence: [
+        {
+          ref: 'session.jsonl#12',
+          sourceFilePath: 'session.jsonl',
+          turn: 12,
+          role: 'problem-action' as const,
+          content: 'Use the bounded normalized workflow.',
+        },
+        {
+          ref: 'session.jsonl#13',
+          sourceFilePath: 'session.jsonl',
+          turn: 13,
+          role: 'verification' as const,
+          content: 'The bounded normalized workflow was accepted.',
+        },
+      ],
       referencedSkills: [
         { name: 'generated-helper-a', capabilityHandle: 'cap-a', guidanceHash: 'hash-a' },
         { name: 'generated-helper-b', capabilityHandle: 'cap-b', guidanceHash: 'hash-b' },
