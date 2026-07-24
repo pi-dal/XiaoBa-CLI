@@ -2,6 +2,7 @@ import { describe, test } from 'node:test';
 import * as assert from 'node:assert/strict';
 
 import {
+  LEARNING_EPISODE_SCHEMA_VERSION,
   buildLearningEpisodeCandidate,
   type LearningEpisode,
   type SemanticObservation,
@@ -9,7 +10,7 @@ import {
 
 function makeEpisode(semanticObservations: SemanticObservation[]): LearningEpisode {
   return {
-    schemaVersion: 3 as any,
+    schemaVersion: LEARNING_EPISODE_SCHEMA_VERSION,
     episodeId: 'episode-review-hints-001',
     runtimeSessionId: 'session-review-hints',
     sourceFilePath: '/logs/sessions/chat/review-hints.jsonl',
@@ -32,7 +33,7 @@ function makeEpisode(semanticObservations: SemanticObservation[]): LearningEpiso
     semanticObservations,
     settlementDeadline: '2026-07-24T00:00:00.000Z',
     status: 'eligible',
-  } as LearningEpisode;
+  } satisfies LearningEpisode;
 }
 
 function candidateFor(...values: string[]) {
