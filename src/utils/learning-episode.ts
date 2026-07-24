@@ -171,6 +171,7 @@ export function buildLearningEpisodeCandidate(
     .join('; ')
     .slice(0, 280);
   const task = deriveCandidateTaskSummary(episode, toolNames, evidenceSummary);
+  const reviewHints = deriveCandidateReviewHints(episode.semanticObservations ?? []);
   const sourceByteRange = sourceUnit?.byteRange ?? episode.unitByteRange ?? { start: 0, end: 0 };
   const generatedAt = sourceUnit?.generatedAt ?? episode.unitGeneratedAt ?? episode.settlementDeadline;
   const external = episode.externalEventProvenance;
@@ -194,11 +195,13 @@ export function buildLearningEpisodeCandidate(
     boundaries: [
       'Only apply when a new task matches the same user-facing capability evidenced here.',
       'Do not reuse the pattern while the user is correcting or iterating on the task.',
+      ...reviewHints.boundaries,
     ],
     risks: [
       'This candidate is derived from one completed AgentTurn and may not generalize.',
       'The Author and Verifier must keep the resulting skill bounded by the supplied evidence.',
       'Do not copy lifecycle words such as settled/episode/candidate into the public routing name.',
+      ...reviewHints.risks,
     ],
     solvedLoop: {
       problem: task.problem,
@@ -221,6 +224,140 @@ export function buildLearningEpisodeCandidate(
     },
   };
 }
+
+/**
+ * Preserve boundary signals that are easy to lose when a concrete delivery is
+ * summarized into a reusable capability. Classify once so boundary and risk
+ * text cannot drift onto different trigger conditions. These are review hints:
+ * the Author/Verifier still decide whether to create, revise, defer, or reject.
+ */
+function deriveCandidateReviewHints(
+  observations: readonly SemanticObservation[],
+): { boundaries: string[]; risks: string[] } {
+  const userIntentObservations = observations.filter(
+    observation => observation.kind === 'user-intent',
+  );
+  const boundaries: string[] = [];
+  const risks: string[] = [];
+  for (const rule of CANDIDATE_REVIEW_HINT_RULES) {
+    if (!rule.matches(userIntentObservations)) continue;
+    boundaries.push(rule.boundary);
+    risks.push(rule.risk);
+  }
+  return {
+    boundaries: uniqueStrings(boundaries),
+    risks: uniqueStrings(risks),
+  };
+}
+
+interface CandidateReviewHintRule {
+  matches: (observations: readonly SemanticObservation[]) => boolean;
+  boundary: string;
+  risk: string;
+}
+
+const CANDIDATE_REVIEW_HINT_RULES: readonly CandidateReviewHintRule[] = [
+  {
+    matches: observations => observationMatches(observations, DYNAMIC_SKILL_INVENTORY_TASK),
+    boundary: 'For dynamic Skill inventories, read the single authoritative Current Skill Registry at execution time, verify discovered Skill directories and active/enabled state, and include the observation time; never hard-code counts or names from this episode.',
+    risk: 'Dynamic inventories may change between sessions; stale snapshots can produce wrong skill names, counts, or instructions.',
+  },
+  {
+    matches: observations => observationContainsAll(
+      observations,
+      USER_PROVIDED_MATERIAL,
+      INVESTOR_CONTEXT,
+      TRANSCRIPT_MATERIAL,
+      ANALYSIS_ACTION,
+    ),
+    boundary: 'For analysis of a user-provided investor transcript, fix the input requirements, analysis dimensions, fact/opinion separation rules, and citation/source boundaries before reuse.',
+    risk: 'A single investor-transcript analysis can be overgeneralized into an unsupported domain-analysis skill.',
+  },
+  {
+    matches: observations => observationContainsAllAfterRemovingNegatedActions(
+      observations,
+      EMAIL_SYSTEM,
+      EXTERNAL_EMAIL_ACTION,
+    ),
+    boundary: 'For email account operations, require explicit current authorization and an available login state; never handle verification codes, plaintext secrets, or unauthorized mailboxes.',
+    risk: 'Prior account, credential, or email-system access does not grant future authority.',
+  },
+  {
+    matches: observations => observationContainsAll(
+      observations,
+      CROSS_REPOSITORY,
+      MENTION_GATING,
+      REPOSITORY_CHANGE_ACTION,
+    ),
+    boundary: 'For cross-repository mention-gating changes, require explicit current repository authorization, baseline tests, a structured mention protocol, and final review, CI, and merge evidence; defer until that closure is present.',
+    risk: 'Prior private-repository, PR, CI, or merge access does not grant future authority, and an unclosed change may not be safely replayable.',
+  },
+  {
+    matches: observations => observationContainsAllAfterRemovingNegatedActions(
+      observations,
+      STRONG_PRIVILEGED_ACCESS,
+      PRIVILEGED_ACTION,
+    ),
+    boundary: 'For privileged account or external-system work, require explicit current authorization and available credentials/login state; do not inherit access from this episode.',
+    risk: 'Prior account, credential, or external-system access does not grant future authority.',
+  },
+  {
+    matches: observations => observationContainsAll(
+      observations,
+      OUTPUT_DOCUMENT_TASK,
+      OPERATION_RECAP_CONTEXT,
+      UNDERLYING_OPERATION_TASK,
+    ),
+    boundary: 'Distinguish the delivered document from the transferable operation behind it; do not turn a one-off write-up into a broad reporting skill when the evidence supports a narrower operation.',
+    risk: 'The visible artifact may be a report about a capability rather than the capability that should be learned.',
+  },
+];
+
+function observationMatches(
+  observations: readonly SemanticObservation[],
+  pattern: RegExp,
+): boolean {
+  return observations.some(observation => pattern.test(observation.value));
+}
+
+function observationContainsAll(
+  observations: readonly SemanticObservation[],
+  ...patterns: readonly RegExp[]
+): boolean {
+  return observations.some(observation =>
+    patterns.every(pattern => pattern.test(observation.value)),
+  );
+}
+
+function observationContainsAllAfterRemovingNegatedActions(
+  observations: readonly SemanticObservation[],
+  ...patterns: readonly RegExp[]
+): boolean {
+  return observations.some(observation => {
+    const affirmativeText = observation.value
+      .replace(NEGATED_ENGLISH_EXTERNAL_ACTION_CLAUSE, ' ')
+      .replace(NEGATED_CHINESE_EXTERNAL_ACTION_CLAUSE, ' ');
+    return patterns.every(pattern => pattern.test(affirmativeText));
+  });
+}
+
+const DYNAMIC_SKILL_INVENTORY_TASK = /(?:(?:list|inventory|catalog)[\s\S]{0,24}(?:registered|enabled)[\s\S]{0,16}\bskills\b|(?:registered|enabled)[\s\S]{0,24}\bskills\b[\s\S]{0,32}(?:list|inventory|catalog|registry|count|names?|enabled)|\bskills\b[\s\S]{0,16}(?:registry|registration|enabled state)|(?:列出|清单|列表|目录)[\s\S]{0,20}(?:当前|实际)[\s\S]{0,12}(?:注册|启用)[\s\S]{0,12}(?:Skills|技能)|(?:当前|实际)[\s\S]{0,24}(?:注册|启用)[\s\S]{0,12}(?:Skills|技能)[\s\S]{0,32}(?:清单|列表|目录|注册表|数量|名称|启用)|(?:Skills|技能)[\s\S]{0,12}(?:注册表|注册状态|启用状态))/iu;
+const USER_PROVIDED_MATERIAL = /(?:user[-\s]?provided|provided by the user|用户提供)/iu;
+const INVESTOR_CONTEXT = /(?:investor|投资者|交流会)/iu;
+const TRANSCRIPT_MATERIAL = /(?:transcript|文字稿|访谈稿)/iu;
+const ANALYSIS_ACTION = /(?:analy[sz]e|analysis|summari[sz]e|review|extract|分析|摘要|总结|提取)/iu;
+const EMAIL_SYSTEM = /(?:\bmail\b|\bemail\b|mailbox|mails\.dev|邮箱|邮件)/iu;
+const EXTERNAL_EMAIL_ACTION = /(?:\b(?:send|sending|sent|receive|receives|received|receiving|establish|establishes|established|establishing|setup|configure|configures|configured|configuring|authenticate|authenticates|authenticated|authenticating|access|accesses|accessed|accessing)\b|\blog(?:s|ged|ging)?\s+in\b|收发|发送|接收|建立|配置|登录|访问|验收)/iu;
+const CROSS_REPOSITORY = /(?:cross[-\s]?repositor(?:y|ies)|cross[-\s]?repo|two repositor(?:y|ies)|two repos|双仓|跨仓|两个私有仓)/iu;
+const MENTION_GATING = /(?:\bmention(?:[-\s]?gating)?\b|activation gate|mention gate|门控|激活链路|@ 激活)/iu;
+const REPOSITORY_CHANGE_ACTION = /(?:modify|change|implement|fix|commit|merge|修改|改动|实现|修复|提交|合并)/iu;
+const STRONG_PRIVILEGED_ACCESS = /(?:oauth|access token|api key|secret|credential|login state|account access|private repositor(?:y|ies)|验证码|密钥|凭据|登录态|账号权限|私有仓)/iu;
+const PRIVILEGED_ACTION = /(?:\b(?:access|authenticate|authorize|setup|configure|modify|change|implement|rotate|store)\b|\blog(?:ging)?\s+in\b|访问|认证|授权|登录|建立|配置|修改|实现|轮换|保存)/iu;
+const NEGATED_ENGLISH_EXTERNAL_ACTION_CLAUSE = /(?:without|do not|don't|never|no need to)\s+(?:(?:currently|yet)\s+)?(?:access(?:ing)?|use|using|log(?:ging)?\s+in|authenticate|send(?:ing)?|receive|receiving)\b[^,;.，。；]*?(?=\b(?:but|however|instead)\b|[,;.，。；]|$)/giu;
+const NEGATED_CHINESE_EXTERNAL_ACTION_CLAUSE = /(?:不|无需|不要|禁止)(?:访问|使用|登录|授权|发送|接收)[^,;.，。；]*?(?=(?:但|但是|而是|不过|然后)|[,;.，。；]|$)/giu;
+const OUTPUT_DOCUMENT_TASK = /(?:report|document|write[-\s]?up|html|kami|pdf|docx|复盘|报告|文档|清单|总结|摘要)/iu;
+const OPERATION_RECAP_CONTEXT = /(?:recap|history|journey|retrospective|write[-\s]?up about|documenting how|历程|过程|复盘|回顾|记录)/iu;
+const UNDERLYING_OPERATION_TASK = /(?:establish|setup|configure|implement|fix|verify|validate|build|operate|established|configured|implemented|fixed|verified|validated|建立|配置|实现|修复|验证|验收|收发|改动|链路|能力)/iu;
 
 /**
  * Derive a concrete, lifecycle-neutral candidate summary from durable

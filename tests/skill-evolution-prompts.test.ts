@@ -122,6 +122,17 @@ describe('skill-evolution progressive-trust prompt policy', () => {
     assert.match(text, /Never copy the failed action into guidance or promote the contradicted behavior/);
   });
 
+  test('Skill Author prompt narrows output, inventory, material-analysis, and high-authority candidates', () => {
+    const text = readRequiredDefaultPromptFile('subagents/skill-author.md');
+    assert.match(text, /Separate a delivered output document from the underlying reusable operation/);
+    assert.match(text, /single authoritative Current Skill Registry/);
+    assert.match(text, /verify discovered Skill directories and active\/enabled state/);
+    assert.match(text, /fix the input requirements, analysis dimensions, fact\/opinion separation rules, and citation boundaries/);
+    assert.match(text, /Do not extend this evidence to arbitrary articles, attachments, meeting notes, transcripts, or domain analysis/);
+    assert.match(text, /Never handle verification codes, plaintext secrets, or unauthorized mailboxes/);
+    assert.match(text, /defer until.*baseline tests.*structured mention protocol.*review, CI, and merge evidence/is);
+  });
+
   test('Skill Verifier prompt does not reject an ordinary episode for weak proxy signals', () => {
     const text = readRequiredDefaultPromptFile('subagents/skill-verifier.md');
     assert.match(text, /One eligible, low-risk Episode can satisfy this policy/);
@@ -149,5 +160,16 @@ describe('skill-evolution progressive-trust prompt policy', () => {
     assert.match(text, /automatic correction-bound reassessment may append evidence only/);
     assert.match(text, /Reject retirement and replacement because the bundle lacks a bounded correction snapshot and the prior guidance body/);
     assert.match(text, /also reject create, migrate, merge, cross-Skill append/);
+  });
+
+  test('Skill Verifier prompt checks output, inventory, material-analysis, and high-authority candidates', () => {
+    const text = readRequiredDefaultPromptFile('subagents/skill-verifier.md');
+    assert.match(text, /Output\/document vs operation/);
+    assert.match(text, /single authoritative Current Skill Registry/);
+    assert.match(text, /discovered directories and active\/enabled state/);
+    assert.match(text, /fixed input requirements, analysis dimensions, fact\/opinion separation rules, and citation\/source boundaries/);
+    assert.match(text, /generalize one user-provided investor transcript into arbitrary articles, attachments, meeting notes, transcripts, or broad domain analysis/);
+    assert.match(text, /verification codes, plaintext secrets, or unauthorized mailboxes/);
+    assert.match(text, /baseline tests, a structured mention protocol, and final review\/CI\/merge evidence/);
   });
 });

@@ -11,7 +11,6 @@ import {
   buildLearningEpisodeCandidate,
   extractLearningEpisodes,
 } from '../src/utils/learning-episode';
-import type { LearningEpisode } from '../src/utils/learning-episode';
 import {
   buildEvidenceCapsule,
   reconstructBundleFromCapsule,
