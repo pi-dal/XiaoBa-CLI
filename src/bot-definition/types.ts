@@ -85,6 +85,8 @@ export interface BotCatalogModelRuntime {
     toolCalling?: boolean;
     streaming?: boolean;
   };
+  capabilitiesSource?: 'relay-models' | 'models-dev' | 'static' | 'probe';
+  capabilitiesCheckedAt?: string;
 }
 
 /**
