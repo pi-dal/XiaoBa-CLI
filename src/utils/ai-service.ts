@@ -6,6 +6,7 @@ import { AnthropicProvider } from '../providers/anthropic-provider';
 import { OpenAIProvider } from '../providers/openai-provider';
 import { Logger } from './logger';
 import { isPrimaryModelToolCallingCapable } from './model-capabilities';
+import { copyProviderErrorDetails, normalizeProviderError } from './provider-error';
 import { resolveModelContextWindow } from './model-context-window';
 
 /**
@@ -214,11 +215,7 @@ export class AIService {
     const wrapped = status
       ? new Error(`API错误 (${status}): ${errorMessage}`)
       : new Error(`请求失败: ${errorMessage}`);
-    const code = this.extractErrorCode(error);
-    if (code) {
-      (wrapped as Error & { code?: string }).code = code;
-    }
-    return wrapped;
+    return copyProviderErrorDetails(wrapped, error);
   }
 
   /**
@@ -227,6 +224,11 @@ export class AIService {
   private isRetryable(error: any): boolean {
     if (this.isAbortError(error)) {
       return false;
+    }
+
+    const normalized = normalizeProviderError(error);
+    if (normalized.retryable !== null) {
+      return normalized.retryable;
     }
 
     if (this.isKnownNonRetryableProviderError(error)) {
@@ -383,7 +385,7 @@ export class AIService {
           elapsedMs,
           maxElapsedMs: policy.maxElapsedMs,
           status,
-          message: this.extractErrorMessage(error),
+          message: normalizeProviderError(error).safeMessage,
         };
         await this.notifyRetry(callbacks, retryAttempt, policy.maxRetries, retryInfo);
 

@@ -341,6 +341,130 @@ test('AIService does not retry quota exhaustion even when provider uses HTTP 429
   assert.equal(attempts, 1);
 });
 
+test('AIService does not retry structured permission denied errors and preserves diagnostics', async () => {
+  process.env.CATSCO_MODEL_RETRY_MAX_RETRIES = '2';
+  const service = createTestService();
+  let attempts = 0;
+  const permissionError = Object.assign(new Error('permission denied'), {
+    response: {
+      status: 403,
+      data: {
+        error: {
+          code: 'permission_denied',
+          message: 'permission denied',
+          retryable: false,
+          request_id: 'req-permission-123',
+        },
+      },
+    },
+  });
+  (service as any).provider = {
+    chat: async () => {
+      attempts += 1;
+      throw permissionError;
+    },
+    chatStream: async () => ({ content: null }),
+  };
+
+  await assert.rejects(
+    () => service.chat([]),
+    (error: Error & Record<string, unknown>) => {
+      assert.equal(error.status, 403);
+      assert.equal(error.code, 'permission_denied');
+      assert.equal(error.retryable, false);
+      assert.equal(error.requestId, 'req-permission-123');
+      return true;
+    },
+  );
+  assert.equal(attempts, 1);
+});
+
+test('AIService does not retry provider pool exhaustion when relay marks it final', async () => {
+  process.env.CATSCO_MODEL_RETRY_MAX_RETRIES = '2';
+  const service = createTestService();
+  let attempts = 0;
+  const poolError = Object.assign(new Error('all candidates failed'), {
+    response: {
+      status: 503,
+      data: {
+        code: 'provider_pool_exhausted',
+        retryable: false,
+        dominant_cause: 'permission_denied',
+        attempt_count: 4,
+      },
+    },
+  });
+  (service as any).provider = {
+    chat: async () => {
+      attempts += 1;
+      throw poolError;
+    },
+    chatStream: async () => ({ content: null }),
+  };
+
+  await assert.rejects(() => service.chat([]), /API错误 \(503\): all candidates failed/);
+  assert.equal(attempts, 1);
+});
+
+test('AIService honors an explicit retryable relay decision', async () => {
+  process.env.CATSCO_MODEL_RETRY_MAX_RETRIES = '1';
+  const service = createTestService();
+  let attempts = 0;
+  const retryableError = Object.assign(new Error('temporary pool exhaustion'), {
+    response: {
+      status: 503,
+      headers: { 'retry-after': '0' },
+      data: {
+        code: 'provider_pool_exhausted',
+        retryable: true,
+      },
+    },
+  });
+  (service as any).sleepWithAbort = async () => undefined;
+  (service as any).provider = {
+    chat: async () => {
+      attempts += 1;
+      if (attempts === 1) throw retryableError;
+      return { content: 'ok' };
+    },
+    chatStream: async () => ({ content: null }),
+  };
+
+  const result = await service.chat([]);
+  assert.deepStrictEqual(result, { content: 'ok' });
+  assert.equal(attempts, 2);
+});
+
+test('AIService redacts credentials from retry callbacks', async () => {
+  process.env.CATSCO_MODEL_RETRY_MAX_RETRIES = '1';
+  const service = createTestService();
+  let attempts = 0;
+  let retryMessage = '';
+  const transientError = Object.assign(new Error('temporary Bearer secret-token sk-secret12345678'), {
+    response: {
+      status: 503,
+      headers: { 'retry-after': '0' },
+      data: { message: 'temporary Bearer secret-token sk-secret12345678' },
+    },
+  });
+  (service as any).sleepWithAbort = async () => undefined;
+  (service as any).provider = {
+    chat: async () => ({ content: null }),
+    chatStream: async () => {
+      attempts += 1;
+      if (attempts === 1) throw transientError;
+      return { content: 'ok' };
+    },
+  };
+
+  await service.chatStream([], undefined, {
+    onRetry: (_attempt, _maxRetries, info) => { retryMessage = info?.message || ''; },
+  });
+
+  assert.match(retryMessage, /\[redacted\]/);
+  assert.doesNotMatch(retryMessage, /secret-token|secret12345678/);
+});
+
 test('AIService still retries transient load balancer failures', async () => {
   process.env.CATSCO_MODEL_RETRY_MAX_RETRIES = '1';
   const service = createTestService();
