@@ -44,6 +44,11 @@ import type { PendingUserInputProvider } from './conversation-runner';
 import { resolveModelContextWindow } from '../utils/model-context-window';
 import { parseSessionKeyV2 } from './session-router';
 import { MODEL_IMAGE_SAFETY_MESSAGE, isModelImageSafetyError } from '../utils/model-error-classifier';
+import {
+  formatProviderErrorReply,
+  normalizeProviderError,
+  sanitizeProviderErrorMessage,
+} from '../utils/provider-error';
 import { stripAssistantArtifactsFromMessages } from '../utils/transcript-artifacts';
 import type { PromptTraceSnapshot } from '../utils/prompt-observability';
 import { toPromptTurnMetadata } from '../utils/prompt-observability';
@@ -678,7 +683,7 @@ export class AgentSession {
 
         // 不删除用户消息，而是添加一个错误回复，保持上下文连贯
         // 这样用户说"继续"时可以接上
-        Logger.error(`[会话 ${this.key}] 处理失败: ${err.message}`);
+        Logger.error(`[会话 ${this.key}] 处理失败: ${sanitizeProviderErrorMessage(err?.message || String(err))}`);
 
         // 识别多模态相关错误
         const errorMsg = err.message || String(err);
@@ -688,12 +693,15 @@ export class AgentSession {
         const isTransientProviderError = this.isTransientProviderError(err);
         const isEmptyModelResponseError = this.isEmptyModelResponseError(err);
         const relayBudgetErrorReply = this.formatRelayBudgetErrorReply(err);
+        const providerErrorReply = formatProviderErrorReply(err, this.currentModelName());
 
         let errorReply = ERROR_MESSAGE;
         if (isImageSafetyError) {
           errorReply = MODEL_IMAGE_SAFETY_MESSAGE;
         } else if (relayBudgetErrorReply) {
           errorReply = relayBudgetErrorReply;
+        } else if (providerErrorReply) {
+          errorReply = providerErrorReply;
         } else if (isVisionError) {
           errorReply = '当前模型不支持图片识别。请使用支持多模态的模型（如 Claude 3.5 Sonnet 或 GPT-4V），或者用文字描述图片内容。';
         } else if (isModelTimeoutError) {
@@ -1115,35 +1123,31 @@ export class AgentSession {
       isEmptyModelResponseError?: boolean;
     },
   ): string {
-    const detail = this.sanitizeErrorMessage(error?.message || String(error));
+    const normalized = normalizeProviderError(error);
+    const detail = sanitizeProviderErrorMessage(error?.message || String(error));
+    const diagnostics = [
+      normalized.status !== null ? `status=${normalized.status}` : null,
+      normalized.code ? `code=${normalized.code}` : null,
+      normalized.category !== 'unknown' ? `category=${normalized.category}` : null,
+      normalized.retryable !== null ? `retryable=${normalized.retryable}` : null,
+      normalized.attemptCount !== null ? `attempt_count=${normalized.attemptCount}` : null,
+      normalized.dominantCause ? `dominant_cause=${sanitizeProviderErrorMessage(normalized.dominantCause).slice(0, 80)}` : null,
+      normalized.requestId ? `request_id=${normalized.requestId.replace(/[^A-Za-z0-9_-]/g, '').slice(-24)}` : null,
+    ].filter(Boolean).join(', ');
+    const summary = diagnostics ? `${detail}; ${diagnostics}` : detail;
     if (flags.isModelTimeoutError) {
-      return `[处理中断: 模型中转请求超时。已保留本轮已完成的工具结果和上下文；如果用户要求继续，请基于当前上下文继续，避免重复已经完成的工具步骤。错误摘要: ${detail}]`;
+      return `[处理中断: 模型中转请求超时。已保留本轮已完成的工具结果和上下文；如果用户要求继续，请基于当前上下文继续，避免重复已经完成的工具步骤。错误摘要: ${summary}]`;
     }
     if (flags.isImageSafetyError) {
-      return `[处理中断: 上游模型拒绝了当前对话中的图片。已保留本轮已完成的上下文；如果用户要求继续，请提示用户删除或更换相关图片，或新开对话后继续。错误摘要: ${detail}]`;
+      return `[处理中断: 上游模型拒绝了当前对话中的图片。已保留本轮已完成的上下文；如果用户要求继续，请提示用户删除或更换相关图片，或新开对话后继续。错误摘要: ${summary}]`;
     }
     if (flags.isTransientProviderError) {
-      return `[处理中断: 模型服务临时异常或上游网关错误。已保留本轮上下文；如果用户要求继续，请从当前状态继续，不要重复已经完成的工具步骤。错误摘要: ${detail}]`;
+      return `[处理中断: 模型服务临时异常或上游网关错误。已保留本轮上下文；如果用户要求继续，请从当前状态继续，不要重复已经完成的工具步骤。错误摘要: ${summary}]`;
     }
     if (flags.isEmptyModelResponseError) {
-      return `[处理中断: 模型未返回正文或工具调用，自动重试后仍未恢复。已保留本轮上下文；如果用户重试，请正常处理上一条请求。错误摘要: ${detail}]`;
+      return `[处理中断: 模型未返回正文或工具调用，自动重试后仍未恢复。已保留本轮上下文；如果用户重试，请正常处理上一条请求。错误摘要: ${summary}]`;
     }
-    return `[处理失败: ${detail}]`;
-  }
-
-  private sanitizeErrorMessage(message: string): string {
-    const normalized = String(message || 'unknown error')
-      .replace(/Bearer\s+[A-Za-z0-9._-]+/gi, 'Bearer [redacted]')
-      .replace(/\bsk-[A-Za-z0-9_-]{8,}\b/g, 'sk-[redacted]')
-      .replace(/("?api_?key"?\s*[:=]\s*)"?[^"\s,}]+/gi, '$1[redacted]')
-      .replace(/("?authorization"?\s*[:=]\s*)"?[^"\s,}]+/gi, '$1[redacted]')
-      .replace(/\s+/g, ' ')
-      .trim();
-    const maxLength = 600;
-    if (normalized.length <= maxLength) {
-      return normalized;
-    }
-    return `${normalized.slice(0, maxLength)}...(已截断)`;
+    return `[处理失败: ${summary}]`;
   }
 
 }
