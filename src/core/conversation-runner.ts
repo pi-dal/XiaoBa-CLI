@@ -1026,6 +1026,7 @@ export class ConversationRunner {
           ],
           tool_call_id: record.result.tool_call_id,
           name: record.result.name,
+          __toolExecutionSucceeded: record.result.ok === true && !record.result.errorCode,
           ...(this.episodeId ? { __episodeId: this.episodeId } : {}),
         });
       } else {
@@ -1035,6 +1036,7 @@ export class ConversationRunner {
           content: record.toolContent,
           tool_call_id: record.result.tool_call_id,
           name: record.result.name,
+          __toolExecutionSucceeded: record.result.ok === true && !record.result.errorCode,
           ...(this.episodeId ? { __episodeId: this.episodeId } : {}),
         });
 
