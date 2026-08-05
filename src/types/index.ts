@@ -30,6 +30,8 @@ export interface Message {
   name?: string;
   /** Historical tool result was normalized once and must not be rewritten by later prompt-budget passes. */
   __toolResultStable?: boolean;
+  /** Internal evidence that this tool result came from a successful execution. Never sent to providers. */
+  __toolExecutionSucceeded?: boolean;
   /** 标记由 injectContext 注入的消息，用于滑动窗口清理 */
   __injected?: boolean;
   /**

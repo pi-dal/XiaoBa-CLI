@@ -5,7 +5,7 @@ import { FeishuConfig } from './types';
 import { MessageHandler } from './message-handler';
 import { MessageSender } from './message-sender';
 import { MessageSessionManager } from '../core/message-session-manager';
-import { AgentServices, BUSY_MESSAGE, ERROR_MESSAGE, RuntimeFeedbackInput } from '../core/agent-session';
+import { AgentServices, BUSY_MESSAGE, RuntimeFeedbackInput } from '../core/agent-session';
 import { Logger } from '../utils/logger';
 import { SubAgentManager } from '../core/sub-agent-manager';
 import { shouldSuppressSubAgentObservationReply } from '../core/sub-agent-observation';
@@ -356,7 +356,14 @@ export class FeishuBot {
       executionScope: createExecutionScopeFromRoute(route),
       runtimeFeedback,
     });
-    if (result.text === BUSY_MESSAGE || result.text === ERROR_MESSAGE) {
+    if (result.text === BUSY_MESSAGE) {
+      const queue = this.messageQueue.get(key) ?? [];
+      queue.unshift({ userText, chatId: msg.chatId, senderId: msg.senderId, sessionRoute: route, source: 'user', runtimeFeedback });
+      this.messageQueue.set(key, queue);
+      Logger.info(`[${key}] 主消息处理遇到竞态忙碌，已重新入队`);
+      return;
+    }
+    if (result.visibleToUser && (result.taskOutcome === 'failed' || result.taskOutcome === 'cancelled')) {
       await this.sender.reply(msg.chatId, result.text);
     }
 
@@ -401,7 +408,7 @@ export class FeishuBot {
       Logger.info(`[${sessionKey}] 主会话竞态忙碌，子智能体反馈已入队`);
       return;
     }
-    if (result.text === ERROR_MESSAGE) {
+    if (result.visibleToUser && (result.taskOutcome === 'failed' || result.taskOutcome === 'cancelled')) {
       await this.sender.reply(chatId, result.text);
     }
     await this.drainMessageQueue(sessionKey);
@@ -460,7 +467,14 @@ export class FeishuBot {
         executionScope,
         runtimeFeedback: msg.runtimeFeedback,
       });
-    if (result.text === ERROR_MESSAGE) {
+    if (result.text === BUSY_MESSAGE) {
+      const pending = this.messageQueue.get(sessionKey) ?? [];
+      pending.unshift(msg);
+      this.messageQueue.set(sessionKey, pending);
+      Logger.info(`[${sessionKey}] 排队消息处理遇到竞态忙碌，已重新入队`);
+      return;
+    }
+    if (result.visibleToUser && (result.taskOutcome === 'failed' || result.taskOutcome === 'cancelled')) {
       await this.sender.reply(msg.chatId, result.text);
     }
 

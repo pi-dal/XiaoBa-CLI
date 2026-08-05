@@ -69,6 +69,8 @@ import {
   isCheckpointCompactionEnabled,
 } from './checkpoint-compaction';
 import { estimateToolsTokens } from './token-estimator';
+import { resolveSessionSurface } from './session-surface';
+import { getPetService } from '../pet/pet-service';
 import type { SessionRuntimeLogEvent, TurnErrorPayload } from '../utils/session-log-schema';
 
 export type { RuntimeFeedbackInput, RuntimeFeedbackOptions } from './runtime-feedback-inbox';
@@ -80,11 +82,31 @@ export interface DurableRemoteContextEntry {
   content: string;
 }
 
+function safeErrorProperty(error: unknown, property: PropertyKey): unknown {
+  if (!error || (typeof error !== 'object' && typeof error !== 'function')) return undefined;
+  try {
+    return Reflect.get(error, property);
+  } catch {
+    return undefined;
+  }
+}
+
+function safeErrorText(error: unknown): string {
+  const message = safeErrorProperty(error, 'message');
+  if (typeof message === 'string' && message) return message;
+  try {
+    const text = String(error ?? '');
+    return text || 'unknown error';
+  } catch {
+    return 'unknown error';
+  }
+}
+
 export const BUSY_MESSAGE = '正在处理上一条消息，请稍候...';
 export const ERROR_MESSAGE = '不好意思，刚才处理出了点问题，你再试一次？';
-export const MODEL_TIMEOUT_MESSAGE = '模型中转请求超时了，我已经保留本轮已完成的工具结果和上下文。你可以直接说“继续”，我会从这里接上。';
-export const MODEL_TRANSIENT_ERROR_MESSAGE = '当前模型服务临时异常，刚才这次请求没有完成。我已经保留上下文；你可以稍后重试，或临时切换到其他模型继续。';
-export const EMPTY_MODEL_RESPONSE_MESSAGE = '模型本轮未返回有效内容，自动重试后仍未恢复。请重新发送上一条消息；若仍失败，请切换模型或稍后再试。';
+export const MODEL_TIMEOUT_MESSAGE = '模型中转请求超时，本轮没有完成。';
+export const MODEL_TRANSIENT_ERROR_MESSAGE = '当前模型服务临时异常，本轮没有完成。';
+export const EMPTY_MODEL_RESPONSE_MESSAGE = '模型本轮未返回有效内容，本轮没有完成。请重新发送上一条消息；若仍失败，请切换模型或稍后再试。';
 export const CONTEXT_COMPACTION_START_MESSAGE = '正在压缩上下文，整理较早的对话内容。';
 export const CONTEXT_COMPACTION_COMPLETE_MESSAGE = '上下文压缩完成，继续处理当前请求。';
 export const CONTEXT_COMPACTION_ERROR_MESSAGE = '上下文压缩失败，已保留原上下文继续处理。';
@@ -654,7 +676,7 @@ export class AgentSession {
         await reconcileCurrentBotPromptBeforeTurn();
         await this.refreshSystemPromptIfNeeded(lifecycleGeneration, this.activeAbortController.signal);
       } catch (error: any) {
-        Logger.warning(`[会话 ${this.key}] Prompt 热加载失败，继续使用上一版: ${error?.message || error}`);
+        Logger.warning(`[会话 ${this.key}] Prompt 热加载失败，继续使用上一版: ${safeErrorText(error)}`);
       }
 
       try {
@@ -722,7 +744,12 @@ export class AgentSession {
         }
         this.messages = result.messages;
         failurePhase = 'result_persistence';
-        this.lifecycleManager.saveContext(this.messages);
+        if (!this.lifecycleManager.saveContext(this.messages)) {
+          throw new Error('Completed turn context persistence failed');
+        }
+        if (result.visibleToUser) {
+          this.recordCompletedTurnEvents();
+        }
         return { ...result, taskOutcome: 'completed' };
       } catch (err: any) {
         if (this.isAbortError(err) || this.interruptRequested || this.activeAbortController.signal.aborted) {
@@ -733,7 +760,7 @@ export class AgentSession {
         }
 
         const recoveredMessages = this.getPartialMessagesFromError(err);
-        const partialProgressPreserved = recoveredMessages
+        const hasRecoverablePartialProgress = recoveredMessages
           ? this.hasRecoverablePartialProgress(recoveredMessages)
           : false;
         if (recoveredMessages) {
@@ -741,7 +768,7 @@ export class AgentSession {
         }
 
         // 识别多模态相关错误
-        const errorMsg = err.message || String(err);
+        const errorMsg = safeErrorText(err);
         const isImageSafetyError = isModelImageSafetyError(err);
         const isVisionError = !isImageSafetyError && errorMsg.match(/image|vision|multimodal|media_type|base64.*not supported/i);
         const isModelTimeoutError = this.isModelTimeoutError(err);
@@ -749,7 +776,8 @@ export class AgentSession {
         const isEmptyModelResponseError = this.isEmptyModelResponseError(err);
         const relayBudgetErrorReply = this.formatRelayBudgetErrorReply(err);
         const isRelayBudgetError = relayBudgetErrorReply !== null;
-        const closestDiagnostics = readModelErrorDiagnostics(err);
+        const closestDiagnostics = readModelErrorDiagnostics(err)
+          ?? readModelErrorDiagnostics(safeErrorProperty(err, 'cause'));
         const classified = classifyModelError(err, {
           isImageSafetyError,
           isRelayBudgetError,
@@ -764,6 +792,28 @@ export class AgentSession {
         });
         const diagnostics = classified.diagnostics;
         const retry = diagnostics.retry;
+        let baseErrorReply = classified.user_message;
+        if (relayBudgetErrorReply) {
+          baseErrorReply = relayBudgetErrorReply;
+        } else if (classified.category === 'transient') {
+          baseErrorReply = this.formatTransientProviderErrorReply();
+        }
+
+        // Keep internal failure context out of future prompts while persisting all durable progress.
+        this.messages.push({
+          role: 'assistant',
+          content: this.formatErrorContextMessage(err, {
+            isModelTimeoutError,
+            isImageSafetyError,
+            isTransientProviderError,
+            isEmptyModelResponseError,
+          }),
+          __internalErrorArtifact: true,
+        });
+        this.messages = stripAssistantArtifactsFromMessages(this.turnContextBuilder.removeTransientMessages(this.messages));
+        const contextPersisted = this.persistFailedTurnContext();
+        const partialProgressPreserved = hasRecoverablePartialProgress && contextPersisted;
+
         const errorPayload: TurnErrorPayload = {
           error_code: classified.error_code,
           category: classified.category,
@@ -788,6 +838,8 @@ export class AgentSession {
           retry_stop_reason: retry?.stop_reason ?? 'unknown',
           retry_elapsed_ms: retry?.elapsed_ms ?? 0,
           turn_elapsed_ms: Date.now() - turnStartedAt,
+          context_persisted: contextPersisted,
+          recoverable_partial_progress: hasRecoverablePartialProgress,
           partial_progress_preserved: partialProgressPreserved,
           episode_id: diagnostics.attempt?.episode_id,
           model_call_id: diagnostics.attempt?.call_id,
@@ -795,7 +847,7 @@ export class AgentSession {
           model_attempt_number: diagnostics.attempt?.attempt_number,
         };
 
-        // 只有真正退出本轮并返回 taskOutcome=failed 的路径才写 turn_error。
+        // Only terminal failures produce a turn_error, after persistence state is known.
         Logger.error(
           `[会话 ${this.key}] 处理中断: ${diagnostics.error_summary}`,
           {
@@ -804,36 +856,13 @@ export class AgentSession {
           } as SessionRuntimeLogEvent,
         );
 
-        // This PR observes failures without changing the established user-facing behavior.
-        let errorReply = ERROR_MESSAGE;
-        if (isImageSafetyError) {
-          errorReply = MODEL_IMAGE_SAFETY_MESSAGE;
-        } else if (relayBudgetErrorReply) {
-          errorReply = relayBudgetErrorReply;
-        } else if (isVisionError) {
-          errorReply = '当前模型不支持图片识别。请使用支持多模态的模型（如 Claude 3.5 Sonnet 或 GPT-4V），或者用文字描述图片内容。';
-        } else if (isModelTimeoutError) {
-          errorReply = MODEL_TIMEOUT_MESSAGE;
-        } else if (isEmptyModelResponseError) {
-          errorReply = EMPTY_MODEL_RESPONSE_MESSAGE;
-        } else if (isTransientProviderError) {
-          errorReply = this.formatTransientProviderErrorReply();
-        }
-
-        // 添加错误回复到上下文，保持对话连贯性
-        this.messages.push({
-          role: 'assistant',
-          content: this.formatErrorContextMessage(err, {
-            isModelTimeoutError,
-            isImageSafetyError,
-            isTransientProviderError,
-            isEmptyModelResponseError,
-          }),
-          __internalErrorArtifact: true,
+        const errorReply = this.formatClassifiedErrorReply(baseErrorReply, {
+          retryCount: retry?.retry_count ?? 0,
+          retryObserved: Boolean(retry),
+          retryStopReason: retry?.stop_reason,
+          contextPersisted,
+          hasRecoverablePartialProgress,
         });
-        this.messages = stripAssistantArtifactsFromMessages(this.turnContextBuilder.removeTransientMessages(this.messages));
-        this.lifecycleManager.saveContext(this.messages);
-
         return { text: errorReply, visibleToUser: true, taskOutcome: 'failed' };
       } finally {
         this.planRuntime.clear();
@@ -1177,6 +1206,17 @@ export class AgentSession {
     }
   }
 
+  private recordCompletedTurnEvents(): void {
+    const surface = resolveSessionSurface(this.key, this.sessionType);
+    for (const eventType of ['message_completed', 'task_completed'] as const) {
+      getPetService().recordEvent({
+        event_type: eventType,
+        session_id: this.key,
+        metadata: { surface },
+      });
+    }
+  }
+
   private stopSubAgents(reason: string): void {
     const result = SubAgentManager.getInstance().stopAllForParent(this.key, reason);
     if (result.stopped > 0) {
@@ -1191,14 +1231,60 @@ export class AgentSession {
     if (idx >= 0) this.messages.splice(idx, 1);
   }
 
+  private safeErrorText(error: unknown): string {
+    return safeErrorText(error);
+  }
+
+  private persistFailedTurnContext(): boolean {
+    try {
+      return this.lifecycleManager.saveContext(this.messages);
+    } catch (error) {
+      Logger.error(`[会话 ${this.key}] 失败上下文持久化异常: ${this.safeErrorText(error)}`);
+      return false;
+    }
+  }
+
+  private formatClassifiedErrorReply(
+    baseMessage: string,
+    state: {
+      retryCount: number;
+      retryObserved: boolean;
+      retryStopReason?: string;
+      contextPersisted: boolean;
+      hasRecoverablePartialProgress: boolean;
+    },
+  ): string {
+    const details: string[] = [baseMessage];
+    if (state.retryCount > 0) {
+      details.push(`系统已自动重试 ${state.retryCount} 次，仍未恢复。`);
+    } else if (state.retryObserved) {
+      details.push(state.retryStopReason === 'stream_output_started'
+        ? '因本轮已开始输出，为避免重复内容，系统未自动重试。'
+        : '系统未执行自动重试。');
+    } else {
+      details.push('本次未记录到自动重试。');
+    }
+
+    if (state.hasRecoverablePartialProgress && state.contextPersisted) {
+      details.push('已完成的工具结果和上下文已保存，可直接说“继续”。');
+    } else if (state.hasRecoverablePartialProgress) {
+      details.push('本轮已有部分进度，但持久化失败；当前进程内可继续，重启后可能丢失。');
+    } else if (state.contextPersisted) {
+      details.push('对话上下文已保存，但本轮没有可恢复的部分进度。');
+    } else {
+      details.push('上下文持久化失败，重启后本轮内容可能丢失。');
+    }
+    return details.join('');
+  }
+
   private isAbortError(error: any): boolean {
-    return error?.name === 'AbortError'
-      || error?.code === 'ERR_CANCELED'
-      || /请求已取消|aborted|aborterror|canceled|cancelled/i.test(String(error?.message || ''));
+    return safeErrorProperty(error, 'name') === 'AbortError'
+      || safeErrorProperty(error, 'code') === 'ERR_CANCELED'
+      || /请求已取消|aborted|aborterror|canceled|cancelled/i.test(safeErrorText(error));
   }
 
   private getPartialMessagesFromError(error: AgentTurnRunError): Message[] | null {
-    const partialMessages = error?.partialMessages;
+    const partialMessages = safeErrorProperty(error, 'partialMessages');
     if (!Array.isArray(partialMessages) || partialMessages.length === 0) {
       return null;
     }
@@ -1215,14 +1301,27 @@ export class AgentSession {
     }
     if (rootIndex < 0) return false;
     const episodeId = messages[rootIndex].__episodeId;
-    return messages.slice(rootIndex + 1).some(message =>
-      (!episodeId || message.__episodeId === episodeId)
-      && (message.role === 'tool' || message.role === 'assistant')
+    const episodeMessages = messages.slice(rootIndex + 1).filter(message =>
+      !episodeId || message.__episodeId === episodeId
     );
+    const issuedToolCallIds = new Set(
+      episodeMessages
+        .filter(message => message.role === 'assistant')
+        .flatMap(message => message.tool_calls ?? [])
+        .map(toolCall => String(toolCall.id || '').trim())
+        .filter(Boolean),
+    );
+    return episodeMessages.some(message => {
+      const toolCallId = String(message.tool_call_id || '').trim();
+      return message.role === 'tool'
+        && message.__toolExecutionSucceeded === true
+        && Boolean(toolCallId)
+        && issuedToolCallIds.has(toolCallId);
+    });
   }
 
   private isModelTimeoutError(error: any): boolean {
-    const text = String(error?.message || error || '');
+    const text = safeErrorText(error);
     return /API错误\s*\(504\)|request_timed_out|request timed out|default_request_timeout_in_seconds|upstream request timeout|gateway timeout/i.test(text);
   }
 
@@ -1232,20 +1331,22 @@ export class AgentSession {
       return true;
     }
 
-    const text = String(error?.message || error || '');
+    const text = safeErrorText(error);
     return /unknown error,\s*520|overloaded_error|service unavailable|bad gateway|gateway timeout|upstream (?:error|timeout)|MaxRetriesExceededError|Connection error|ECONNRESET|ETIMEDOUT|EAI_AGAIN|fetch failed|socket hang up|network error|premature close/i.test(text);
   }
 
   private isEmptyModelResponseError(error: any): boolean {
-    const code = String(error?.code || error?.cause?.code || '').toUpperCase();
+    const rawCode = safeErrorProperty(error, 'code')
+      || safeErrorProperty(safeErrorProperty(error, 'cause'), 'code');
+    const code = typeof rawCode === 'string' ? rawCode.toUpperCase() : '';
     if (code === 'EMPTY_MODEL_RESPONSE') {
       return true;
     }
-    return /模型未返回有效内容|模型返回了空响应/i.test(String(error?.message || error || ''));
+    return /模型未返回有效内容|模型返回了空响应/i.test(safeErrorText(error));
   }
 
   private formatRelayBudgetErrorReply(error: any): string | null {
-    const text = String(error?.message || error || '');
+    const text = safeErrorText(error);
     const status = this.extractErrorStatus(error);
     const isBudgetError =
       status === 402
@@ -1271,10 +1372,12 @@ export class AgentSession {
   }
 
   private extractErrorStatus(error: any): number | null {
-    const status = error?.status || error?.response?.status || error?.error?.status;
+    const status = safeErrorProperty(error, 'status')
+      || safeErrorProperty(safeErrorProperty(error, 'response'), 'status')
+      || safeErrorProperty(safeErrorProperty(error, 'error'), 'status');
     if (typeof status === 'number') return status;
 
-    const text = String(error?.message || error || '');
+    const text = safeErrorText(error);
     const match = text.match(/(?:API错误|HTTP|status(?:\s*code)?)\s*[\(:= ]\s*(\d{3})\b/i);
     if (!match) return null;
     const parsed = Number(match[1]);
@@ -1300,7 +1403,7 @@ export class AgentSession {
   private formatTransientProviderErrorReply(): string {
     const model = this.currentModelName();
     return model
-      ? `当前模型 ${model} 的服务临时异常，刚才这次请求没有完成。我已经保留上下文；你可以稍后重试，或临时切换到其他模型继续。`
+      ? `当前模型 ${model} 的服务临时异常，刚才这次请求没有完成。你可以稍后重试，或临时切换到其他模型继续。`
       : MODEL_TRANSIENT_ERROR_MESSAGE;
   }
 
@@ -1313,18 +1416,18 @@ export class AgentSession {
       isEmptyModelResponseError?: boolean;
     },
   ): string {
-    const detail = this.sanitizeErrorMessage(error?.message || String(error));
+    const detail = this.sanitizeErrorMessage(safeErrorText(error));
     if (flags.isModelTimeoutError) {
-      return `[处理中断: 模型中转请求超时。已保留本轮已完成的工具结果和上下文；如果用户要求继续，请基于当前上下文继续，避免重复已经完成的工具步骤。错误摘要: ${detail}]`;
+      return `[处理中断: 模型中转请求超时。失败处理将尝试持久化本轮上下文，是否成功以持久化结果为准。错误摘要: ${detail}]`;
     }
     if (flags.isImageSafetyError) {
-      return `[处理中断: 上游模型拒绝了当前对话中的图片。已保留本轮已完成的上下文；如果用户要求继续，请提示用户删除或更换相关图片，或新开对话后继续。错误摘要: ${detail}]`;
+      return `[处理中断: 上游模型拒绝了当前对话中的图片。请提示用户删除或更换相关图片，或新开对话后继续。错误摘要: ${detail}]`;
     }
     if (flags.isTransientProviderError) {
-      return `[处理中断: 模型服务临时异常或上游网关错误。已保留本轮上下文；如果用户要求继续，请从当前状态继续，不要重复已经完成的工具步骤。错误摘要: ${detail}]`;
+      return `[处理中断: 模型服务临时异常或上游网关错误。失败处理将尝试持久化本轮上下文，是否成功以持久化结果为准。错误摘要: ${detail}]`;
     }
     if (flags.isEmptyModelResponseError) {
-      return `[处理中断: 模型未返回正文或工具调用，自动重试后仍未恢复。已保留本轮上下文；如果用户重试，请正常处理上一条请求。错误摘要: ${detail}]`;
+      return `[处理中断: 模型未返回正文或工具调用。失败处理将尝试持久化本轮上下文，是否成功以持久化结果为准。错误摘要: ${detail}]`;
     }
     return `[处理失败: ${detail}]`;
   }
