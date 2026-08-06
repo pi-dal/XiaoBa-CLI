@@ -41,6 +41,7 @@ import { createEvidenceReviewJob } from './evidence-review-graph';
 import {
   loadEvidenceReviewJobStore,
   mutateEvidenceReviewJobStore,
+  reconcileEvidenceReviewJobStore,
   upsertEvidenceReviewJob,
   evidenceReviewJobStorePathForReviewQueue,
 } from './evidence-review-job-store';
@@ -53,6 +54,7 @@ import {
   reclaimExpiredLeases,
   createReviewQuantum,
   deriveJobDisposition,
+  convergeStrandedJob,
   listRunnableQuanta,
   stableStringify,
 } from './evidence-review-graph-core';
@@ -295,6 +297,71 @@ export class EvidenceReviewEngine {
     return mutateEvidenceReviewJobStore(this.options.jobStorePath, mutation);
   }
 
+  /**
+   * Repair legacy active Jobs that have no current or future progress path.
+   * The store helper preserves the original bytes before the first repair.
+   */
+  reconcileStrandedJobs(now: Date = this.options.now?.() ?? new Date()) {
+    return reconcileEvidenceReviewJobStore(this.options.jobStorePath, job => {
+      const reclaimed = reclaimExpiredLeases(job, now);
+      const converged = convergeStrandedJob(job, now);
+      if (converged) this.restoreSucceededCommitOutcome(job, now);
+      // Reclaiming an expired lease makes the Job runnable again. It must be
+      // persisted even though the graph is no longer stranded after reclaim.
+      return reclaimed.length > 0 || converged;
+    });
+  }
+
+  /** Restore engine-owned terminal metadata from an authoritative commit result. */
+  private restoreSucceededCommitOutcome(job: EvidenceReviewJob, now: Date): void {
+    if (job.disposition !== 'completed') return;
+    const commit = Object.values(job.quanta).find(
+      quantum => quantum.kind === 'commit' && quantum.state === 'succeeded',
+    );
+    if (!commit) return;
+
+    const result = commit.result && typeof commit.result === 'object'
+      ? commit.result as Partial<SkillEvolutionResult>
+      : undefined;
+    const resultTransitionId = typeof result?.transitionId === 'string'
+      ? result.transitionId
+      : typeof result?.audit?.transitionId === 'string'
+        ? result.audit.transitionId
+        : undefined;
+    const transitionId = resultTransitionId ?? commit.commitReceipt?.transitionId;
+    if (transitionId) job.transitionId = transitionId;
+
+    const nowIso = now.toISOString();
+    job.terminalReason = undefined;
+    job.nextDueAt = undefined;
+    job.updatedAt = nowIso;
+
+    const hasPersistedOutcome = typeof result?.transition === 'string'
+      || typeof result?.queued === 'string';
+    const semanticDefer = hasPersistedOutcome
+      ? result?.transition === 'defer' || result?.queued === 'deferred'
+      : job.deferState !== undefined;
+    if (!semanticDefer) {
+      job.deferState = undefined;
+      return;
+    }
+
+    const priorDeferState = job.deferState;
+    job.disposition = 'deferred';
+    job.workClass = 'semantic_reassessment';
+    job.deferState = {
+      reviewerVersion: priorDeferState?.reviewerVersion
+        ?? result?.audit?.reviewerVersion
+        ?? this.options.reviewerVersion
+        ?? job.basis.reviewPolicyVersion,
+      reason: result?.verifier?.rationale
+        ?? priorDeferState?.reason
+        ?? job.verifierResult?.rationale
+        ?? 'Verifier deferred for later review.',
+      deferredAt: priorDeferState?.deferredAt ?? commit.updatedAt ?? nowIso,
+    };
+  }
+
   /** Test/bootstrap replacement only; production read-modify-write must use mutateStore. */
   saveStore(state: ReturnType<typeof loadEvidenceReviewJobStore>): void {
     this.mutateStore(live => {
@@ -416,6 +483,12 @@ export class EvidenceReviewEngine {
         ));
         if (runnable.length === 0) {
           job.disposition = deriveJobDisposition(job);
+          // Only converge from the unfiltered graph. A caller may deliberately
+          // restrict allowedKinds/quantumId while other work remains runnable.
+          if (job.disposition !== 'completed' && listRunnableQuanta(job, now).length === 0) {
+            convergeStrandedJob(job, now);
+          }
+          this.restoreSucceededCommitOutcome(job, now);
           job.updatedAt = now.toISOString();
           upsertEvidenceReviewJob(state, job);
           return { job, selected: undefined, claim: undefined, remainingRunnable: 0 };
@@ -1612,6 +1685,10 @@ export async function advanceJobsFairly(
   const attemptedJobIds = new Set<string>();
   const maxClaims = Math.max(0, Math.floor(options.maxClaims));
   const maxClaimsPerJob = Math.max(1, Math.floor(options.maxClaimsPerJob ?? 1));
+
+  // Repair legacy active-but-unrunnable Jobs before planning. This is a locked,
+  // idempotent migration and preserves the original store on first change.
+  engine.reconcileStrandedJobs(options.now);
 
   for (let attempt = 0; attempt < maxClaims; attempt++) {
     if (options.signal?.aborted || options.shouldStopClaiming?.()) break;

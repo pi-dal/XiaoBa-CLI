@@ -41,7 +41,7 @@ import { readShardStructurally } from '../src/utils/evidence-review-engine';
 import {
   saveEvidenceReviewJobStore,
 } from '../src/utils/evidence-review-job-store';
-import { recoverJobAfterRestart } from '../src/utils/evidence-review-graph-core';
+import { listRunnableQuanta, recoverJobAfterRestart } from '../src/utils/evidence-review-graph-core';
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -368,6 +368,280 @@ describe('Evidence Review revision loop (durable graph)', () => {
       assert.equal(failed.quanta[reader.quantumId]?.attempts, 1);
       assert.equal(failed.disposition, 'terminal_failed');
       assert.equal(failed.nextDueAt, undefined);
+    } finally {
+      dir.cleanup();
+    }
+  });
+
+  test('reconciles a legacy active stranded Job once and preserves the original store', async () => {
+    const dir = setupEngineDir();
+    const now = new Date('2026-08-06T00:00:00.000Z');
+    try {
+      const engine = new EvidenceReviewEngine({
+        jobStorePath: dir.jobStorePath,
+        workingDirectory: dir.root,
+        now: () => now,
+      });
+      const job = engine.createJob({
+        bundle: fixtureBundle(`legacy-stranded-${crypto.randomUUID().slice(0, 8)}`),
+        candidate: fixtureCandidate(),
+        workClass: 'operational_recovery',
+      });
+      const state = engine.loadStore();
+      const legacy = state.jobs[job.jobId]!;
+      const roots = Object.values(legacy.quanta)
+        .filter(quantum => quantum.dependencyQuantumIds.length === 0);
+      assert.ok(roots.length >= 2);
+      for (const quantum of roots) {
+        quantum.state = 'succeeded';
+        quantum.updatedAt = new Date(now.getTime() - 1_000).toISOString();
+      }
+      roots[0]!.state = 'terminal_failed';
+      roots[0]!.attempts = 5;
+      roots[0]!.failureKind = 'invalid_completion_schema';
+      roots[0]!.failureReason = 'schema-validation-error';
+      roots[0]!.failureMessage = 'invalid_completion_schema: reader returned empty completion';
+      for (const quantum of Object.values(legacy.quanta)) {
+        if (quantum.state !== 'pending') continue;
+        (quantum as { dependencyQuantumIds: readonly string[] }).dependencyQuantumIds = [roots[0]!.quantumId];
+      }
+      legacy.disposition = 'active';
+      legacy.nextDueAt = undefined;
+      engine.saveStore(state);
+
+      const advanced = await advanceJobsFairly(engine, 'wake:legacy-reconcile', {
+        maxClaims: 1,
+        maxClaimsPerJob: 1,
+        now,
+      });
+      const backupPath = `${dir.jobStorePath}.before-stranded-job-reconcile-v1`;
+      const repaired = engine.loadStore().jobs[job.jobId]!;
+      const original = JSON.parse(fs.readFileSync(backupPath, 'utf8')) as {
+        jobs: Record<string, EvidenceReviewJob>;
+      };
+
+      assert.equal(advanced.claims, 0);
+      assert.deepEqual(advanced.jobIds, []);
+      assert.equal(repaired.disposition, 'terminal_failed');
+      assert.equal(repaired.nextDueAt, undefined);
+      assert.match(repaired.terminalReason ?? '', /review_job_stranded/);
+      assert.match(repaired.terminalReason ?? '', /reader returned empty completion/);
+      assert.equal(original.jobs[job.jobId]?.disposition, 'active');
+
+      const backupBefore = fs.readFileSync(backupPath);
+      const second = engine.reconcileStrandedJobs(new Date(now.getTime() + 1_000));
+      assert.deepEqual(second.repairedJobIds, []);
+      assert.deepEqual(fs.readFileSync(backupPath), backupBefore);
+    } finally {
+      dir.cleanup();
+    }
+  });
+
+  test('restores a legacy active Job with a succeeded commit as completed', () => {
+    const dir = setupEngineDir();
+    const now = new Date('2026-08-06T00:00:00.000Z');
+    try {
+      const engine = new EvidenceReviewEngine({
+        jobStorePath: dir.jobStorePath,
+        workingDirectory: dir.root,
+        now: () => now,
+      });
+      const job = engine.createJob({
+        bundle: fixtureBundle(`legacy-committed-${crypto.randomUUID().slice(0, 8)}`),
+        candidate: fixtureCandidate(),
+        workClass: 'operational_recovery',
+      });
+      const state = engine.loadStore();
+      const legacy = state.jobs[job.jobId]!;
+      for (const quantum of Object.values(legacy.quanta)) {
+        quantum.state = 'succeeded';
+        quantum.lease = undefined;
+        quantum.nextRetryAt = undefined;
+        quantum.updatedAt = now.toISOString();
+      }
+      const commit = Object.values(legacy.quanta).find(quantum => quantum.kind === 'commit')!;
+      commit.result = { transition: 'reject_candidate', verified: false, rounds: 1 };
+      legacy.disposition = 'active';
+      legacy.nextDueAt = undefined;
+      engine.saveStore(state);
+
+      const result = engine.reconcileStrandedJobs(now);
+      const repaired = engine.loadStore().jobs[job.jobId]!;
+
+      assert.deepEqual(result.repairedJobIds, [job.jobId]);
+      assert.equal(repaired.disposition, 'completed');
+      assert.equal(repaired.terminalReason, undefined);
+      assert.equal(repaired.nextDueAt, undefined);
+    } finally {
+      dir.cleanup();
+    }
+  });
+
+  test('restores semantic defer metadata from a legacy succeeded commit', () => {
+    const dir = setupEngineDir();
+    const now = new Date('2026-08-06T00:00:00.000Z');
+    try {
+      const engine = new EvidenceReviewEngine({
+        jobStorePath: dir.jobStorePath,
+        workingDirectory: dir.root,
+        now: () => now,
+        reviewerVersion: 'reviewer-legacy-recovery',
+      });
+      const job = engine.createJob({
+        bundle: fixtureBundle(`legacy-deferred-${crypto.randomUUID().slice(0, 8)}`),
+        candidate: fixtureCandidate(),
+        workClass: 'live_learning',
+      });
+      const state = engine.loadStore();
+      const legacy = state.jobs[job.jobId]!;
+      for (const quantum of Object.values(legacy.quanta)) {
+        quantum.state = 'succeeded';
+        quantum.lease = undefined;
+        quantum.nextRetryAt = undefined;
+        quantum.updatedAt = now.toISOString();
+      }
+      const commit = Object.values(legacy.quanta).find(quantum => quantum.kind === 'commit')!;
+      const deferredResult: SkillEvolutionResult = {
+        transition: 'defer',
+        queued: 'operational',
+        transitionId: 'transition:legacy-defer',
+        verified: false,
+        rounds: 1,
+        verifier: {
+          decision: 'defer',
+          issues: [],
+          rationale: 'Await corroborating evidence before re-review.',
+        },
+      };
+      commit.result = deferredResult;
+      legacy.disposition = 'active';
+      legacy.terminalReason = 'stale terminal state';
+      legacy.nextDueAt = new Date(now.getTime() + 60_000).toISOString();
+      engine.saveStore(state);
+
+      const result = engine.reconcileStrandedJobs(now);
+      const repaired = engine.loadStore().jobs[job.jobId]!;
+
+      assert.deepEqual(result.repairedJobIds, [job.jobId]);
+      assert.equal(repaired.disposition, 'deferred');
+      assert.equal(repaired.workClass, 'semantic_reassessment');
+      assert.deepEqual(repaired.deferState, {
+        reviewerVersion: 'reviewer-legacy-recovery',
+        reason: 'Await corroborating evidence before re-review.',
+        deferredAt: now.toISOString(),
+      });
+      assert.equal(repaired.transitionId, 'transition:legacy-defer');
+      assert.equal(repaired.terminalReason, undefined);
+      assert.equal(repaired.nextDueAt, undefined);
+    } finally {
+      dir.cleanup();
+    }
+  });
+
+  test('persists expired lease reclamation before fair scheduling', () => {
+    const dir = setupEngineDir();
+    const now = new Date('2026-08-06T00:00:00.000Z');
+    try {
+      const engine = new EvidenceReviewEngine({
+        jobStorePath: dir.jobStorePath,
+        workingDirectory: dir.root,
+        now: () => now,
+      });
+      const job = engine.createJob({
+        bundle: fixtureBundle(`legacy-expired-lease-${crypto.randomUUID().slice(0, 8)}`),
+        candidate: fixtureCandidate(),
+        workClass: 'operational_recovery',
+      });
+      const state = engine.loadStore();
+      const legacy = state.jobs[job.jobId]!;
+      const roots = Object.values(legacy.quanta)
+        .filter(quantum => quantum.dependencyQuantumIds.length === 0);
+      assert.ok(roots.length >= 2);
+      for (const quantum of roots) {
+        quantum.state = 'succeeded';
+        quantum.lease = undefined;
+        quantum.updatedAt = now.toISOString();
+      }
+      const expired = roots[0]!;
+      expired.state = 'leased';
+      expired.lease = {
+        leaseId: 'lease:expired',
+        ownerWakeId: 'wake:old',
+        leasedAt: new Date(now.getTime() - 120_000).toISOString(),
+        expiresAt: new Date(now.getTime() - 60_000).toISOString(),
+      };
+      legacy.disposition = 'active';
+      legacy.nextDueAt = expired.lease.expiresAt;
+      engine.saveStore(state);
+
+      const result = engine.reconcileStrandedJobs(now);
+      const repaired = engine.loadStore().jobs[job.jobId]!;
+      const reclaimed = repaired.quanta[expired.quantumId]!;
+
+      assert.deepEqual(result.repairedJobIds, [job.jobId]);
+      assert.equal(reclaimed.state, 'pending');
+      assert.equal(reclaimed.lease, undefined);
+      assert.equal(repaired.nextDueAt, undefined);
+      assert.ok(listRunnableQuanta(repaired, now).some(quantum => quantum.quantumId === expired.quantumId));
+      assert.equal(fs.existsSync(`${dir.jobStorePath}.before-stranded-job-reconcile-v1`), true);
+    } finally {
+      dir.cleanup();
+    }
+  });
+
+  test('does not converge active Jobs that still have a future retry or valid lease', () => {
+    const dir = setupEngineDir();
+    const now = new Date('2026-08-06T00:00:00.000Z');
+    try {
+      const engine = new EvidenceReviewEngine({
+        jobStorePath: dir.jobStorePath,
+        workingDirectory: dir.root,
+        now: () => now,
+      });
+      const makeWaitingJob = (suffix: string) => engine.createJob({
+        bundle: fixtureBundle(`not-stranded-${suffix}-${crypto.randomUUID().slice(0, 8)}`),
+        candidate: fixtureCandidate(),
+        workClass: 'operational_recovery',
+      });
+      const retryJob = makeWaitingJob('retry');
+      const leasedJob = makeWaitingJob('lease');
+      const state = engine.loadStore();
+
+      for (const [jobId, mode] of [[retryJob.jobId, 'retry'], [leasedJob.jobId, 'lease']] as const) {
+        const live = state.jobs[jobId]!;
+        const roots = Object.values(live.quanta)
+          .filter(quantum => quantum.dependencyQuantumIds.length === 0);
+        for (const quantum of roots) {
+          quantum.state = 'succeeded';
+          quantum.updatedAt = now.toISOString();
+        }
+        const waiting = roots[0]!;
+        if (mode === 'retry') {
+          waiting.state = 'retry_wait';
+          waiting.nextRetryAt = new Date(now.getTime() + 60_000).toISOString();
+        } else {
+          waiting.state = 'leased';
+          waiting.lease = {
+            leaseId: 'lease:test',
+            ownerWakeId: 'wake:test',
+            leasedAt: now.toISOString(),
+            expiresAt: new Date(now.getTime() + 60_000).toISOString(),
+          };
+        }
+        for (const quantum of Object.values(live.quanta)) {
+          if (quantum.state !== 'pending') continue;
+          (quantum as { dependencyQuantumIds: readonly string[] }).dependencyQuantumIds = [waiting.quantumId];
+        }
+        live.disposition = 'active';
+      }
+      engine.saveStore(state);
+
+      const result = engine.reconcileStrandedJobs(now);
+      const after = engine.loadStore();
+      assert.deepEqual(result.repairedJobIds, []);
+      assert.equal(after.jobs[retryJob.jobId]?.disposition, 'active');
+      assert.equal(after.jobs[leasedJob.jobId]?.disposition, 'active');
+      assert.equal(fs.existsSync(`${dir.jobStorePath}.before-stranded-job-reconcile-v1`), false);
     } finally {
       dir.cleanup();
     }
