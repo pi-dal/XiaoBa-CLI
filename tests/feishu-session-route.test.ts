@@ -217,6 +217,35 @@ describe('Feishu SessionRoute V2', () => {
     }
   });
 
+
+  test('delivers classified failed replies without relying on the legacy fallback text', async () => {
+    const bot = createHarness({
+      message: {
+        messageId: 'msg-error',
+        chatId: 'shared',
+        chatType: 'p2p',
+        senderId: 'shared',
+        text: '继续',
+        mentionBot: false,
+        msgType: 'text',
+      },
+    });
+    bot.sessionResult = {
+      visibleToUser: true,
+      text: '模型服务暂时不可用，请稍后再试。',
+      taskOutcome: 'failed',
+    };
+
+    try {
+      await (bot as any).onMessage({});
+
+      assert.deepEqual(bot.replies, [
+        { chatId: 'shared', text: '模型服务暂时不可用，请稍后再试。' },
+      ]);
+    } finally {
+      SubAgentManager.getInstance().unregisterPlatformCallbacks('session:v2:feishu:p2p:shared');
+    }
+  });
 });
 
 function createHarness(options: {
@@ -232,6 +261,8 @@ function createHarness(options: {
   bot.sessionBusy = options.busy ?? false;
   bot.createdSessions = [] as string[];
   bot.handledTurns = [] as any[];
+  bot.replies = [] as Array<{ chatId: string; text: string }>;
+  bot.sessionResult = { visibleToUser: false, text: '' };
   bot.processedMsgIds = new Set();
   bot.pendingAttachments = new Map();
   bot.messageQueue = new Map();
@@ -245,7 +276,7 @@ function createHarness(options: {
     handleCommand: async () => ({ handled: false }),
     handleMessage: async (userText: string, handleOptions: any) => {
       bot.handledTurns.push({ userText, options: handleOptions });
-      return options.results?.shift() ?? options.result ?? { visibleToUser: false, text: '' };
+      return options.results?.shift() ?? options.result ?? bot.sessionResult;
     },
     handleRuntimeObservation: async (userText: string, handleOptions: any) => {
       bot.handledTurns.push({ userText, options: handleOptions });
@@ -259,7 +290,10 @@ function createHarness(options: {
     },
   };
   bot.sender = {
-    reply: async (_chatId: string, text: string) => { options.sentTexts?.push(text); },
+    reply: async (chatId: string, text: string) => {
+      options.sentTexts?.push(text);
+      bot.replies.push({ chatId, text });
+    },
     downloadFile: async () => null,
     fetchMergeForwardTexts: async () => '',
     sendFile: async () => undefined,

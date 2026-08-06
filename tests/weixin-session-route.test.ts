@@ -245,6 +245,46 @@ describe('Weixin SessionRoute V2', () => {
     }
   });
 
+
+  test('delivers classified failed replies without relying on the legacy fallback text', async () => {
+    const sentTexts: Array<{ userId: string; text: string; contextToken?: string; fromUserId?: string }> = [];
+    const bot = createHarness({
+      sentTexts,
+      parsed: {
+        message_id: 'wx-msg-error',
+        from: { id: 'shared' },
+        chat: { id: 'wx-bot' },
+        text: '继续',
+        context_token: 'ctx-token',
+      },
+    });
+    bot.sessionResult = {
+      visibleToUser: true,
+      text: '模型响应超时，本轮上下文已保留，请稍后继续。',
+      taskOutcome: 'failed',
+    };
+
+    try {
+      await (bot as any).handleMessage({
+        message_type: 0,
+        message_id: 'wx-msg-error',
+        from_user_id: 'shared',
+        to_user_id: 'wx-bot',
+        context_token: 'ctx-token',
+      });
+
+      assert.deepEqual(sentTexts, [
+        {
+          userId: 'shared',
+          text: '模型响应超时，本轮上下文已保留，请稍后继续。',
+          contextToken: 'ctx-token',
+          fromUserId: 'wx-bot',
+        },
+      ]);
+    } finally {
+      SubAgentManager.getInstance().unregisterPlatformCallbacks('session:v2:weixin:p2p:shared');
+    }
+  });
 });
 
 function createHarness(options: {
@@ -260,6 +300,7 @@ function createHarness(options: {
   bot.sessionBusy = options.busy ?? false;
   bot.createdSessions = [] as string[];
   bot.handledTurns = [] as any[];
+  bot.sessionResult = { visibleToUser: false, text: '' };
   bot.contextTokens = new Map();
   bot.messageQueue = new Map();
   bot.saveState = async () => undefined;
@@ -272,7 +313,7 @@ function createHarness(options: {
     isBusy: () => bot.sessionBusy,
     handleMessage: async (userText: string, handleOptions: any) => {
       bot.handledTurns.push({ userText, options: handleOptions });
-      return options.results?.shift() ?? options.result ?? { visibleToUser: false, text: '' };
+      return options.results?.shift() ?? options.result ?? bot.sessionResult;
     },
     handleRuntimeObservation: async (userText: string, handleOptions: any) => {
       bot.handledTurns.push({ userText, options: handleOptions });
