@@ -695,7 +695,7 @@ describe('AgentSession lifecycle', () => {
   });
 
   test('handleMessage preserves completed tool context when model relay times out', async () => {
-    const { AgentSession, SessionStore, MODEL_TIMEOUT_MESSAGE } = loadSessionModules();
+    const { AgentSession, SessionStore } = loadSessionModules();
     let aiCalls = 0;
     const toolCall = {
       id: 'call_read',
@@ -748,9 +748,7 @@ describe('AgentSession lifecycle', () => {
 
     const result = await session.handleMessage('read notes then continue');
 
-    assert.match(result.text, new RegExp(`^${MODEL_TIMEOUT_MESSAGE}`));
-    assert.match(result.text, /本次未记录到自动重试/);
-    assert.match(result.text, /已完成的工具结果和上下文已保存/);
+    assert.equal(result.text, '模型服务暂时不稳定，本次处理未能完成，请稍后继续。');
     assert.equal(aiCalls, 2);
 
     const retainedMessages = (session as any).messages as any[];
@@ -800,7 +798,7 @@ describe('AgentSession lifecycle', () => {
 
     const result = await session.handleMessage('continue');
 
-    assert.equal(result.text, '当前模型暂时无法继续调用，请切换模型或联系管理员。');
+    assert.equal(result.text, '模型服务暂时不稳定，本次处理未能完成，请稍后继续。');
     assert.doesNotMatch(result.text, /model budget exceeded|API错误/i);
   });
 
@@ -817,7 +815,7 @@ describe('AgentSession lifecycle', () => {
 
     const result = await session.handleMessage('continue');
 
-    assert.equal(result.text, '当前模型暂时无法继续调用，请切换模型或联系管理员。');
+    assert.equal(result.text, '模型服务暂时不稳定，本次处理未能完成，请稍后继续。');
   });
 
   test('handleMessage does not treat unrelated 402 text as relay budget exhaustion', async () => {
@@ -833,11 +831,7 @@ describe('AgentSession lifecycle', () => {
 
     const result = await session.handleMessage('continue');
 
-    assert.equal([
-      '模型拒绝了本轮请求格式。原样重试通常无法解决，请重新发送或切换模型。',
-      '模型未能处理本次请求，请重新发送；持续失败时请联系管理员。',
-    ].includes(result.text), true);
-    assert.doesNotMatch(result.text, /额度不足|补充额度|402 tokens|schema is invalid/);
+    assert.equal(result.text, '模型服务暂时不稳定，本次处理未能完成，请稍后继续。');
   });
 
   test('handleMessage surfaces transient provider failures without leaking raw upstream payload', async () => {
@@ -856,7 +850,7 @@ describe('AgentSession lifecycle', () => {
 
     const result = await session.handleMessage('continue');
 
-    assert.equal(result.text, '模型服务暂时不可用，请稍后再试。');
+    assert.equal(result.text, '模型服务暂时不稳定，本次处理未能完成，请稍后继续。');
     assert.doesNotMatch(result.text, /unknown error|request_id|API错误|520/);
   });
 
@@ -873,7 +867,7 @@ describe('AgentSession lifecycle', () => {
 
     const result = await session.handleMessage('继续');
 
-    assert.equal(result.text, '当前请求较多，请稍等片刻再试。');
+    assert.equal(result.text, '模型服务暂时不稳定，本次处理未能完成，请稍后继续。');
     assert.doesNotMatch(result.text, /429|状态码|错误编号/);
   });
 
@@ -899,12 +893,12 @@ describe('AgentSession lifecycle', () => {
 
     const result = await session.handleMessage('继续');
 
-    assert.equal(result.text, '模型服务暂时不可用，系统已自动重试，但仍未恢复，请稍后再试。');
+    assert.equal(result.text, '模型服务暂时不稳定，系统已尝试自动恢复但仍未成功，请稍后继续。');
     assert.doesNotMatch(result.text, /503|状态码|错误编号/);
   });
 
   test('handleMessage tells the user how to recover after empty model responses are exhausted', async () => {
-    const { AgentSession, EMPTY_MODEL_RESPONSE_MESSAGE } = loadSessionModules();
+    const { AgentSession } = loadSessionModules();
     const session = new AgentSession('catscompany:lifecycle-empty-model-response', buildMockServices({
       aiService: {
         async chatStream() {
@@ -919,10 +913,7 @@ describe('AgentSession lifecycle', () => {
 
     const result = await session.handleMessage('继续上一条');
 
-    assert.match(result.text, new RegExp(`^${EMPTY_MODEL_RESPONSE_MESSAGE}`));
-    assert.match(result.text, /本次未记录到自动重试/);
-    assert.match(result.text, /重新发送上一条消息/);
-    assert.match(result.text, /切换模型或稍后再试/);
+    assert.equal(result.text, '模型服务暂时不稳定，本次处理未能完成，请稍后继续。');
     assert.doesNotMatch(result.text, /EMPTY_MODEL_RESPONSE|请求失败/);
   });
 
@@ -942,7 +933,7 @@ describe('AgentSession lifecycle', () => {
 
     const result = await session.handleMessage('继续');
 
-    assert.equal(result.text, '模型服务暂时不可用，请稍后再试。');
+    assert.equal(result.text, '模型服务暂时不稳定，本次处理未能完成，请稍后继续。');
     assert.doesNotMatch(result.text, /API错误|状态码|503/);
   });
 
@@ -985,10 +976,7 @@ describe('AgentSession lifecycle', () => {
     const result = await session.handleMessage('继续');
 
     assert.equal(result.taskOutcome, 'failed');
-    const usesDetailedFailure = /上游模型拒绝了本轮请求/.test(result.text)
-      && /已自动重试 2 次/.test(result.text);
-    const usesSanitizedFailure = result.text === '模型未能处理本次请求，请稍后再试。';
-    assert.equal(usesDetailedFailure || usesSanitizedFailure, true);
+    assert.equal(result.text, '模型服务暂时不稳定，系统已尝试自动恢复但仍未成功，请稍后继续。');
     const logPath = (session as any).sessionTurnLogger.getLogFilePath();
     const entries = fs.readFileSync(logPath, 'utf8')
       .split(/\r?\n/)

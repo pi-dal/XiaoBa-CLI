@@ -136,6 +136,7 @@ import {
   buildEpisodeEvidenceBundle,
   buildEpisodeSettlementEvidence,
   MissingLearningEpisodeSourceEvidenceError,
+  type EvidenceBundleSkillCatalogSnapshot,
 } from './episode-evidence-bundle';
 import {
   ExternalEpisodeProvenanceStore,
@@ -173,6 +174,10 @@ export type RuntimeLearningReason =
    * wake slice reached quota / page boundary while durable continuation remains.
    */
   | 'external-continuation';
+
+function yieldRuntimeTurn(): Promise<void> {
+  return new Promise(resolve => setImmediate(resolve));
+}
 
 export type RuntimeLearningStageStatus = 'succeeded' | 'failed' | 'skipped';
 
@@ -2601,6 +2606,23 @@ export class RuntimeLearning {
     dueWork: DueWork,
     wakeSignal?: AbortSignal,
   ): Promise<RuntimeLearningReviewReport> {
+    const createSkillCatalogSnapshot = (): EvidenceBundleSkillCatalogSnapshot => {
+      const registry = this.skillEvolution.getRegistry();
+      return {
+        registry,
+        referencedSkillSnapshots: this.skillEvolution.getReferencedSkillSnapshots(registry),
+      };
+    };
+    let reconciliationSkillCatalog: EvidenceBundleSkillCatalogSnapshot | undefined;
+    const getReconciliationSkillCatalog = (): EvidenceBundleSkillCatalogSnapshot => {
+      reconciliationSkillCatalog ??= createSkillCatalogSnapshot();
+      return reconciliationSkillCatalog;
+    };
+    let deferredSkillCatalog: EvidenceBundleSkillCatalogSnapshot | undefined;
+    const getDeferredSkillCatalog = (): EvidenceBundleSkillCatalogSnapshot => {
+      deferredSkillCatalog ??= createSkillCatalogSnapshot();
+      return deferredSkillCatalog;
+    };
     // Reconcile before the due-work gate. The planner intentionally schedules
     // only operational recovery retries, while a legacy stranded Job can be
     // any work class and has no runnable Quantum to make itself due.
@@ -2624,7 +2646,7 @@ export class RuntimeLearning {
     // carries the old contradiction — before fair advance so only clean
     // successors can advance.
     try {
-      this.reconcileSettlementConsistency();
+      await this.reconcileSettlementConsistency(getReconciliationSkillCatalog, wakeSignal);
     } catch (error) {
       Logger.warning(
         `[RuntimeLearning] settlement reconciliation skipped: ${toErrorMessage(error)}`,
@@ -2636,8 +2658,14 @@ export class RuntimeLearning {
     // checked in the same single-owner reactivation pass.
     const deferredBundleIds = new Set(this.skillEvolution.getDeferredReviewBundleIds());
     const liveDeferredBundles: EvidenceBundle[] = [];
+    let deferredBundleIndex = 0;
     for (const episode of Object.values(this.episodeStore.load().episodes)) {
+      if (wakeSignal?.aborted || this.shutdownDrainRequested) break;
       if (!deferredBundleIds.has(`v3:learning-episode:${episode.episodeId}`)) continue;
+      if (deferredBundleIndex++ > 0) {
+        await yieldRuntimeTurn();
+        if (wakeSignal?.aborted || this.shutdownDrainRequested) break;
+      }
       try {
         liveDeferredBundles.push(buildEpisodeEvidenceBundle(
           episode,
@@ -2646,6 +2674,8 @@ export class RuntimeLearning {
           this.evidenceCapsuleStore,
           this.isEpisodeFromExternalSource.bind(this),
           this.listSkillLoadFactsForEpisode(episode),
+          undefined,
+          getDeferredSkillCatalog(),
         ));
       } catch (error) {
         Logger.warning(`[RuntimeLearning] deferred bundle refresh skipped for ${episode.episodeId}: ${toErrorMessage(error)}`);
@@ -2726,10 +2756,26 @@ export class RuntimeLearning {
     const selectionClassCursors = { ...classCursors };
     let selectionNextClass = nextClass;
     const maxCandidates = Math.max(0, Math.floor(this.config.skillEvolutionReviewMaxCandidates));
-    const admittedEpisodeTasks: Array<{
-      episode: LearningEpisode;
-      bundle: ReturnType<typeof buildEpisodeEvidenceBundle>;
-    }> = [];
+    let admissionSkillCatalog: EvidenceBundleSkillCatalogSnapshot | undefined;
+    const buildBundleForEpisode = (episode: LearningEpisode): EvidenceBundle => {
+      if (!admissionSkillCatalog) {
+        admissionSkillCatalog = createSkillCatalogSnapshot();
+      }
+      return buildEpisodeEvidenceBundle(
+        episode,
+        buildLearningEpisodeCandidate(episode),
+        this.skillEvolution,
+        this.evidenceCapsuleStore,
+        this.isEpisodeFromExternalSource.bind(this),
+        this.listSkillLoadFactsForEpisode(episode),
+        undefined,
+        admissionSkillCatalog,
+      );
+    };
+    // Keep only the original Episode record until dispatch. A materialized
+    // bundle adds copied source evidence and current-skill snapshots for every
+    // selected candidate, which need not stay live while earlier jobs enqueue.
+    const admittedEpisodeTasks: LearningEpisode[] = [];
     let settlementError: unknown;
     while (reviewBudget.candidates < maxCandidates) {
       const availableClasses = new Set(
@@ -2793,70 +2839,58 @@ export class RuntimeLearning {
         }
         continue;
       }
-      try {
-        const bundle = buildEpisodeEvidenceBundle(
-          selected.episode,
-          buildLearningEpisodeCandidate(selected.episode),
-          this.skillEvolution,
-          this.evidenceCapsuleStore,
-          this.isEpisodeFromExternalSource.bind(this),
-          this.listSkillLoadFactsForEpisode(selected.episode),
-        );
-        if (!this.canAdmitReviewWork(reviewBudget)) continue;
-        classCursors[selected.workClass] = taskId(selected);
-        nextClass = REVIEW_WORK_CLASS_ORDER[
-          (REVIEW_WORK_CLASS_ORDER.indexOf(selected.workClass) + 1) % REVIEW_WORK_CLASS_ORDER.length
-        ]!;
-        admittedEpisodeTasks.push({ episode: selected.episode, bundle });
-      } catch (error) {
-        // Pre-snapshot local Episodes cannot be safely reconstructed. Do not
-        // turn that immutable-data gap into a forever retry continuation;
-        // leave the Episode untouched for explicit migration/inspection.
-        if (error instanceof MissingLearningEpisodeSourceEvidenceError) {
-          pendingEpisodeIds.delete(selected.episode.episodeId);
-          Logger.warning(`[RuntimeLearning] review skipped for legacy Episode ${selected.episode.episodeId}: ${error.message}`);
-          continue;
-        }
-        settlementError = settlementError ?? error;
-      }
+      if (!this.canAdmitReviewWork(reviewBudget)) continue;
+      classCursors[selected.workClass] = taskId(selected);
+      nextClass = REVIEW_WORK_CLASS_ORDER[
+        (REVIEW_WORK_CLASS_ORDER.indexOf(selected.workClass) + 1) % REVIEW_WORK_CLASS_ORDER.length
+      ]!;
+      admittedEpisodeTasks.push(selected.episode);
     }
 
     let episodeReviewFailures = 0;
     let episodeReviewTimeouts = 0;
     let episodeOperationalFailures = 0;
+    // Yield between bundle constructions so a standard 100-candidate batch
+    // does not monopolize the dashboard event loop for one uninterrupted turn.
+    const recordEpisodeAdmissionError = (episode: LearningEpisode, error: unknown): void => {
+      // Pre-snapshot local Episodes cannot be safely reconstructed. Do not
+      // turn that immutable-data gap into a forever retry continuation;
+      // leave the Episode untouched for explicit migration/inspection.
+      if (error instanceof MissingLearningEpisodeSourceEvidenceError) {
+        pendingEpisodeIds.delete(episode.episodeId);
+        Logger.warning(`[RuntimeLearning] review skipped for legacy Episode ${episode.episodeId}: ${error.message}`);
+        return;
+      }
+      episodeReviewFailures++;
+      settlementError = settlementError ?? error;
+      Logger.warning(`[RuntimeLearning] review admission failed for ${episode.episodeId}: ${toErrorMessage(error)}`);
+    };
 
-    const externalEpisodeTasks = admittedEpisodeTasks.filter(({ episode }) =>
+    const externalEpisodeTasks = admittedEpisodeTasks.filter(episode =>
       this.isEpisodeFromExternalSource(episode.episodeId));
-    const localEpisodeTasks = admittedEpisodeTasks.filter(({ episode }) =>
+    const localEpisodeTasks = admittedEpisodeTasks.filter(episode =>
       !this.isEpisodeFromExternalSource(episode.episodeId));
 
     // External/Pi learning is maintenance work with an unreliable provider in
-    // its path. Admit it durably and let fair background wakes advance it;
-    // never hold external ingestion open while waiting for model review.
-    for (const { episode, bundle } of externalEpisodeTasks) {
+    // its path, so keep its durable admission ahead of local work. Fair
+    // background wakes advance every admitted job; this loop never waits for a
+    // model review.
+    const admissionOrder = [...externalEpisodeTasks, ...localEpisodeTasks];
+    for (const [index, episode] of admissionOrder.entries()) {
+      if (index > 0) await yieldRuntimeTurn();
+      if (
+        wakeSignal?.aborted
+        || this.shutdownDrainRequested
+        || this.clock().getTime() >= reviewBudget.deadlineAt
+      ) break;
       try {
+        const bundle = buildBundleForEpisode(episode);
         this.skillEvolution.enqueueReview(bundle);
         // Admission is complete. The durable job, not this heartbeat, now owns
         // the episode until a fair background wake reaches a disposition.
         pendingEpisodeIds.delete(episode.episodeId);
       } catch (error) {
-        episodeReviewFailures++;
-        settlementError = settlementError ?? error;
-        Logger.warning(`[RuntimeLearning] review admission failed for ${episode.episodeId}: ${toErrorMessage(error)}`);
-      }
-    }
-
-    // Local work follows the same durable admission contract as external work.
-    // Newly admitted jobs are not drained synchronously; fair background wakes
-    // claim one Quantum per job and resume from the persisted graph.
-    for (const { episode, bundle } of localEpisodeTasks) {
-      try {
-        this.skillEvolution.enqueueReview(bundle);
-        pendingEpisodeIds.delete(episode.episodeId);
-      } catch (error) {
-        episodeReviewFailures++;
-        settlementError = settlementError ?? error;
-        Logger.warning(`[RuntimeLearning] review admission failed for ${episode.episodeId}: ${toErrorMessage(error)}`);
+        recordEpisodeAdmissionError(episode, error);
       }
     }
 
@@ -4861,7 +4895,10 @@ export class RuntimeLearning {
    * never blocks review, because review itself still fail-closes when a
    * capsule is missing or internally inconsistent.
    */
-  private reconcileSettlementConsistency(): void {
+  private async reconcileSettlementConsistency(
+    getSkillCatalog?: () => EvidenceBundleSkillCatalogSnapshot,
+    wakeSignal?: AbortSignal,
+  ): Promise<void> {
     const episodes = Object.values(this.episodeStore.load().episodes);
     const episodeById = new Map(episodes.map(e => [e.episodeId, e] as const));
 
@@ -4929,7 +4966,12 @@ export class RuntimeLearning {
       // Job store optional during early construction / V3-disabled paths.
       return;
     }
-    for (const job of recoverableJobs) {
+    for (const [index, job] of recoverableJobs.entries()) {
+      if (wakeSignal?.aborted || this.shutdownDrainRequested) break;
+      if (index > 0) {
+        await yieldRuntimeTurn();
+        if (wakeSignal?.aborted || this.shutdownDrainRequested) break;
+      }
       const normalized = migratePersistedEvidenceBundleAuthority(job.bundle);
       if (!normalized || normalized.authority.kind !== 'learning-episode') continue;
       const episode = episodeById.get(normalized.authority.episodeId);
@@ -4941,6 +4983,8 @@ export class RuntimeLearning {
         this.evidenceCapsuleStore,
         this.isEpisodeFromExternalSource.bind(this),
         this.listSkillLoadFactsForEpisode(episode),
+        undefined,
+        getSkillCatalog?.(),
       );
       // Detect whether the frozen bundle's settlement evidence is stale
       // relative to the current authoritative/reconstructed capsule. The

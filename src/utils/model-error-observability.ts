@@ -41,6 +41,9 @@ export interface ModelErrorDiagnostics {
   provider_code?: string;
   provider_type?: string;
   request_id?: string;
+  response_id?: string;
+  terminal_event?: string;
+  failure_phase?: string;
   error_name?: string;
   top_frame?: string;
   stack_fingerprint?: string;
@@ -162,6 +165,18 @@ function captureModelErrorDiagnosticsUnsafe(
     causeDiagnostics?.request_id,
     safePath(cause, 'response', 'headers', 'x-request-id'),
   );
+  const responseId = firstText(
+    existing?.response_id,
+    safeRead(error, 'responseId'),
+    safeRead(error, 'response_id'),
+    safeRead(responseError, 'response_id'),
+    causeDiagnostics?.response_id,
+    safeRead(cause, 'responseId'),
+    safeRead(cause, 'response_id'),
+    safePath(cause, 'response', 'data', 'error', 'response_id'),
+  );
+  const terminalEvent = firstText(existing?.terminal_event, error?.terminalEvent);
+  const failurePhase = firstText(existing?.failure_phase, error?.failurePhase);
   const sourceMessage = firstText(
     safeRead(responseError, 'message'),
     safePath(error, 'response', 'data', 'message'),
@@ -201,6 +216,9 @@ function captureModelErrorDiagnosticsUnsafe(
     provider_code: providerCode ?? transportCode,
     provider_type: providerType,
     request_id: requestId,
+    response_id: responseId,
+    terminal_event: terminalEvent,
+    failure_phase: failurePhase,
     error_name: errorName,
     top_frame: existing?.top_frame ?? stack.topFrame,
     stack_fingerprint: existing?.stack_fingerprint ?? stack.fingerprint,
@@ -278,6 +296,9 @@ function normalizeDiagnostics(input: ModelErrorDiagnostics): ModelErrorDiagnosti
     ...(providerCode && { provider_code: providerCode }),
     ...(providerType && { provider_type: providerType }),
     ...(hashedIdentifier(input.request_id, 'request') && { request_id: hashedIdentifier(input.request_id, 'request') }),
+    ...(hashedIdentifier(input.response_id, 'response') && { response_id: hashedIdentifier(input.response_id, 'response') }),
+    ...(safeText(input.terminal_event) && { terminal_event: safeText(input.terminal_event) }),
+    ...(safeText(input.failure_phase) && { failure_phase: safeText(input.failure_phase) }),
     ...(errorName && { error_name: errorName }),
     ...(safeText(input.top_frame) && { top_frame: safeText(input.top_frame) }),
     ...(safeText(input.stack_fingerprint) && { stack_fingerprint: safeText(input.stack_fingerprint) }),

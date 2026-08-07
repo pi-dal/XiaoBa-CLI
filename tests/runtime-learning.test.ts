@@ -130,6 +130,35 @@ function frozenEpisodeSource(
   };
 }
 
+function eligibleReviewEpisode(
+  episodeId: string,
+  runtimeSessionId: string,
+): LearningEpisode {
+  return {
+    schemaVersion: 3,
+    episodeId,
+    runtimeSessionId,
+    sourceFilePath: `${episodeId}.jsonl`,
+    deliveryTurn: 1,
+    completionEvidence: [{
+      ref: `${episodeId}#1`,
+      sourceFilePath: `${episodeId}.jsonl`,
+      turn: 1,
+      kind: 'artifact-delivery',
+      detail: 'send_file: delivered',
+    }],
+    contradictionSignals: [],
+    sourceEvidence: [frozenEpisodeSource(`${episodeId}#1`, `${episodeId}.jsonl`, 1)],
+    semanticObservations: [{
+      kind: 'user-intent',
+      value: `Deliver ${episodeId}.`,
+      sourceRefs: [`${episodeId}#intent`],
+    }],
+    settlementDeadline: new Date(0).toISOString(),
+    status: 'eligible',
+  };
+}
+
 function createDeferred<T = void>(): {
   promise: Promise<T>;
   resolve: (value: T | PromiseLike<T>) => void;
@@ -441,6 +470,8 @@ function setupEnv(
     CATSCO_USER_DATA_DIR: process.env.CATSCO_USER_DATA_DIR,
     XIAOBA_ELECTRON_USER_DATA_DIR: process.env.XIAOBA_ELECTRON_USER_DATA_DIR,
     XIAOBA_SKILL_EVOLUTION_REASSESSMENT_MANIFEST_FILE: process.env.XIAOBA_SKILL_EVOLUTION_REASSESSMENT_MANIFEST_FILE,
+    XIAOBA_SKILL_EVOLUTION_REVIEWER_CONCURRENCY: process.env.XIAOBA_SKILL_EVOLUTION_REVIEWER_CONCURRENCY,
+    XIAOBA_SKILL_EVOLUTION_REVIEW_MAX_CANDIDATES: process.env.XIAOBA_SKILL_EVOLUTION_REVIEW_MAX_CANDIDATES,
     XIAOBA_SKILL_EVOLUTION_REVIEW_MAX_QUANTA_PER_WAKE: process.env.XIAOBA_SKILL_EVOLUTION_REVIEW_MAX_QUANTA_PER_WAKE,
     XIAOBA_EXTERNAL_SESSION_LOG_SOURCES_ENABLED: process.env.XIAOBA_EXTERNAL_SESSION_LOG_SOURCES_ENABLED,
     XIAOBA_EXTERNAL_SESSION_LOG_ENABLED_PROVIDERS: process.env.XIAOBA_EXTERNAL_SESSION_LOG_ENABLED_PROVIDERS,
@@ -461,6 +492,8 @@ function setupEnv(
   delete process.env.XIAOBA_ELECTRON_USER_DATA_DIR;
   process.env.XIAOBA_RUNTIME_ROOT = root;
   process.env.XIAOBA_SKILL_EVOLUTION_REASSESSMENT_MANIFEST_FILE = reassessmentManifestPath;
+  delete process.env.XIAOBA_SKILL_EVOLUTION_REVIEWER_CONCURRENCY;
+  delete process.env.XIAOBA_SKILL_EVOLUTION_REVIEW_MAX_CANDIDATES;
   process.env.XIAOBA_SKILL_EVOLUTION_REVIEW_MAX_QUANTA_PER_WAKE = '1';
   process.env.XIAOBA_EXTERNAL_SESSION_LOG_SOURCES_ENABLED = 'false';
   delete process.env.XIAOBA_EXTERNAL_SESSION_LOG_ENABLED_PROVIDERS;
@@ -1070,6 +1103,251 @@ describe('RuntimeLearning — AC3: Due Review', () => {
 
   beforeEach(() => { env = setupEnv(0); }); // Immediate settlement
   afterEach(() => { env.restore(); env.teardown(); });
+
+  test('preserves the standard review limits', () => {
+    const config = env.runtimeLearning.getConfig();
+
+    assert.equal(config.skillEvolutionReviewerConcurrency, 3);
+    assert.equal(config.skillEvolutionReviewMaxCandidates, 100);
+  });
+
+  test('builds each admission once, shares one skill snapshot, and yields between admissions', async () => {
+    const episodeIds = [
+      'episode-admission-a',
+      'episode-admission-b',
+      'episode-admission-c',
+      'episode-admission-d',
+    ];
+    const episodes: Record<string, LearningEpisode> = {};
+    for (const episodeId of episodeIds) {
+      episodes[episodeId] = eligibleReviewEpisode(episodeId, 'runtime-admission-yield');
+    }
+    env.runtimeLearning.getEpisodeStore().save({ schemaVersion: 3, episodes });
+
+    const originalGetReferencedSkillSnapshots = env.skillEvolution.getReferencedSkillSnapshots;
+    const originalEnqueueReview = env.skillEvolution.enqueueReview;
+    let referencedSnapshotLoads = 0;
+    let admissions = 0;
+    let admissionsWhenEventLoopRegainedControl: number | undefined;
+    env.skillEvolution.getReferencedSkillSnapshots = () => {
+      referencedSnapshotLoads++;
+      return originalGetReferencedSkillSnapshots.call(env.skillEvolution);
+    };
+    env.skillEvolution.enqueueReview = (bundle: EvidenceBundle) => {
+      admissions++;
+      if (admissions === 1) {
+        setImmediate(() => {
+          admissionsWhenEventLoopRegainedControl = admissions;
+        });
+      }
+      return originalEnqueueReview.call(env.skillEvolution, bundle);
+    };
+
+    try {
+      await env.runtimeLearning.wake('startup');
+      await new Promise<void>(resolve => setImmediate(resolve));
+
+      assert.equal(referencedSnapshotLoads, 1);
+      assert.equal(admissions, episodeIds.length);
+      assert.equal(admissionsWhenEventLoopRegainedControl, 1);
+    } finally {
+      env.skillEvolution.getReferencedSkillSnapshots = originalGetReferencedSkillSnapshots;
+      env.skillEvolution.enqueueReview = originalEnqueueReview;
+    }
+  });
+
+  test('keeps a yielded admission batch on one coherent Skill catalog snapshot', async () => {
+    const capabilityHandle = 'cap_coherent_admission_snapshot';
+    const initialRoutingName = 'coherent-admission-snapshot';
+    const skillFilePath = path.join(env.outputDir, capabilityHandle, 'SKILL.md');
+    const writeSkill = (routingName: string): string => {
+      const content = [
+        '---',
+        `name: ${routingName}`,
+        'description: Keep the review catalog coherent.',
+        'user-invocable: true',
+        `x-xiaoba-capability-handle: ${capabilityHandle}`,
+        '---',
+        '',
+        'Keep the review catalog coherent.',
+        '',
+      ].join('\n');
+      fs.mkdirSync(path.dirname(skillFilePath), { recursive: true });
+      fs.writeFileSync(skillFilePath, content, 'utf8');
+      return crypto.createHash('sha256').update(content).digest('hex');
+    };
+    const initialGuidanceHash = writeSkill(initialRoutingName);
+    const initialRegistry = emptyCurrentSkillRegistryState();
+    initialRegistry.catalogRevision = 1;
+    initialRegistry.capabilities[capabilityHandle] = {
+      handle: capabilityHandle,
+      revision: 1,
+      routingName: initialRoutingName,
+      description: 'Keep the review catalog coherent.',
+      skillFilePath,
+      guidanceHash: initialGuidanceHash,
+      evidenceRefs: [],
+      referencedSkills: [],
+      createdAt: new Date(0).toISOString(),
+      updatedAt: new Date(0).toISOString(),
+    };
+    saveCurrentSkillRegistry(env.registryPath, initialRegistry);
+
+    const episodeIds = ['episode-coherent-catalog-a', 'episode-coherent-catalog-b'];
+    const episodes: Record<string, LearningEpisode> = {};
+    const ledger = new SkillUsageLedger(path.join(env.root, 'data', 'skill-usage-ledger.jsonl'));
+    for (const episodeId of episodeIds) {
+      const agentTurnEpisodeId = `turn-${episodeId}`;
+      episodes[episodeId] = {
+        ...eligibleReviewEpisode(episodeId, 'runtime-coherent-catalog'),
+        agentTurnEpisodeId,
+      };
+      ledger.recordGeneratedSkillLoad({
+        runtimeSessionId: 'runtime-coherent-catalog',
+        episodeId: agentTurnEpisodeId,
+        skill: {
+          capabilityHandle,
+          routingName: initialRoutingName,
+          skillFilePath,
+          guidanceHash: initialGuidanceHash,
+        },
+      });
+    }
+    env.runtimeLearning.getEpisodeStore().save({ schemaVersion: 3, episodes });
+
+    const originalEnqueueReview = env.skillEvolution.enqueueReview;
+    const admittedBundles: EvidenceBundle[] = [];
+    let registryChanged = false;
+    env.skillEvolution.enqueueReview = (bundle: EvidenceBundle) => {
+      admittedBundles.push(bundle);
+      const result = originalEnqueueReview.call(env.skillEvolution, bundle);
+      if (admittedBundles.length === 1) {
+        setImmediate(() => {
+          const nextRoutingName = 'coherent-admission-snapshot-v2';
+          const nextGuidanceHash = writeSkill(nextRoutingName);
+          const nextRegistry = emptyCurrentSkillRegistryState();
+          nextRegistry.catalogRevision = 2;
+          nextRegistry.capabilities[capabilityHandle] = {
+            ...initialRegistry.capabilities[capabilityHandle]!,
+            revision: 2,
+            routingName: nextRoutingName,
+            guidanceHash: nextGuidanceHash,
+            updatedAt: new Date().toISOString(),
+          };
+          saveCurrentSkillRegistry(env.registryPath, nextRegistry);
+          registryChanged = true;
+        });
+      }
+      return result;
+    };
+
+    try {
+      await env.runtimeLearning.wake('startup');
+
+      assert.equal(registryChanged, true);
+      assert.equal(admittedBundles.length, episodeIds.length);
+      for (const bundle of admittedBundles) {
+        assert.equal(bundle.referencedSkills[0]?.name, initialRoutingName);
+        assert.equal(bundle.referencedSkills[0]?.guidanceHash, initialGuidanceHash);
+        assert.equal(bundle.relatedCurrentSkills[0]?.routingName, initialRoutingName);
+        assert.equal(bundle.relatedCurrentSkills[0]?.guidanceHash, initialGuidanceHash);
+      }
+    } finally {
+      env.skillEvolution.enqueueReview = originalEnqueueReview;
+    }
+  });
+
+  test('stops remaining admissions when drain starts at an admission yield', async () => {
+    const episodeIds = ['episode-drain-admission-a', 'episode-drain-admission-b'];
+    const episodes: Record<string, LearningEpisode> = {};
+    for (const episodeId of episodeIds) {
+      episodes[episodeId] = eligibleReviewEpisode(episodeId, 'runtime-drain-admission');
+    }
+    env.runtimeLearning.getEpisodeStore().save({ schemaVersion: 3, episodes });
+
+    const originalEnqueueReview = env.skillEvolution.enqueueReview;
+    const firstAdmission = createDeferred<void>();
+    const drainStarted = createDeferred<void>();
+    let admissions = 0;
+    let drainPromise: Promise<boolean> | undefined;
+    env.skillEvolution.enqueueReview = (bundle: EvidenceBundle) => {
+      const result = originalEnqueueReview.call(env.skillEvolution, bundle);
+      admissions++;
+      if (admissions === 1) {
+        firstAdmission.resolve();
+        setImmediate(() => {
+          drainPromise = env.runtimeLearning.drain(1_000);
+          drainStarted.resolve();
+        });
+      }
+      return result;
+    };
+
+    let wake: Promise<RuntimeLearningHeartbeatResult> | undefined;
+    try {
+      wake = env.runtimeLearning.wake('startup');
+      await firstAdmission.promise;
+      await drainStarted.promise;
+      await wake;
+
+      assert.equal(admissions, 1);
+      assert.ok(drainPromise);
+      assert.equal(await drainPromise, true);
+      assert.equal(env.skillEvolution.getReviewedOrQueuedBundleIds().size, 1);
+
+      const continuationPath = reviewContinuationPathForEpisodeStore(env.episodeStorePath);
+      const continuation = JSON.parse(fs.readFileSync(continuationPath, 'utf8')) as {
+        episodeIds: string[];
+      };
+      assert.deepEqual(continuation.episodeIds, [episodeIds[1]!]);
+    } finally {
+      env.skillEvolution.enqueueReview = originalEnqueueReview;
+      if (wake) await Promise.allSettled([wake]);
+      if (drainPromise) await Promise.allSettled([drainPromise]);
+    }
+  });
+
+  test('stops deferred bundle rebuilds when drain starts at a rebuild yield', async () => {
+    const episodeIds = ['episode-drain-deferred-a', 'episode-drain-deferred-b'];
+    const episodes: Record<string, LearningEpisode> = {};
+    for (const episodeId of episodeIds) {
+      episodes[episodeId] = eligibleReviewEpisode(episodeId, 'runtime-deferred-drain');
+    }
+    env.runtimeLearning.getEpisodeStore().save({ schemaVersion: 3, episodes });
+
+    const originalGetDeferredBundleIds = env.skillEvolution.getDeferredReviewBundleIds;
+    const originalReactivateDeferredReviews = env.skillEvolution.reactivateDeferredReviews;
+    const drainStarted = createDeferred<void>();
+    let drainPromise: Promise<boolean> | undefined;
+    let rebuiltBundles: readonly EvidenceBundle[] | undefined;
+    env.skillEvolution.getDeferredReviewBundleIds = () => {
+      setImmediate(() => {
+        drainPromise = env.runtimeLearning.drain(1_000);
+        drainStarted.resolve();
+      });
+      return episodeIds.map(episodeId => `v3:learning-episode:${episodeId}`);
+    };
+    env.skillEvolution.reactivateDeferredReviews = bundles => {
+      rebuiltBundles = bundles;
+      return [];
+    };
+
+    let wake: Promise<RuntimeLearningHeartbeatResult> | undefined;
+    try {
+      wake = env.runtimeLearning.wake('startup');
+      await drainStarted.promise;
+      await wake;
+
+      assert.equal(rebuiltBundles?.length, 1);
+      assert.ok(drainPromise);
+      assert.equal(await drainPromise, true);
+    } finally {
+      env.skillEvolution.getDeferredReviewBundleIds = originalGetDeferredBundleIds;
+      env.skillEvolution.reactivateDeferredReviews = originalReactivateDeferredReviews;
+      if (wake) await Promise.allSettled([wake]);
+      if (drainPromise) await Promise.allSettled([drainPromise]);
+    }
+  });
 
   test('an accepted single episode bootstraps a Current Skill without a prior Skill load', async () => {
     const [delivery, acceptance] = deliveryPair(-2); // 2 hours ago

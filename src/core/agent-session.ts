@@ -47,6 +47,7 @@ import {
   classifyModelError,
   MODEL_IMAGE_SAFETY_MESSAGE,
   isModelImageSafetyError,
+  type ModelErrorCategory,
 } from '../utils/model-error-classifier';
 import {
   readModelErrorDiagnostics,
@@ -103,10 +104,12 @@ function safeErrorText(error: unknown): string {
 }
 
 export const BUSY_MESSAGE = '正在处理上一条消息，请稍候...';
-export const ERROR_MESSAGE = '不好意思，刚才处理出了点问题，你再试一次？';
-export const MODEL_TIMEOUT_MESSAGE = '模型中转请求超时，本轮没有完成。';
-export const MODEL_TRANSIENT_ERROR_MESSAGE = '当前模型服务临时异常，本轮没有完成。';
-export const EMPTY_MODEL_RESPONSE_MESSAGE = '模型本轮未返回有效内容，本轮没有完成。请重新发送上一条消息；若仍失败，请切换模型或稍后再试。';
+export const ERROR_MESSAGE = '本次处理未能完成，请稍后再试。';
+export const MODEL_TIMEOUT_MESSAGE = '模型响应超时，本轮上下文已保留，请稍后继续。';
+export const MODEL_TRANSIENT_ERROR_MESSAGE = '模型服务暂时不可用，请稍后再试。';
+export const EMPTY_MODEL_RESPONSE_MESSAGE = '模型本轮未返回有效内容，请重新发送上一条消息；若仍失败，请切换模型或稍后再试。';
+export const MODEL_RECOVERY_FAILED_MESSAGE = '模型服务暂时不稳定，系统已尝试自动恢复但仍未成功，请稍后继续。';
+export const MODEL_REQUEST_FAILED_MESSAGE = '模型服务暂时不稳定，本次处理未能完成，请稍后继续。';
 export const CONTEXT_COMPACTION_START_MESSAGE = '正在压缩上下文，整理较早的对话内容。';
 export const CONTEXT_COMPACTION_COMPLETE_MESSAGE = '上下文压缩完成，继续处理当前请求。';
 export const CONTEXT_COMPACTION_ERROR_MESSAGE = '上下文压缩失败，已保留原上下文继续处理。';
@@ -789,12 +792,12 @@ export class AgentSession {
         });
         const diagnostics = classified.diagnostics;
         const retry = diagnostics.retry;
-        let baseErrorReply = classified.user_message;
-        if (relayBudgetErrorReply) {
-          baseErrorReply = relayBudgetErrorReply;
-        } else if (classified.category === 'transient') {
-          baseErrorReply = this.formatTransientProviderErrorReply();
-        }
+        const baseErrorReply = relayBudgetErrorReply
+          ?? this.formatClassifiedErrorReply(
+            classified.category,
+            classified.user_message,
+            retry?.retry_count ?? 0,
+          );
 
         // Keep internal failure context out of future prompts while persisting all durable progress.
         this.messages.push({
@@ -826,6 +829,9 @@ export class AgentSession {
           provider_code: diagnostics.provider_code,
           provider_type: diagnostics.provider_type,
           provider_request_id: diagnostics.request_id,
+          provider_response_id: diagnostics.response_id,
+          terminal_event: diagnostics.terminal_event,
+          provider_failure_phase: diagnostics.failure_phase,
           error_fingerprint: diagnostics.fingerprint,
           stack_fingerprint: diagnostics.stack_fingerprint,
           top_frame: diagnostics.top_frame,
@@ -853,14 +859,7 @@ export class AgentSession {
           } as SessionRuntimeLogEvent,
         );
 
-        const errorReply = this.formatClassifiedErrorReply(baseErrorReply, {
-          retryCount: retry?.retry_count ?? 0,
-          retryObserved: Boolean(retry),
-          retryStopReason: retry?.stop_reason,
-          contextPersisted,
-          hasRecoverablePartialProgress,
-        });
-        return { text: errorReply, visibleToUser: true, taskOutcome: 'failed' };
+        return { text: baseErrorReply, visibleToUser: true, taskOutcome: 'failed' };
       } finally {
         this.planRuntime.clear();
         scheduleCurrentBotPromptReconcile();
@@ -1241,39 +1240,6 @@ export class AgentSession {
     }
   }
 
-  private formatClassifiedErrorReply(
-    baseMessage: string,
-    state: {
-      retryCount: number;
-      retryObserved: boolean;
-      retryStopReason?: string;
-      contextPersisted: boolean;
-      hasRecoverablePartialProgress: boolean;
-    },
-  ): string {
-    const details: string[] = [baseMessage];
-    if (state.retryCount > 0) {
-      details.push(`系统已自动重试 ${state.retryCount} 次，仍未恢复。`);
-    } else if (state.retryObserved) {
-      details.push(state.retryStopReason === 'stream_output_started'
-        ? '因本轮已开始输出，为避免重复内容，系统未自动重试。'
-        : '系统未执行自动重试。');
-    } else {
-      details.push('本次未记录到自动重试。');
-    }
-
-    if (state.hasRecoverablePartialProgress && state.contextPersisted) {
-      details.push('已完成的工具结果和上下文已保存，可直接说“继续”。');
-    } else if (state.hasRecoverablePartialProgress) {
-      details.push('本轮已有部分进度，但持久化失败；当前进程内可继续，重启后可能丢失。');
-    } else if (state.contextPersisted) {
-      details.push('对话上下文已保存，但本轮没有可恢复的部分进度。');
-    } else {
-      details.push('上下文持久化失败，重启后本轮内容可能丢失。');
-    }
-    return details.join('');
-  }
-
   private isAbortError(error: any): boolean {
     return safeErrorProperty(error, 'name') === 'AbortError'
       || safeErrorProperty(error, 'code') === 'ERR_CANCELED'
@@ -1397,11 +1363,21 @@ export class AgentSession {
     return provider || null;
   }
 
-  private formatTransientProviderErrorReply(): string {
-    const model = this.currentModelName();
-    return model
-      ? `当前模型 ${model} 的服务临时异常，刚才这次请求没有完成。你可以稍后重试，或临时切换到其他模型继续。`
-      : MODEL_TRANSIENT_ERROR_MESSAGE;
+  private formatClassifiedErrorReply(
+    category: ModelErrorCategory,
+    fallback: string,
+    retryCount: number,
+  ): string {
+    if (
+      category === 'image_safety'
+      || category === 'vision_unsupported'
+      || category === 'input_too_large'
+    ) {
+      return fallback;
+    }
+    return retryCount > 0
+      ? MODEL_RECOVERY_FAILED_MESSAGE
+      : MODEL_REQUEST_FAILED_MESSAGE;
   }
 
   private formatErrorContextMessage(
