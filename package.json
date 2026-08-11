@@ -1,6 +1,6 @@
 {
   "name": "xiaoba-cli",
-  "version": "1.4.8",
+  "version": "1.4.6",
   "description": "CatsCo - local agent runtime and dashboard",
   "main": "electron/main.js",
   "bin": {
@@ -8,10 +8,12 @@
     "xiaoba": "dist/index.js"
   },
   "scripts": {
-    "build": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\" && tsc",
+    "build": "tsc",
     "dev": "tsx src/index.ts",
     "start": "node dist/index.js",
     "start:cli": "node dist/index.js",
+    "review:runtime": "tsx src/review/review-adapter-cli.ts",
+    "inspection:runtime": "tsx src/inspection/inspection-run-cli.ts",
     "electron:dev": "npm run build && node scripts/start-electron-dev.mjs",
     "electron:build": "npm run build && npm run prepare:runtime && npm run prune:electron-optionals && electron-builder --config electron-builder.config.cjs --publish never",
     "electron:build:mac": "npm run build && npm run prepare:runtime && npm run prune:electron-optionals && electron-builder --config electron-builder.config.cjs --mac --publish never",
@@ -20,11 +22,9 @@
     "watch": "tsc --watch",
     "test": "node scripts/run-tests.mjs runtime",
     "test:runtime": "node scripts/run-tests.mjs runtime",
-    "test:cross-repo:catsco-skills": "node scripts/cross-repo-catsco-skills-smoke.mjs",
     "test:legacy": "node scripts/run-tests.mjs legacy",
     "test:all": "node scripts/run-tests.mjs all",
     "test:list": "node scripts/run-tests.mjs runtime --list",
-    "canary:anthropic-prompt-cache": "node scripts/anthropic-prompt-cache-canary.mjs",
     "report": "node dist/index.js chat --exec '/report'",
     "clean-logs": "node scripts/clean-logs.mjs",
     "prepare:runtime": "node scripts/prepare-runtime.mjs",
@@ -34,7 +34,6 @@
     "electron:build:mac:arm64": "npm run build && node scripts/prepare-runtime.mjs darwin arm64 && npm run prune:electron-optionals && electron-builder --config electron-builder.config.cjs --mac --arm64 --publish never",
     "release:check": "node scripts/check-release-branding.mjs",
     "release:verify-version": "node scripts/verify-release-version.js",
-    "worker:artifact": "node scripts/build-linux-worker-artifact.mjs",
     "skillhub:trust-root": "node scripts/update-skillhub-root-key.mjs",
     "version:sync": "node scripts/inject-version.js"
   },
@@ -75,6 +74,7 @@
     "ora": "^5.4.1",
     "pdf-parse": "^1.1.1",
     "pdfjs-dist": "^4.6.82",
+    "proper-lockfile": "^4.1.2",
     "sharp": "^0.34.5"
   },
   "devDependencies": {
@@ -115,7 +115,6 @@
       "dashboard/**/*",
       "prompts/**/*",
       "skills/**/*",
-      "!skills/generated-distilled/**",
       "!skills/**/*.pyo",
       "!skills/**/*.pyc",
       "!skills/**/__pycache__/**",
@@ -162,11 +161,7 @@
         "zip"
       ],
       "icon": "build-resources/icons/icon.icns",
-      "artifactName": "${productName}-${version}-mac-${arch}.${ext}",
-      "hardenedRuntime": true,
-      "gatekeeperAssess": false,
-      "entitlements": "build-resources/entitlements.mac.plist",
-      "entitlementsInherit": "build-resources/entitlements.mac.inherit.plist"
+      "artifactName": "${productName}-${version}-mac-${arch}.${ext}"
     },
     "win": {
       "target": [

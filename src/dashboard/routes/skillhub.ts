@@ -1,15 +1,15 @@
 import type { Router } from 'express';
 import { SkillHubService } from '../../skillhub/service';
-import {
-  scheduleCurrentBotSkillSync,
-  withCurrentBotSkillWorkspaceWrite,
-} from '../../bot-skills/runtime';
-import {
-  shareLocalSkillForCatsCo,
-  type SkillHubCatsCoAuthPayload,
-} from '../../skillhub/local-share';
 
-export { assertExpectedLocalSkillShareScope } from '../../skillhub/local-share';
+export interface SkillHubCatsCoAuthPayload {
+  token: string;
+  baseUrl: string;
+  user?: {
+    uid?: string;
+    username?: string;
+    displayName?: string;
+  };
+}
 
 export interface SkillHubRouteOptions {
   getCatsCoAuth?: () => Promise<SkillHubCatsCoAuthPayload> | SkillHubCatsCoAuthPayload;
@@ -87,14 +87,7 @@ export function registerSkillHubRoutes(router: Router, options: SkillHubRouteOpt
     try {
       const skillId = String(req.body?.skillId || '').trim();
       if (!skillId) return res.status(400).json({ error: 'skillId required' });
-      const result = await withCurrentBotSkillWorkspaceWrite(() => (
-        serviceFrom(req.body).install(
-          skillId,
-          String(req.body?.version || '').trim() || undefined,
-        )
-      ));
-      scheduleCurrentBotSkillSync();
-      res.json(result);
+      res.json(await serviceFrom(req.body).install(skillId, String(req.body?.version || '').trim() || undefined));
     } catch (error: any) {
       sendSkillHubError(res, error);
     }
@@ -143,7 +136,7 @@ export function registerSkillHubRoutes(router: Router, options: SkillHubRouteOpt
 
   router.post('/skillhub/developer/share-local-skill', async (req, res) => {
     try {
-      res.status(201).json(await shareLocalSkillForCatsCo(req.body || {}, options));
+      res.status(201).json(await serviceFrom(req.body).shareLocalSkill(req.body || {}));
     } catch (error: any) {
       sendSkillHubError(res, error);
     }
@@ -151,7 +144,7 @@ export function registerSkillHubRoutes(router: Router, options: SkillHubRouteOpt
 
   router.post('/skillhub/share-local-skill', async (req, res) => {
     try {
-      res.status(201).json(await shareLocalSkillForCatsCo(req.body || {}, options));
+      res.status(201).json(await serviceFrom(req.body).shareLocalSkill(req.body || {}));
     } catch (error: any) {
       sendSkillHubError(res, error);
     }
@@ -190,8 +183,8 @@ export function registerSkillHubRoutes(router: Router, options: SkillHubRouteOpt
   });
 }
 
-function serviceFrom(_input?: any, options: { sessionScope?: 'persistent' | 'memory' } = {}): SkillHubService {
-  return new SkillHubService(options);
+function serviceFrom(_input?: any): SkillHubService {
+  return new SkillHubService();
 }
 
 function sendSkillHubError(res: any, error: any): void {

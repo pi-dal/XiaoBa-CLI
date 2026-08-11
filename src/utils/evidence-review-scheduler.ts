@@ -1,7 +1,7 @@
 /**
  * Fair Review Quantum Rotation (#108).
  *
- * Durable, fair selection of Review Quanta from the engine job store:
+ * Durable, work-conserving selection of Review Quanta from the engine job store:
  * 1. Rotate durably across work classes (no permanent priority class).
  * 2. Within a selected class, claim at most one Quantum per runnable job
  *    before that job is visited again.
@@ -9,9 +9,9 @@
  *    reader lanes while either lane remains incomplete (including claims
  *    planned earlier in this pass).
  * 4. Per-job concurrency caps (counting already-leased / in-flight quanta)
- *    prevent one large job from monopolizing the batch, including when it is
- *    the only runnable Job.
- * 5. Job size, retry count, and bundle length never alter semantic eligibility
+ *    prevent one large job from monopolizing slots when other jobs are runnable.
+ * 5. When only one job is runnable, it may consume spare global capacity.
+ * 6. Job size, retry count, and bundle length never alter semantic eligibility
  *    or permanent priority.
  */
 
@@ -36,10 +36,8 @@ export interface FairSchedulePlan {
 export interface FairScheduleOptions {
   /** Global max quanta to claim this pass. */
   maxClaims: number;
-  /** Strict per-job concurrency cap for this batch. */
+  /** Per-job concurrency when multiple jobs compete. */
   maxClaimsPerJob: number;
-  /** Jobs already attempted by the current batch must not receive another claim. */
-  excludeJobIds?: ReadonlySet<string>;
   now?: Date;
 }
 
@@ -208,10 +206,12 @@ export function planFairQuantumClaims(
   const claims: FairSchedulePlan['claims'] = [];
   if (maxClaims === 0) return { claims, fairness };
 
-  const activeJobs = Object.values(state.jobs)
-    .filter(job => !options.excludeJobIds?.has(job.jobId));
+  const activeJobs = Object.values(state.jobs);
   const byClass = runnableJobsByClass(activeJobs, now);
   const allRunnableJobs = WORK_CLASS_ORDER.flatMap(wc => byClass[wc]);
+  const soleJob = allRunnableJobs.length === 1 ? allRunnableJobs[0] : undefined;
+  // Work-conserving: sole runnable job may fill spare global capacity.
+  const effectivePerJobCap = soleJob ? maxClaims : maxClaimsPerJob;
 
   const claimsPerJob = new Map<string, number>();
   for (const job of allRunnableJobs) {
@@ -228,7 +228,7 @@ export function planFairQuantumClaims(
     selectedClass: ReviewWorkClass,
   ): boolean => {
     const used = claimsPerJob.get(job.jobId) ?? 0;
-    if (used >= maxClaimsPerJob) return false;
+    if (used >= effectivePerJobCap) return false;
     if (claims.length >= maxClaims) return false;
 
     const quantum = pickJobQuantum(
@@ -289,12 +289,21 @@ export function planFairQuantumClaims(
       if (tryClaimFromJob(job, selectedClass)) claimedThisCycle = true;
     }
 
+    // Work-conserving refill: the sole runnable job may consume spare global
+    // capacity within the same pass without waiting for empty class rotations.
+    if (soleJob && selectedClass === soleJob.workClass) {
+      while (claims.length < maxClaims) {
+        if (!tryClaimFromJob(soleJob, selectedClass)) break;
+        claimedThisCycle = true;
+      }
+    }
+
     fairness.nextWorkClass = nextWorkClass(selectedClass);
 
     // Drop exhausted / capped jobs from the class list for subsequent cycles.
     byClass[selectedClass] = byClass[selectedClass].filter(job => {
       const used = claimsPerJob.get(job.jobId) ?? 0;
-      if (used >= maxClaimsPerJob) return false;
+      if (used >= effectivePerJobCap) return false;
       return pickJobQuantum(
         job,
         now,

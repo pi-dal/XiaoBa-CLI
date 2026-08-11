@@ -2,7 +2,6 @@ import { describe, test } from 'node:test';
 import * as assert from 'node:assert';
 import { FeishuBot } from '../src/feishu';
 import { SubAgentManager } from '../src/core/sub-agent-manager';
-import { BUSY_MESSAGE } from '../src/core/agent-session';
 
 describe('Feishu SessionRoute V2', () => {
   test('routes private messages through a Feishu V2 session key', async () => {
@@ -69,200 +68,13 @@ describe('Feishu SessionRoute V2', () => {
       SubAgentManager.getInstance().unregisterPlatformCallbacks('session:v2:feishu:group:oc_group');
     }
   });
-  test('sends a classified failed result instead of collapsing it to ERROR_MESSAGE', async () => {
-    const sentTexts: string[] = [];
-    const bot = createHarness({
-      sentTexts,
-      result: { visibleToUser: true, text: '模型访问凭证无效。', taskOutcome: 'failed' },
-      message: {
-        messageId: 'msg-failed', chatId: 'private', chatType: 'p2p', senderId: 'private',
-        text: 'hello', mentionBot: true, msgType: 'text',
-      },
-    });
-    try {
-      await (bot as any).onMessage({});
-      assert.deepEqual(sentTexts, ['模型访问凭证无效。']);
-    } finally {
-      SubAgentManager.getInstance().unregisterPlatformCallbacks('session:v2:feishu:p2p:private');
-    }
-  });
-
-  test('requeues a direct racing BUSY user message and sends the later failure once', async () => {
-    const sentTexts: string[] = [];
-    const bot = createHarness({
-      sentTexts,
-      results: [
-        { visibleToUser: true, text: BUSY_MESSAGE },
-        { visibleToUser: true, text: '模型请求超时。', taskOutcome: 'failed' },
-      ],
-      message: {
-        messageId: 'msg-direct-race', chatId: 'oc_direct_race', chatType: 'group', senderId: 'ou_direct_race',
-        text: 'direct racing user text', mentionBot: true, msgType: 'text',
-      },
-    });
-    const sessionKey = 'session:v2:feishu:group:oc_direct_race';
-    try {
-      await (bot as any).onMessage({});
-      assert.equal(bot.messageQueue.get(sessionKey)?.[0]?.userText, 'direct racing user text');
-      assert.deepEqual(sentTexts, []);
-
-      await (bot as any).drainMessageQueue(sessionKey);
-      assert.equal(bot.messageQueue.has(sessionKey), false);
-      assert.deepEqual(sentTexts, ['模型请求超时。']);
-    } finally {
-      SubAgentManager.getInstance().unregisterPlatformCallbacks(sessionKey);
-    }
-  });
-
-  test('sends a queued classified failure exactly once', async () => {
-    const sentTexts: string[] = [];
-    const bot = createHarness({
-      busy: true,
-      sentTexts,
-      result: { visibleToUser: true, text: '模型请求参数无效。', taskOutcome: 'failed' },
-      message: {
-        messageId: 'msg-queued-failed', chatId: 'oc_failed', chatType: 'group', senderId: 'ou_failed',
-        text: '@bot 继续', mentionBot: true, msgType: 'text',
-      },
-    });
-    const sessionKey = 'session:v2:feishu:group:oc_failed';
-    try {
-      await (bot as any).onMessage({});
-      bot.sessionBusy = false;
-      await (bot as any).drainMessageQueue(sessionKey);
-      assert.deepEqual(sentTexts, ['模型请求参数无效。']);
-    } finally {
-      SubAgentManager.getInstance().unregisterPlatformCallbacks(sessionKey);
-    }
-  });
-
-  test('sends a subagent classified failure exactly once', async () => {
-    const sentTexts: string[] = [];
-    const bot = createHarness({
-      sentTexts,
-      runtimeResult: { visibleToUser: true, text: '模型服务暂时不可用。', taskOutcome: 'failed' },
-      message: {
-        messageId: 'unused', chatId: 'private', chatType: 'p2p', senderId: 'private',
-        text: 'unused', mentionBot: false, msgType: 'text',
-      },
-    });
-    await (bot as any).handleSubAgentFeedback(
-      'session:v2:feishu:p2p:private',
-      'private',
-      'private',
-      'subagent result',
-    );
-    assert.deepEqual(sentTexts, ['模型服务暂时不可用。']);
-  });
-
-  test('queues busy subagent feedback and later sends its classified failure once', async () => {
-    const sentTexts: string[] = [];
-    const bot = createHarness({
-      busy: true,
-      sentTexts,
-      runtimeResult: { visibleToUser: true, text: '模型超时，请稍后重试。', taskOutcome: 'failed' },
-      message: { messageId: 'unused', chatId: 'private', chatType: 'p2p', senderId: 'private', text: '', mentionBot: false, msgType: 'text' },
-    });
-    const sessionKey = 'session:v2:feishu:p2p:private';
-    await (bot as any).handleSubAgentFeedback(sessionKey, 'private', 'private', 'subagent result');
-    assert.equal(bot.messageQueue.get(sessionKey)?.[0]?.source, 'subagent_feedback');
-    bot.sessionBusy = false;
-    await (bot as any).drainMessageQueue(sessionKey);
-    assert.deepEqual(sentTexts, ['模型超时，请稍后重试。']);
-  });
-
-  test('requeues a racing BUSY subagent result and sends the later failure once', async () => {
-    const sentTexts: string[] = [];
-    const bot = createHarness({
-      sentTexts,
-      runtimeResults: [
-        { visibleToUser: true, text: BUSY_MESSAGE },
-        { visibleToUser: true, text: '模型权限不足。', taskOutcome: 'failed' },
-      ],
-      message: { messageId: 'unused', chatId: 'private', chatType: 'p2p', senderId: 'private', text: '', mentionBot: false, msgType: 'text' },
-    });
-    const sessionKey = 'session:v2:feishu:p2p:private';
-    await (bot as any).handleSubAgentFeedback(sessionKey, 'private', 'private', 'subagent result');
-    assert.equal(bot.messageQueue.get(sessionKey)?.[0]?.source, 'subagent_feedback');
-    await (bot as any).drainMessageQueue(sessionKey);
-    assert.deepEqual(sentTexts, ['模型权限不足。']);
-  });
-
-
-  test('requeues a racing BUSY queued user message and sends the later failure once', async () => {
-    const sentTexts: string[] = [];
-    const bot = createHarness({
-      sentTexts,
-      results: [
-        { visibleToUser: true, text: BUSY_MESSAGE },
-        { visibleToUser: true, text: '模型请求超时。', taskOutcome: 'failed' },
-      ],
-      message: { messageId: 'queued-race', chatId: 'oc_race', chatType: 'group', senderId: 'ou_race', text: 'queued user text', mentionBot: true, msgType: 'text' },
-    });
-    const sessionKey = 'session:v2:feishu:group:oc_race';
-    bot.sessionBusy = true;
-    try {
-      await (bot as any).onMessage({});
-      bot.sessionBusy = false;
-      await (bot as any).drainMessageQueue(sessionKey);
-      assert.equal(bot.messageQueue.get(sessionKey)?.length, 1);
-      assert.equal(bot.messageQueue.get(sessionKey)?.[0]?.userText, 'queued user text');
-      assert.deepEqual(sentTexts, []);
-
-      await (bot as any).drainMessageQueue(sessionKey);
-      assert.equal(bot.messageQueue.has(sessionKey), false);
-      assert.deepEqual(sentTexts, ['模型请求超时。']);
-    } finally {
-      SubAgentManager.getInstance().unregisterPlatformCallbacks(sessionKey);
-    }
-  });
-
-
-  test('delivers classified failed replies without relying on the legacy fallback text', async () => {
-    const bot = createHarness({
-      message: {
-        messageId: 'msg-error',
-        chatId: 'shared',
-        chatType: 'p2p',
-        senderId: 'shared',
-        text: '继续',
-        mentionBot: false,
-        msgType: 'text',
-      },
-    });
-    bot.sessionResult = {
-      visibleToUser: true,
-      text: '模型服务暂时不可用，请稍后再试。',
-      taskOutcome: 'failed',
-    };
-
-    try {
-      await (bot as any).onMessage({});
-
-      assert.deepEqual(bot.replies, [
-        { chatId: 'shared', text: '模型服务暂时不可用，请稍后再试。' },
-      ]);
-    } finally {
-      SubAgentManager.getInstance().unregisterPlatformCallbacks('session:v2:feishu:p2p:shared');
-    }
-  });
 });
 
-function createHarness(options: {
-  busy?: boolean;
-  message: any;
-  result?: any;
-  results?: any[];
-  runtimeResult?: any;
-  runtimeResults?: any[];
-  sentTexts?: string[];
-}): any {
+function createHarness(options: { busy?: boolean; message: any }): any {
   const bot = Object.create(FeishuBot.prototype) as any;
   bot.sessionBusy = options.busy ?? false;
   bot.createdSessions = [] as string[];
   bot.handledTurns = [] as any[];
-  bot.replies = [] as Array<{ chatId: string; text: string }>;
-  bot.sessionResult = { visibleToUser: false, text: '' };
   bot.processedMsgIds = new Set();
   bot.pendingAttachments = new Map();
   bot.messageQueue = new Map();
@@ -276,11 +88,11 @@ function createHarness(options: {
     handleCommand: async () => ({ handled: false }),
     handleMessage: async (userText: string, handleOptions: any) => {
       bot.handledTurns.push({ userText, options: handleOptions });
-      return options.results?.shift() ?? options.result ?? bot.sessionResult;
+      return { visibleToUser: false, text: '' };
     },
     handleRuntimeObservation: async (userText: string, handleOptions: any) => {
       bot.handledTurns.push({ userText, options: handleOptions });
-      return options.runtimeResults?.shift() ?? options.runtimeResult ?? { visibleToUser: false, text: '' };
+      return { visibleToUser: false, text: '' };
     },
   };
   bot.sessionManager = {
@@ -290,10 +102,7 @@ function createHarness(options: {
     },
   };
   bot.sender = {
-    reply: async (chatId: string, text: string) => {
-      options.sentTexts?.push(text);
-      bot.replies.push({ chatId, text });
-    },
+    reply: async () => undefined,
     downloadFile: async () => null,
     fetchMergeForwardTexts: async () => '',
     sendFile: async () => undefined,

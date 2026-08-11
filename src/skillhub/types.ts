@@ -15,11 +15,6 @@ export interface SkillHubAuthState {
   authenticated: boolean;
   baseUrl: string;
   user?: SkillHubUser;
-  catsCo?: {
-    uid?: string;
-    username?: string;
-    displayName?: string;
-  };
   roles: string[];
   permissions: string[];
   developerProfile?: any;

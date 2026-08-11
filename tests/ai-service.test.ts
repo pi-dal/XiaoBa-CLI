@@ -3,7 +3,6 @@ import * as assert from 'node:assert';
 import { AIService } from '../src/utils/ai-service';
 import type { ChatResponse } from '../src/types';
 import type { StreamCallbacks } from '../src/providers/provider';
-import { readModelErrorDiagnostics } from '../src/utils/model-error-observability';
 
 const originalStreamRetry = process.env.GAUZ_STREAM_RETRY;
 const originalRetryMaxRetries = process.env.CATSCO_MODEL_RETRY_MAX_RETRIES;
@@ -90,33 +89,6 @@ test('AIService retries transient stream errors before any text is emitted', asy
   assert.deepStrictEqual(chunks, ['ok']);
 });
 
-test('AIService can disable retries for a bounded stream request', async () => {
-  const service = createTestService();
-  let attempts = 0;
-  (service as any).provider = {
-    chat: async () => ({ content: null }),
-    chatStream: async () => {
-      attempts += 1;
-      if (attempts === 1) {
-        throw Object.assign(new Error('rate limited'), {
-          response: {
-            status: 429,
-            headers: { 'retry-after': '0' },
-            data: { message: 'rate limited' },
-          },
-        });
-      }
-      return { content: 'would have retried' };
-    },
-  };
-
-  await assert.rejects(
-    () => service.chatStream([], undefined, undefined, { retryMode: 'none' }),
-    /429/,
-  );
-  assert.equal(attempts, 1);
-});
-
 test('AIService can keep retrying transient stream failures beyond the old short cap', async () => {
   process.env.CATSCO_MODEL_RETRY_MAX_RETRIES = '5';
   const service = createTestService();
@@ -129,7 +101,7 @@ test('AIService can keep retrying transient stream failures beyond the old short
       if (attempts <= 4) {
         throw Object.assign(new Error(`temporary stream failure ${attempts}`), {
           response: {
-            status: 500,
+            status: 503,
             headers: { 'retry-after': '0' },
             data: { message: 'temporary stream failure' },
           },
@@ -187,43 +159,6 @@ test('AIService does not retry stream errors after visible text is emitted', asy
   assert.equal(errors.length, 1);
   assert.deepStrictEqual(retries, []);
   assert.deepStrictEqual(chunks, ['partial']);
-});
-
-test('AIService retries buffered stream failures without publishing abandoned text', async () => {
-  process.env.CATSCO_MODEL_RETRY_MAX_RETRIES = '1';
-  const service = createTestService();
-  (service as any).config.openaiApiMode = 'responses';
-  let attempts = 0;
-  const finalResponse: ChatResponse = { content: 'recovered' };
-  (service as any).provider = {
-    chat: async () => ({ content: null }),
-    chatStream: async (_messages: unknown, _tools: unknown, callbacks?: StreamCallbacks) => {
-      attempts += 1;
-      callbacks?.onText?.(attempts === 1 ? 'abandoned draft' : 'recovered');
-      if (attempts === 1) {
-        throw Object.assign(new Error('stream interrupted'), {
-          code: 'stream_read_error',
-          error: { code: 'stream_read_error', type: 'stream_error' },
-        });
-      }
-      return finalResponse;
-    },
-  };
-  (service as any).sleepWithAbort = async () => {};
-
-  const chunks: string[] = [];
-  const retries: number[] = [];
-  const result = await service.chatStream([], undefined, {
-    onText: text => chunks.push(text),
-    onRetry: attempt => retries.push(attempt),
-  }, {
-    streamOutputMode: 'buffered',
-  });
-
-  assert.equal(result, finalResponse);
-  assert.equal(attempts, 2);
-  assert.deepStrictEqual(chunks, ['recovered']);
-  assert.deepStrictEqual(retries, [1]);
 });
 
 test('AIService still honors explicit full stream retry opt-in', async () => {
@@ -432,72 +367,6 @@ test('AIService still retries transient load balancer failures', async () => {
   assert.equal(attempts, 2);
 });
 
-test('AIService retries Responses semantic transient codes and types', async () => {
-  const semanticFailures = [
-    { code: 'stream_read_error' },
-    { code: 'upstream_error' },
-    { type: 'server_is_overloaded' },
-    { type: 'service_unavailable_error' },
-  ];
-
-  for (const semantic of semanticFailures) {
-    process.env.CATSCO_MODEL_RETRY_MAX_RETRIES = '1';
-    const service = createTestService();
-    (service as any).config.openaiApiMode = 'responses';
-    let attempts = 0;
-    (service as any).provider = {
-      chat: async () => {
-        attempts += 1;
-        if (attempts === 1) {
-          throw Object.assign(new Error('semantic provider failure'), {
-            ...semantic,
-            error: { ...semantic, message: 'semantic provider failure' },
-          });
-        }
-        return { content: 'ok' };
-      },
-      chatStream: async () => ({ content: null }),
-    };
-    (service as any).sleepWithAbort = async () => {};
-
-    const result = await service.chat([]);
-    assert.equal(result.content, 'ok');
-    assert.equal(attempts, 2, JSON.stringify(semantic));
-  }
-});
-
-test('AIService guarantees one recovery attempt after a first 504 exhausts the retry window', () => {
-  process.env.CATSCO_MODEL_RETRY_MAX_RETRIES = '14';
-  process.env.CATSCO_MODEL_RETRY_MAX_MS = '1000';
-  const service = createTestService();
-  (service as any).config.openaiApiMode = 'responses';
-  const gatewayTimeout = Object.assign(new Error('gateway timeout'), { status: 504 });
-  const policy = (service as any).resolveRetryPolicy(gatewayTimeout);
-
-  assert.equal(policy.maxRetries, 1);
-  assert.equal(policy.guaranteedRetries, 1);
-  assert.equal(
-    (service as any).resolveRetryStopReason(gatewayTimeout, 1, policy, 300_000),
-    undefined,
-  );
-  assert.equal(
-    (service as any).resolveRetryStopReason(gatewayTimeout, 2, policy, 301_000),
-    'retry_limit_exhausted',
-  );
-  assert.ok((service as any).resolveRetryDelayMs(gatewayTimeout, 1, policy, 300_000) > 0);
-});
-
-test('AIService bounds Responses gateway retries without changing other API modes', () => {
-  process.env.CATSCO_MODEL_RETRY_MAX_RETRIES = '14';
-  const responsesService = createTestService();
-  (responsesService as any).config.openaiApiMode = 'responses';
-  const chatCompletionsService = createTestService();
-  const unavailable = Object.assign(new Error('service unavailable'), { status: 503 });
-
-  assert.equal((responsesService as any).resolveRetryPolicy(unavailable).maxRetries, 2);
-  assert.equal((chatCompletionsService as any).resolveRetryPolicy(unavailable).maxRetries, 14);
-});
-
 test('AIService uses a short retry policy for likely custom endpoint configuration errors', () => {
   process.env.CATSCO_MODEL_RETRY_MAX_RETRIES = '10';
   process.env.CATSCO_MODEL_RETRY_MAX_MS = String(5 * 60 * 1000);
@@ -586,147 +455,6 @@ test('AIService cancels before provider call when signal is already aborted', as
     /请求已取消/,
   );
   assert.equal(called, false);
-});
-
-test('AIService preserves provider fields and non-retryable stop reason on wrapped errors', async () => {
-  const service = createTestService();
-  const rawError = Object.assign(new Error('Request failed with status code 422'), {
-    response: {
-      status: 422,
-      data: {
-        request_id: 'req_schema_1',
-        error: {
-          code: 'invalid_tool_schema',
-          type: 'invalid_request_error',
-          message: 'tool schema is invalid',
-        },
-      },
-    },
-  });
-  (service as any).provider = {
-    chat: async () => { throw rawError; },
-    chatStream: async () => ({ content: 'unused' }),
-  };
-
-  let wrapped: unknown;
-  const attemptEvents: any[] = [];
-  try {
-    await service.chat([], undefined, {
-      modelAttemptSink: { observe: event => { attemptEvents.push(event); } },
-      modelAttemptContext: { episodeId: 'episode-ai-service' },
-    });
-  } catch (error) {
-    wrapped = error;
-  }
-
-  const diagnostics = readModelErrorDiagnostics(wrapped);
-  assert.equal((wrapped as any).status, 422);
-  assert.equal(diagnostics?.provider, 'openai');
-  assert.equal(diagnostics?.model, 'primary-model');
-  assert.equal(diagnostics?.phase, 'model_request');
-  assert.equal(diagnostics?.provider_code, 'invalid_tool_schema');
-  assert.equal(diagnostics?.provider_type, 'invalid_request_error');
-  assert.match(diagnostics?.request_id || '', /^request_[a-f0-9]{12}$/);
-  assert.notEqual(diagnostics?.request_id, 'req_schema_1');
-  assert.equal(diagnostics?.retry?.attempt_count, 1);
-  assert.equal(diagnostics?.retry?.retry_count, 0);
-  assert.equal(diagnostics?.retry?.stop_reason, 'non_retryable');
-  assert.equal(diagnostics?.attempt?.call_id, attemptEvents[1].callId);
-  assert.equal(diagnostics?.attempt?.attempt_id, attemptEvents[1].attemptId);
-  assert.equal(diagnostics?.attempt?.attempt_number, 1);
-  assert.equal(diagnostics?.attempt?.episode_id, 'episode-ai-service');
-});
-
-test('AIService records retry exhaustion on the final wrapped error', async () => {
-  process.env.CATSCO_MODEL_RETRY_MAX_RETRIES = '1';
-  const service = createTestService();
-  let attempts = 0;
-  (service as any).sleepWithAbort = async () => undefined;
-  (service as any).provider = {
-    chat: async () => {
-      attempts += 1;
-      throw Object.assign(new Error('temporary upstream failure'), {
-        response: {
-          status: 503,
-          headers: { 'retry-after': '0' },
-          data: { error: { type: 'overloaded_error', message: 'temporary upstream failure' } },
-        },
-      });
-    },
-    chatStream: async () => ({ content: 'unused' }),
-  };
-
-  let wrapped: unknown;
-  try {
-    await service.chat([]);
-  } catch (error) {
-    wrapped = error;
-  }
-
-  const diagnostics = readModelErrorDiagnostics(wrapped);
-  assert.equal(attempts, 2);
-  assert.equal(diagnostics?.retry?.attempt_count, 2);
-  assert.equal(diagnostics?.retry?.retry_count, 1);
-  assert.equal(diagnostics?.retry?.max_retries, 1);
-  assert.equal(diagnostics?.retry?.stop_reason, 'retry_limit_exhausted');
-});
-
-test('AIService records when stream output prevents an otherwise retryable request', async () => {
-  const service = createTestService();
-  (service as any).provider = {
-    chat: async () => ({ content: 'unused' }),
-    chatStream: async (_messages: unknown, _tools: unknown, callbacks?: StreamCallbacks) => {
-      callbacks?.onText?.('partial response');
-      throw Object.assign(new Error('upstream disconnected'), {
-        response: { status: 503, data: { message: 'upstream disconnected' } },
-      });
-    },
-  };
-
-  let wrapped: unknown;
-  try {
-    await service.chatStream([], undefined, { onText: () => undefined });
-  } catch (error) {
-    wrapped = error;
-  }
-
-  const diagnostics = readModelErrorDiagnostics(wrapped);
-  assert.equal(diagnostics?.retry?.attempt_count, 1);
-  assert.equal(diagnostics?.retry?.retry_count, 0);
-  assert.equal(diagnostics?.retry?.stop_reason, 'stream_output_started');
-});
-
-
-test('AIService safely wraps a provider error with hostile getters', async () => {
-  process.env.CATSCO_MODEL_RETRY_MAX_RETRIES = '0';
-  const service = createTestService();
-  const hostile = new Proxy(Object.freeze({}), {
-    get(_target, property) {
-      if (property === 'message' || property === 'response' || property === 'error'
-        || property === 'cause' || property === 'code' || property === 'name'
-        || property === 'status' || property === 'headers') {
-        throw new Error(`hostile getter: ${String(property)}`);
-      }
-      return undefined;
-    },
-    getPrototypeOf() {
-      throw new Error('hostile prototype');
-    },
-  });
-  (service as any).provider = {
-    chat: async () => { throw hostile; },
-    chatStream: async () => { throw hostile; },
-  };
-
-  await assert.rejects(
-    () => service.chat([]),
-    (error: unknown) => {
-      assert.ok(error instanceof Error);
-      assert.match(error.message, /^请求失败:/);
-      assert.doesNotMatch(error.message, /hostile getter|hostile prototype/);
-      return true;
-    },
-  );
 });
 
 function createTestService(): AIService {

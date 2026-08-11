@@ -1,29 +1,12 @@
 import { Message, ChatConfig, ChatResponse } from '../types';
 import { ConfigManager } from './config';
 import { ToolDefinition } from '../types/tool';
-import {
-  AIProvider,
-  AIRequestOptions,
-  ModelAttemptEvent,
-  ModelAttemptSink,
-  ModelAttemptStopReason,
-  StreamCallbacks,
-  StreamRetryInfo,
-} from '../providers/provider';
+import { AIProvider, AIRequestOptions, StreamCallbacks, StreamRetryInfo } from '../providers/provider';
 import { AnthropicProvider } from '../providers/anthropic-provider';
 import { OpenAIProvider } from '../providers/openai-provider';
-import {
-  prepareProviderRequestMessages,
-  type ProviderRequestPreflightSummary,
-} from '../providers/request-preflight';
 import { Logger } from './logger';
 import { isPrimaryModelToolCallingCapable } from './model-capabilities';
 import { resolveModelContextWindow } from './model-context-window';
-import {
-  attachModelErrorDiagnostics,
-  attachRetrySummary,
-  captureModelErrorDiagnostics,
-} from './model-error-observability';
 
 /**
  * AI 服务 - 统一的 AI 调用入口
@@ -45,45 +28,6 @@ const EMPTY_RESPONSE_ERROR_CODE = 'EMPTY_MODEL_RESPONSE';
 const EMPTY_RESPONSE_MAX_RETRIES = 2;
 const EMPTY_RESPONSE_MAX_ELAPSED_MS = 2 * 60 * 1000;
 const EMPTY_RESPONSE_MAX_DELAY_MS = 2000;
-function safeErrorProperty(value: unknown, property: PropertyKey): unknown {
-  if (value === null || value === undefined || (typeof value !== 'object' && typeof value !== 'function')) {
-    return undefined;
-  }
-  try {
-    return Reflect.get(value, property);
-  } catch {
-    return undefined;
-  }
-}
-
-function safeErrorPath(value: unknown, ...properties: PropertyKey[]): unknown {
-  let current = value;
-  for (const property of properties) {
-    current = safeErrorProperty(current, property);
-    if (current === undefined || current === null) return current;
-  }
-  return current;
-}
-
-function safeErrorString(value: unknown, fallback = ''): string {
-  if (typeof value === 'string') return value;
-  if (typeof value === 'number' || typeof value === 'boolean' || typeof value === 'bigint') return String(value);
-  try {
-    return String(value ?? fallback);
-  } catch {
-    return fallback;
-  }
-}
-const TRANSIENT_PROVIDER_CODES = new Set([
-  'stream_read_error',
-  'upstream_error',
-  'server_is_overloaded',
-  'service_unavailable_error',
-]);
-const RESPONSES_TRANSIENT_MAX_RETRIES = 2;
-const TRANSIENT_HTTP_MAX_RETRIES = 2;
-const GATEWAY_TIMEOUT_MAX_RETRIES = 1;
-let modelAttemptCallSequence = 0;
 
 type ProviderKind = 'openai' | 'anthropic';
 
@@ -92,17 +36,6 @@ interface RetryPolicy {
   maxElapsedMs: number;
   baseDelayMs: number;
   maxDelayMs: number;
-  guaranteedRetries: number;
-}
-
-interface ModelAttemptRun {
-  callId: string;
-  sink?: ModelAttemptSink;
-  context?: AIRequestOptions['modelAttemptContext'];
-  messages: readonly Message[];
-  tools: readonly ToolDefinition[];
-  stream: boolean;
-  preflight?: ProviderRequestPreflightSummary;
 }
 
 export class AIService {
@@ -178,14 +111,11 @@ export class AIService {
       throw new Error('API密钥未配置。请先运行: catsco config');
     }
 
-    const prepared = this.prepareProviderRequest(messages);
     try {
       return await this.withRetry(
-        async () => this.requireUsableResponse(await this.provider.chat(prepared.messages, tools, options)),
+        async () => this.requireUsableResponse(await this.provider.chat(messages, tools, options)),
         undefined,
         options.signal,
-        options.retryMode === 'none' ? () => false : undefined,
-        this.createModelAttemptRun(prepared.messages, tools, false, options, prepared.summary),
       );
     } catch (error: any) {
       throw this.wrapError(error);
@@ -208,42 +138,19 @@ export class AIService {
     }
 
     const allowStreamRetry = process.env.GAUZ_STREAM_RETRY === 'true';
-    const prepared = this.prepareProviderRequest(messages);
-    const supportsBufferedRecovery = this.isResponsesMode();
-    const streamOutputMode = supportsBufferedRecovery
-      ? options.streamOutputMode ?? (callbacks?.onText ? 'live' : 'buffered')
-      : 'live';
-    let hasObservedText = false;
-    let hasDeliveredText = false;
+    let hasStreamedText = false;
+    const providerCallbacks = this.createProviderStreamCallbacks(callbacks, () => {
+      hasStreamedText = true;
+    });
 
     try {
       const result = await this.withRetry(
-        async () => {
-          const bufferedChunks: string[] = [];
-          const providerCallbacks = this.createProviderStreamCallbacks(text => {
-            hasObservedText = true;
-            if (streamOutputMode === 'buffered') {
-              bufferedChunks.push(text);
-              return;
-            }
-            if (callbacks?.onText) {
-              callbacks.onText(text);
-              hasDeliveredText = true;
-            }
-          });
-          const response = this.requireUsableResponse(
-            await this.provider.chatStream(prepared.messages, tools, providerCallbacks, options),
-          );
-          if (streamOutputMode === 'buffered' && bufferedChunks.length > 0) {
-            callbacks?.onText?.(bufferedChunks.join(''));
-          }
-          return response;
-        },
+        async () => this.requireUsableResponse(
+          await this.provider.chatStream(messages, tools, providerCallbacks, options),
+        ),
         callbacks,
         options.signal,
-        () => options.retryMode !== 'none'
-          && (allowStreamRetry || (supportsBufferedRecovery ? !hasDeliveredText : !hasObservedText)),
-        this.createModelAttemptRun(prepared.messages, tools, true, options, prepared.summary),
+        () => allowStreamRetry || !hasStreamedText,
       );
       callbacks?.onComplete?.(result);
       return result;
@@ -254,30 +161,17 @@ export class AIService {
     }
   }
 
-  private createProviderStreamCallbacks(onText?: (text: string) => void): StreamCallbacks | undefined {
-    if (!onText) {
+  private createProviderStreamCallbacks(callbacks?: StreamCallbacks, onTextObserved?: () => void): StreamCallbacks | undefined {
+    if (!callbacks) {
       return undefined;
     }
 
     return {
       onText: (text: string) => {
-        if (text) onText(text);
+        if (text) onTextObserved?.();
+        callbacks.onText?.(text);
       },
     };
-  }
-
-  private prepareProviderRequest(messages: Message[]): ReturnType<typeof prepareProviderRequestMessages> {
-    const prepared = prepareProviderRequestMessages(messages);
-    if (prepared.summary) {
-      Logger.warning(
-        `Provider request preflight repaired message structure: issues=${prepared.summary.issueCodes.join(',')}`
-        + ` dropped_messages=${prepared.summary.droppedMessages}`
-        + ` dropped_tool_calls=${prepared.summary.droppedToolCalls}`
-        + ` dropped_tool_results=${prepared.summary.droppedToolResults}`
-        + ` replay_fallbacks=${prepared.summary.providerReplayFallbacks}`,
-      );
-    }
-    return prepared;
   }
 
   private requireUsableResponse(response: ChatResponse): ChatResponse {
@@ -316,32 +210,14 @@ export class AIService {
 
     const status = this.extractStatus(error);
     const errorMessage = this.extractErrorMessage(error);
-    const diagnostics = captureModelErrorDiagnostics(error, {
-      provider,
-      model,
-      phase: 'model_request',
-    });
 
     const wrapped = status
       ? new Error(`API错误 (${status}): ${errorMessage}`)
       : new Error(`请求失败: ${errorMessage}`);
-    if (status) {
-      (wrapped as Error & { status?: number }).status = status;
-    }
     const code = this.extractErrorCode(error);
     if (code) {
       (wrapped as Error & { code?: string }).code = code;
     }
-    try {
-      Object.defineProperty(wrapped, 'cause', {
-        value: error,
-        configurable: true,
-        enumerable: false,
-      });
-    } catch {
-      // Older runtimes may expose a non-configurable cause property.
-    }
-    attachModelErrorDiagnostics(wrapped, diagnostics);
     return wrapped;
   }
 
@@ -351,10 +227,6 @@ export class AIService {
   private isRetryable(error: any): boolean {
     if (this.isAbortError(error)) {
       return false;
-    }
-
-    if (this.isResponsesMode() && this.isSemanticTransientProviderError(error)) {
-      return true;
     }
 
     if (this.isKnownNonRetryableProviderError(error)) {
@@ -387,7 +259,7 @@ export class AIService {
       return true;
     }
 
-    const message = safeErrorString(safeErrorProperty(error, 'message'));
+    const message = String(error?.message || '');
     const hasRetryableStatusText =
       /(?:API错误|HTTP|status(?:\s*code)?|response status)\s*[\(:= ]\s*(?:408|429|500|502|503|504|520|524|529)\b/i.test(message)
       || /^\s*(?:408|429|500|502|503|504|520|524|529)\b/.test(message);
@@ -399,7 +271,7 @@ export class AIService {
     }
 
     // Anthropic SDK overloaded_error
-    if (safeErrorPath(error, 'error', 'type') === 'overloaded_error') {
+    if (error?.error?.type === 'overloaded_error') {
       return true;
     }
 
@@ -413,51 +285,29 @@ export class AIService {
     }
 
     const message = [
-      safeErrorPath(error, 'response', 'data', 'error', 'code'),
-      safeErrorPath(error, 'response', 'data', 'error', 'type'),
-      safeErrorPath(error, 'response', 'data', 'error', 'message'),
-      safeErrorPath(error, 'response', 'data', 'message'),
-      safeErrorPath(error, 'error', 'code'),
-      safeErrorPath(error, 'error', 'type'),
-      safeErrorPath(error, 'error', 'message'),
-      safeErrorProperty(error, 'message'),
-    ].filter(Boolean).map(value => safeErrorString(value)).join(' ');
+      error?.response?.data?.error?.code,
+      error?.response?.data?.error?.type,
+      error?.response?.data?.error?.message,
+      error?.response?.data?.message,
+      error?.error?.code,
+      error?.error?.type,
+      error?.error?.message,
+      error?.message,
+    ].filter(Boolean).join(' ');
 
     return /insufficient[_\s-]?quota|quota[_\s-]?exceeded|billing|(?:insufficient|low|exhausted)[_\s-]?(?:credit|balance)|(?:credit|balance)[_\s-]?(?:exhausted|insufficient|too low)|账户余额|余额不足|额度不足|额度已用尽|context length|maximum context|max(?:imum)? tokens?|prompt too long|invalid[_\s-]?request|invalid[_\s-]?api[_\s-]?key|unauthorized|forbidden|permission denied|model .*not found|model_not_found|tool schema|schema is invalid|content policy|safety/i
       .test(message);
-  }
-
-  private isSemanticTransientProviderError(error: any): boolean {
-    return this.extractProviderSemanticCodes(error)
-      .some(code => TRANSIENT_PROVIDER_CODES.has(code));
-  }
-
-  private extractProviderSemanticCodes(error: any): string[] {
-    return [
-      error?.providerCode,
-      error?.providerType,
-      error?.response?.data?.error?.code,
-      error?.response?.data?.error?.type,
-      error?.response?.data?.code,
-      error?.response?.data?.type,
-      error?.error?.code,
-      error?.error?.type,
-      error?.code,
-      error?.type,
-    ]
-      .filter(value => typeof value === 'string' && value.trim())
-      .map(value => String(value).trim().toLowerCase());
   }
 
   /**
    * 从错误中提取 HTTP 状态码
    */
   private extractStatus(error: any): number | null {
-    const status = safeErrorPath(error, 'response', 'status') || safeErrorProperty(error, 'status');
+    const status = error?.response?.status || error?.status;
     if (typeof status === 'number') {
       return status;
     }
-    const text = safeErrorString(safeErrorProperty(error, 'message'), safeErrorString(error));
+    const text = String(error?.message || error || '');
     const match = text.match(/(?:API错误|HTTP|status(?:\s*code)?)\s*[\(:= ]\s*(\d{3})\b/i);
     if (match) {
       const parsed = Number(match[1]);
@@ -470,14 +320,12 @@ export class AIService {
    * 从错误中提取 Retry-After 头（秒）
    */
   private getRetryAfter(error: any): number | null {
-    const retryAfter = safeErrorPath(error, 'response', 'headers', 'retry-after')
-      || safeErrorPath(error, 'headers', 'retry-after');
+    const retryAfter = error?.response?.headers?.['retry-after'] || error?.headers?.['retry-after'];
     if (retryAfter) {
-      const retryAfterText = safeErrorString(retryAfter);
-      const seconds = parseInt(retryAfterText, 10);
+      const seconds = parseInt(retryAfter, 10);
       if (!isNaN(seconds)) return seconds;
 
-      const dateMs = Date.parse(retryAfterText);
+      const dateMs = Date.parse(String(retryAfter));
       if (Number.isFinite(dateMs)) {
         return Math.max(0, Math.ceil((dateMs - Date.now()) / 1000));
       }
@@ -493,101 +341,41 @@ export class AIService {
     callbacks?: StreamCallbacks,
     signal?: AbortSignal,
     shouldRetry?: (error: any, attempt: number) => boolean,
-    attemptRun?: ModelAttemptRun,
   ): Promise<T> {
+    let lastError: any;
+    const policy = this.resolveRetryPolicy();
     const startedAt = Date.now();
 
     for (let attempt = 0; ; attempt++) {
-      this.throwIfAborted(signal);
-      const attemptStartedAt = Date.now();
-      const attemptNumber = attempt + 1;
-      this.emitModelAttempt(attemptRun, attemptNumber, {
-        outcome: 'started',
-      });
       try {
-        const result = await fn();
-        this.emitModelAttempt(attemptRun, attemptNumber, {
-          outcome: 'succeeded',
-          durationMs: Date.now() - attemptStartedAt,
-          response: result as ChatResponse,
-        });
-        return result;
+        this.throwIfAborted(signal);
+        return await fn();
       } catch (error: any) {
+        lastError = error;
+
         if (this.isAbortError(error) || signal?.aborted) {
-          const policy = this.resolveRetryPolicy(error);
-          this.emitModelAttempt(attemptRun, attemptNumber, {
-            outcome: 'cancelled',
-            durationMs: Date.now() - attemptStartedAt,
-            error,
-            retry: {
-              retryNumber: attempt,
-              maxRetries: policy.maxRetries,
-              elapsedMs: Date.now() - startedAt,
-              maxElapsedMs: policy.maxElapsedMs,
-              stopReason: 'aborted',
-            },
-          });
           throw this.createAbortError();
         }
 
         const policy = this.resolveRetryPolicy(error);
         const retryAttempt = attempt + 1;
+        if (
+          retryAttempt > policy.maxRetries
+          || !this.isRetryable(error)
+          || shouldRetry?.(error, retryAttempt) === false
+        ) {
+          throw error;
+        }
+
         const elapsedMs = Date.now() - startedAt;
-        const stopReason = this.resolveRetryStopReason(
-          error,
-          retryAttempt,
-          policy,
-          elapsedMs,
-          shouldRetry,
-        );
-        if (stopReason) {
-          attachRetrySummary(error, {
-            attempt_count: attemptNumber,
-            retry_count: attempt,
-            max_retries: policy.maxRetries,
-            elapsed_ms: elapsedMs,
-            max_elapsed_ms: policy.maxElapsedMs,
-            stop_reason: stopReason,
-          }, {
-            call_id: attemptRun?.callId,
-            attempt_id: attemptRun ? `${attemptRun.callId}:${attemptNumber}` : undefined,
-            attempt_number: attemptRun ? attemptNumber : undefined,
-            episode_id: attemptRun?.context?.episodeId,
-          });
-          this.emitModelAttempt(attemptRun, attemptNumber, {
-            outcome: 'failed',
-            durationMs: Date.now() - attemptStartedAt,
-            error,
-            retry: {
-              retryNumber: attempt,
-              maxRetries: policy.maxRetries,
-              elapsedMs,
-              maxElapsedMs: policy.maxElapsedMs,
-              stopReason,
-            },
-          });
+        if (elapsedMs >= policy.maxElapsedMs) {
           throw error;
         }
 
         // 计算等待时间：优先用 Retry-After，否则指数退避
         const delay = this.resolveRetryDelayMs(error, retryAttempt, policy, elapsedMs);
-        this.emitModelAttempt(attemptRun, attemptNumber, {
-          outcome: 'retrying',
-          durationMs: Date.now() - attemptStartedAt,
-          error,
-          retry: {
-            retryNumber: retryAttempt,
-            maxRetries: policy.maxRetries,
-            delayMs: delay,
-            elapsedMs,
-            maxElapsedMs: policy.maxElapsedMs,
-          },
-        });
 
-        const status = this.extractStatus(error)
-          || this.extractErrorCode(error)
-          || this.extractProviderSemanticCodes(error)[0]
-          || 'unknown';
+        const status = this.extractStatus(error) || this.extractErrorCode(error) || 'unknown';
         const retryInfo: StreamRetryInfo = {
           attempt: retryAttempt,
           maxRetries: policy.maxRetries,
@@ -607,86 +395,8 @@ export class AIService {
         await this.sleepWithAbort(delay, signal);
       }
     }
-  }
 
-  private resolveRetryStopReason(
-    error: any,
-    retryAttempt: number,
-    policy: RetryPolicy,
-    elapsedMs: number,
-    shouldRetry?: (error: any, attempt: number) => boolean,
-  ): ModelAttemptStopReason | undefined {
-    if (!this.isRetryable(error)) return 'non_retryable';
-    if (shouldRetry?.(error, retryAttempt) === false) return 'stream_output_started';
-    if (retryAttempt > policy.maxRetries) return 'retry_limit_exhausted';
-    if (elapsedMs >= policy.maxElapsedMs && retryAttempt > policy.guaranteedRetries) {
-      return 'retry_window_exhausted';
-    }
-    return undefined;
-  }
-
-  private createModelAttemptRun(
-    messages: readonly Message[],
-    tools: readonly ToolDefinition[] | undefined,
-    stream: boolean,
-    options: AIRequestOptions,
-    preflight?: ProviderRequestPreflightSummary,
-  ): ModelAttemptRun | undefined {
-    if (!options.modelAttemptSink) return undefined;
-    modelAttemptCallSequence = (modelAttemptCallSequence + 1) % Number.MAX_SAFE_INTEGER;
-    return {
-      callId: `${Date.now().toString(36)}-${process.pid.toString(36)}-${modelAttemptCallSequence.toString(36)}`,
-      sink: options.modelAttemptSink,
-      context: options.modelAttemptContext ? { ...options.modelAttemptContext } : undefined,
-      messages,
-      tools: tools || [],
-      stream,
-      ...(preflight ? { preflight } : {}),
-    };
-  }
-
-  private emitModelAttempt(
-    run: ModelAttemptRun | undefined,
-    attemptNumber: number,
-    fields: Pick<ModelAttemptEvent, 'outcome'>
-      & Partial<Pick<ModelAttemptEvent, 'durationMs' | 'response' | 'error' | 'retry'>>,
-  ): void {
-    if (!run?.sink) return;
-    const event: ModelAttemptEvent = {
-      schema: 'xiaoba.model_attempt.v1',
-      callId: run.callId,
-      attemptId: `${run.callId}:${attemptNumber}`,
-      attemptNumber,
-      timestamp: new Date().toISOString(),
-      outcome: fields.outcome,
-      provider: this.config.provider as ProviderKind,
-      model: this.config.model || 'unknown',
-      apiType: this.config.provider === 'anthropic'
-        ? 'anthropic-messages'
-        : this.config.openaiApiMode === 'responses'
-          ? 'openai-responses'
-          : 'openai-chat-completions',
-      stream: run.stream,
-      ...(run.context ? { context: run.context } : {}),
-      request: {
-        messages: run.messages,
-        tools: run.tools,
-        ...(run.preflight ? { preflight: run.preflight } : {}),
-      },
-      ...(fields.durationMs === undefined ? {} : { durationMs: fields.durationMs }),
-      ...(fields.response === undefined ? {} : { response: fields.response }),
-      ...(fields.error === undefined ? {} : { error: fields.error }),
-      ...(fields.retry === undefined ? {} : { retry: fields.retry }),
-    };
-
-    try {
-      const result = run.sink.observe(event);
-      if (result && typeof (result as Promise<void>).then === 'function') {
-        Promise.resolve(result).catch(() => undefined);
-      }
-    } catch {
-      // Diagnostics about diagnostics must never affect the provider request.
-    }
+    throw lastError;
   }
 
   private resolveRetryPolicy(error?: any): RetryPolicy {
@@ -710,7 +420,6 @@ export class AIService {
         MAX_CONFIGURABLE_RETRY_DURATION_MS,
       ),
       baseDelayMs: BASE_DELAY_MS,
-      guaranteedRetries: 0,
     };
 
     if (this.isEmptyModelResponseError(error)) {
@@ -719,28 +428,6 @@ export class AIService {
         maxRetries: Math.min(policy.maxRetries, EMPTY_RESPONSE_MAX_RETRIES),
         maxElapsedMs: Math.min(policy.maxElapsedMs, EMPTY_RESPONSE_MAX_ELAPSED_MS),
         maxDelayMs: Math.min(policy.maxDelayMs, EMPTY_RESPONSE_MAX_DELAY_MS),
-      };
-    }
-
-    if (this.isResponsesMode() && this.isGatewayTimeoutError(error)) {
-      return {
-        ...policy,
-        maxRetries: Math.min(policy.maxRetries, GATEWAY_TIMEOUT_MAX_RETRIES),
-        guaranteedRetries: Math.min(policy.maxRetries, GATEWAY_TIMEOUT_MAX_RETRIES),
-      };
-    }
-
-    if (this.isResponsesMode() && this.isSemanticTransientProviderError(error)) {
-      return {
-        ...policy,
-        maxRetries: Math.min(policy.maxRetries, RESPONSES_TRANSIENT_MAX_RETRIES),
-      };
-    }
-
-    if (this.isResponsesMode() && [502, 503, 529].includes(this.extractStatus(error) ?? 0)) {
-      return {
-        ...policy,
-        maxRetries: Math.min(policy.maxRetries, TRANSIENT_HTTP_MAX_RETRIES),
       };
     }
 
@@ -761,9 +448,7 @@ export class AIService {
     const rawDelay = retryAfter !== null
       ? retryAfter * 1000
       : Math.min(policy.maxDelayMs, policy.baseDelayMs * Math.pow(2, retryAttempt - 1)) + Math.random() * 500;
-    const remainingMs = elapsedMs >= policy.maxElapsedMs && retryAttempt <= policy.guaranteedRetries
-      ? policy.maxDelayMs
-      : Math.max(0, policy.maxElapsedMs - elapsedMs);
+    const remainingMs = Math.max(0, policy.maxElapsedMs - elapsedMs);
     return Math.max(0, Math.min(rawDelay, remainingMs));
   }
 
@@ -780,19 +465,15 @@ export class AIService {
   }
 
   private extractErrorMessage(error: any): string {
-    return safeErrorString(
-      safeErrorPath(error, 'response', 'data', 'error', 'message')
-        || safeErrorPath(error, 'response', 'data', 'message')
-        || safeErrorPath(error, 'error', 'message')
-        || safeErrorProperty(error, 'message'),
-      safeErrorString(error, 'Unknown provider error'),
-    );
+    return error?.response?.data?.error?.message
+      || error?.response?.data?.message
+      || error?.error?.message
+      || error?.message
+      || String(error);
   }
 
   private extractErrorCode(error: any): string {
-    return safeErrorString(
-      safeErrorProperty(error, 'code') || safeErrorPath(error, 'cause', 'code'),
-    ).toUpperCase();
+    return String(error?.code || error?.cause?.code || '').toUpperCase();
   }
 
   private isEmptyModelResponseError(error: any): boolean {
@@ -801,18 +482,6 @@ export class AIService {
 
   private isShortNetworkRetryError(error: any): boolean {
     return SHORT_NETWORK_RETRY_CODES.has(this.extractErrorCode(error));
-  }
-
-  private isGatewayTimeoutError(error: any): boolean {
-    const code = this.extractErrorCode(error);
-    return this.extractStatus(error) === 504
-      || code === 'XIAOBA_RESPONSES_HEADERS_TIMEOUT'
-      || code === 'UND_ERR_HEADERS_TIMEOUT';
-  }
-
-  private isResponsesMode(): boolean {
-    return this.config.provider === 'openai'
-      && this.config.openaiApiMode === 'responses';
   }
 
   private async notifyRetry(
@@ -824,7 +493,7 @@ export class AIService {
     try {
       await callbacks?.onRetry?.(attempt, maxRetries, info);
     } catch (error: any) {
-      Logger.warning(`重试提示回调失败: ${safeErrorString(safeErrorProperty(error, 'message'), safeErrorString(error))}`);
+      Logger.warning(`重试提示回调失败: ${error?.message || error}`);
     }
   }
 
@@ -853,9 +522,9 @@ export class AIService {
   }
 
   private isAbortError(error: any): boolean {
-    return safeErrorProperty(error, 'name') === 'AbortError'
-      || safeErrorProperty(error, 'code') === 'ERR_CANCELED'
-      || /aborted|aborterror|canceled|cancelled/i.test(safeErrorString(safeErrorProperty(error, 'message')));
+    return error?.name === 'AbortError'
+      || error?.code === 'ERR_CANCELED'
+      || /aborted|aborterror|canceled|cancelled/i.test(String(error?.message || ''));
   }
 
   private createAbortError(): Error {

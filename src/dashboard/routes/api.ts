@@ -9,7 +9,6 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as dotenv from 'dotenv';
 import { PathResolver } from '../../utils/path-resolver';
-import { Logger } from '../../utils/logger';
 import { APP_VERSION } from '../../version';
 import type { ChatConfig, OpenAIApiMode, ReasoningEffort } from '../../types';
 import type { ToolDefinition } from '../../types/tool';
@@ -56,28 +55,22 @@ import { inferCatsUploadType, uploadCatsLocalFile } from '../../catscompany/uplo
 import { createCatsCoLocalConfigService } from '../../catscompany/local-config';
 import { catalogRuntimeMatchesModelId, createBotDefinitionSyncService } from '../../bot-definition/service';
 import { prepareBoundBotDefinition } from '../../bot-definition/activation';
-import { createBotDefinitionCloudSyncService } from '../../bot-definition/cloud-sync';
 import { getPromptReconcileCoordinator } from '../../bot-definition/prompt-sync';
-import { rollbackPreparedBotSkills } from '../../bot-skills/runtime';
 import {
   customModelDefinitionToConfig,
   modelRuntimeToConfig,
   resolveActiveBotLLMConfig,
 } from '../../bot-definition/llm-config-resolver';
-import { pullCloudBotModelSelection } from '../../bot-definition/cloud-client';
 import {
   BOT_CATALOG_MODEL_RUNTIME_SCHEMA,
   type BotCatalogModelRuntime,
   type BotDefinitionSyncResult,
-  type BotModelDefinition,
   type CustomBotModelDefinition,
 } from '../../bot-definition/types';
 import { resolveCatsCoRuntimeConfig } from '../../catscompany/runtime-config';
 import { consumeLocalFileGrant, validateLocalFileGrant } from '../local-file-grants';
 import { registerSkillHubRoutes } from './skillhub';
 import { registerPetRoutes } from './pet';
-import { registerTurnErrorRoutes } from './turn-errors';
-import { registerCacheTraceRoutes } from './cache-trace';
 import type { DashboardAuthStatus } from '../auth';
 import { SkillHubService } from '../../skillhub/service';
 import {
@@ -98,6 +91,10 @@ import {
 } from '../../core/branch-agent-config';
 import { normalizeReasoningEffort, reasoningEffortOrDefault } from '../../utils/reasoning-effort';
 import { normalizeOpenAIApiMode, openAIApiModeOrDefault } from '../../utils/openai-api-mode';
+import { AgentRunStore, projectAgentRun } from '../../core/agent-run-store';
+import type { AgentRunPublicProjection } from '../../core/agent-run-types';
+import { ReviewRunStore } from '../../review/review-run-store';
+import { projectReviewAsAgentRun } from '../../review/review-agent-run-projection';
 import {
   BindWeixinChannelResult,
   WeixinChannelStatus,
@@ -118,6 +115,22 @@ const MODELS_DEV_DASHBOARD_WAIT_MS = 250;
 
 function runtimeDataRoot(): string {
   return PathResolver.getRuntimeDataRoot();
+}
+
+function loadDashboardAgentRuns(): AgentRunPublicProjection[] {
+  const genericStorePath = process.env.XIAOBA_AGENT_RUN_STORE_FILE
+    ? path.resolve(process.env.XIAOBA_AGENT_RUN_STORE_FILE)
+    : path.join(PathResolver.getRuntimeDataRoot(), 'data', 'agent-runs.json');
+  const reviewWorkspace = path.resolve(process.env.XIAOBA_REVIEW_WORKSPACE
+    || path.join(process.cwd(), 'review', 'evidence-envelopes'));
+  const genericStore = new AgentRunStore(genericStorePath);
+  const reviewStore = new ReviewRunStore(path.join(reviewWorkspace, 'review-runs.json'));
+  if (reviewStore.isCorrupt()) throw new Error('Review Run data is unavailable');
+  return [
+    ...genericStore.list().map(projectAgentRun),
+    ...reviewStore.list().map(projectReviewAsAgentRun),
+  ].sort((left, right) => right.updatedAt.localeCompare(left.updatedAt)
+    || left.runId.localeCompare(right.runId));
 }
 
 type SkillSource = 'system' | 'bundled' | 'user';
@@ -310,6 +323,28 @@ function normalizeTrustedCatsHttpBaseUrl(value: unknown): string {
     return url.origin;
   }
   throw httpError('Untrusted CatsCo HTTP endpoint', 400);
+}
+
+function resolveTrustedCatsAttachmentUrl(httpBaseUrl: string, value: unknown): URL {
+  const trustedBase = new URL(normalizeTrustedCatsHttpBaseUrl(httpBaseUrl));
+  let url: URL;
+  try {
+    url = new URL(String(value || '').trim(), trustedBase);
+  } catch {
+    throw httpError('Invalid CatsCo attachment URL', 400);
+  }
+
+  if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.origin !== trustedBase.origin) {
+    throw httpError('Untrusted CatsCo attachment URL', 400);
+  }
+  return url;
+}
+
+function catsAttachmentDisposition(value: unknown): string {
+  const original = path.basename(String(value || 'download').trim() || 'download').replace(/[\r\n"]/g, '_');
+  const fallback = original.replace(/[^\x20-\x7e]/g, '_') || 'download';
+  const encoded = encodeURIComponent(original).replace(/['()*]/g, char => `%${char.charCodeAt(0).toString(16).toUpperCase()}`);
+  return `attachment; filename="${fallback}"; filename*=UTF-8''${encoded}`;
 }
 
 function normalizeTrustedCatsServerUrl(value: unknown): string {
@@ -882,11 +917,10 @@ async function commitCatsBotBindingAndStartConnector(
   const promptCoordinator = getPromptReconcileCoordinator({ runtimeRoot: runtimeDataRoot() });
   await promptCoordinator.prepareCurrentBotForSwitch();
   const promptSnapshot = promptCoordinator.captureActiveSnapshot();
-  let preparedBot: Awaited<ReturnType<typeof prepareBoundBotDefinition>>;
   try {
     const warnings = await ensureCatsFriendBinding(state, input.userUid, input.botUid, input.apiKey);
     const updated = writeCatsBotBinding(state, input);
-    preparedBot = await prepareBoundBotDefinition({
+    const preparedBot = await prepareBoundBotDefinition({
       runtimeRoot: runtimeDataRoot(),
       botId: input.botUid,
       selectedCatalogRuntime: input.selectedCatalogRuntime,
@@ -922,11 +956,6 @@ async function commitCatsBotBindingAndStartConnector(
       botDefinitionSync,
     };
   } catch (error) {
-    try {
-      await rollbackPreparedBotSkills(runtimeDataRoot(), preparedBot?.skillSync);
-    } catch (workspaceError) {
-      Logger.warning(`Bot Skill 工作区回滚失败: ${String((workspaceError as Error)?.message || workspaceError)}`);
-    }
     rollback();
     promptCoordinator.restoreActiveSnapshot(promptSnapshot);
     throw error;
@@ -1411,10 +1440,10 @@ function dashboardSecretValue(raw: unknown, current: string | undefined, id: str
 }
 
 /** Saves the custom profile independently and only selects it when activation is explicit. */
-async function updateBoundBotCustomModelFromDashboardSettings(
+function updateBoundBotCustomModelFromDashboardSettings(
   body: any,
   options: { publishActive: boolean },
-): Promise<Record<string, unknown> | undefined> {
+): Record<string, unknown> | undefined {
   const botId = currentBoundBotId();
   if (!botId || !hasDashboardModelUpdates(body)) return undefined;
   if (body?.modelProfileSource !== undefined && body.modelProfileSource !== 'custom') {
@@ -1460,36 +1489,8 @@ async function updateBoundBotCustomModelFromDashboardSettings(
   };
   service.storeCustomModelProfile(botId, customModel);
   return options.publishActive
-    ? syncBoundBotModelToCloud(botId, customModel)
+    ? toBotDefinitionSyncPayload(service.publish(botId, customModel))
     : undefined;
-}
-
-async function syncBoundBotModelToCloud(
-  botId: string,
-  model: BotModelDefinition,
-): Promise<Record<string, unknown>> {
-  const runtimeRoot = runtimeDataRoot();
-  const definitionService = createBotDefinitionSyncService({ runtimeRoot });
-  const result = definitionService.updateModel(botId, model);
-  const payload = toBotDefinitionSyncPayload(result) ?? {};
-  const cloudSync = createBotDefinitionCloudSyncService({ runtimeRoot, definitionService });
-  cloudSync.markModelPending(botId);
-  try {
-    const snapshot = await cloudSync.pushModel(botId, getCatsAuthState(), result.definition.model);
-    return {
-      ...payload,
-      cloudSynced: Boolean(snapshot),
-      cloudPending: !snapshot,
-      ...(snapshot ? { cloudRevision: snapshot.revision } : {}),
-    };
-  } catch (error) {
-    return {
-      ...payload,
-      cloudSynced: false,
-      cloudPending: true,
-      cloudError: sanitizeCatsErrorMessage(error instanceof Error ? error.message : String(error)),
-    };
-  }
 }
 
 function publishCurrentBotDefinition(): BotDefinitionSyncResult | undefined {
@@ -1515,21 +1516,22 @@ function publishCurrentBotDefinitionPayload(): Record<string, unknown> | undefin
   return toBotDefinitionSyncPayload(publishCurrentBotDefinition());
 }
 
-async function updateCurrentCustomDefinitionReasoningEffort(
+function updateCurrentCustomDefinitionReasoningEffort(
   reasoningEffort: ReasoningEffort,
-): Promise<Record<string, unknown> | undefined> {
+): Record<string, unknown> | undefined {
   const service = createBotDefinitionSyncService({ runtimeRoot: runtimeDataRoot() });
   const definition = service.pullOrBootstrapCurrentBoundBot()?.definition;
   if (!definition || definition.model.kind !== 'custom') return undefined;
-  return syncBoundBotModelToCloud(definition.botId, {
+  const result = service.publish(definition.botId, {
     ...definition.model,
     reasoningEffort,
   });
+  return toBotDefinitionSyncPayload(result);
 }
 
-async function updateCurrentCatalogRuntimeReasoningEffort(
+function updateCurrentCatalogRuntimeReasoningEffort(
   reasoningEffort: ReasoningEffort,
-): Promise<Record<string, unknown> | undefined> {
+): Record<string, unknown> | undefined {
   const service = createBotDefinitionSyncService({ runtimeRoot: runtimeDataRoot() });
   const definition = service.pullOrBootstrapCurrentBoundBot()?.definition;
   if (!definition || definition.model.kind !== 'catalog') return undefined;
@@ -1538,10 +1540,7 @@ async function updateCurrentCatalogRuntimeReasoningEffort(
     throw httpError('The selected catalog model is not materialized on this device.', 409);
   }
   service.storeCatalogRuntime({ ...runtime, reasoningEffort });
-  return syncBoundBotModelToCloud(definition.botId, {
-    ...definition.model,
-    reasoningEffort,
-  });
+  return toBotDefinitionSyncPayload(service.publish(definition.botId, definition.model));
 }
 
 function modelProfileFromStoredEnv(
@@ -2211,11 +2210,6 @@ export function createApiRouter(
   const modelsDevFetch = options.modelsDevFetch ?? fetch;
   registerSkillHubRoutes(router, { getCatsCoAuth: getCatsCoAuthForSkillHub });
   registerPetRoutes(router);
-  registerTurnErrorRoutes(router);
-  registerCacheTraceRoutes(router, {
-    runtimeRoot: runtimeDataRoot(),
-    serviceManager,
-  });
 
   // ==================== 总览 ====================
 
@@ -2246,6 +2240,24 @@ export function createApiRouter(
       services,
       authStatus: options.getAuthStatus?.() || { enabled: false, configured: false },
     });
+  });
+
+  router.get('/agent-runs', (_req, res) => {
+    try {
+      res.json(loadDashboardAgentRuns());
+    } catch {
+      res.status(503).json({ error: 'Agent Run data is unavailable' });
+    }
+  });
+
+  router.get('/agent-runs/:runId', (req, res) => {
+    try {
+      const run = loadDashboardAgentRuns().find(candidate => candidate.runId === req.params.runId);
+      if (!run) return res.status(404).json({ error: 'Agent Run not found' });
+      res.json(run);
+    } catch {
+      res.status(503).json({ error: 'Agent Run data is unavailable' });
+    }
   });
 
   router.get('/runtime/config', async (_req, res) => {
@@ -2858,7 +2870,7 @@ export function createApiRouter(
     }
   });
 
-  router.put('/settings', async (req, res) => {
+  router.put('/settings', (req, res) => {
     try {
       const previousModel = modelProfileFromCurrentConfig();
       const previousSource = storedModelSource();
@@ -2868,7 +2880,7 @@ export function createApiRouter(
       // Bound bots never write a second model source to .env. Non-model
       // dashboard settings keep their existing machine-local behavior.
       const botDefinitionSync = boundBot
-        ? await updateBoundBotCustomModelFromDashboardSettings(req.body, { publishActive: publishBoundCustom })
+        ? updateBoundBotCustomModelFromDashboardSettings(req.body, { publishActive: publishBoundCustom })
         : undefined;
       const result = updateDashboardSettings(
         boundBot ? withoutDashboardModelUpdates(req.body) : req.body,
@@ -2902,14 +2914,14 @@ export function createApiRouter(
     }
   });
 
-  router.put('/model/reasoning-effort', async (req, res) => {
+  router.put('/model/reasoning-effort', (req, res) => {
     try {
       const requested = requestedReasoningEffort(req.body?.reasoningEffort);
       const activeBotConfig = resolveActiveBotLLMConfig({ runtimeRoot: runtimeDataRoot() });
       if (activeBotConfig?.source === 'custom_definition') {
         const previousReasoningEffort = activeBotConfig.config.reasoningEffort ?? 'default';
         const reasoningEffort = requested ?? previousReasoningEffort;
-        const botDefinitionSync = await updateCurrentCustomDefinitionReasoningEffort(reasoningEffort);
+        const botDefinitionSync = updateCurrentCustomDefinitionReasoningEffort(reasoningEffort);
         const restartInfo = req.body?.restartConnector === true || req.body?.activateConnector === true
           ? activateCatsCompanyConnector(serviceManager, {
             startIfStopped: req.body?.activateConnector === true || req.body?.startConnector === true,
@@ -2934,7 +2946,7 @@ export function createApiRouter(
       if (activeBotConfig?.source === 'catalog_runtime') {
         const previousReasoningEffort = activeBotConfig.config.reasoningEffort ?? 'high';
         const reasoningEffort = relayReasoningEffortOrHigh(requested ?? previousReasoningEffort);
-        const botDefinitionSync = await updateCurrentCatalogRuntimeReasoningEffort(reasoningEffort);
+        const botDefinitionSync = updateCurrentCatalogRuntimeReasoningEffort(reasoningEffort);
         const restartInfo = req.body?.restartConnector === true || req.body?.activateConnector === true
           ? activateCatsCompanyConnector(serviceManager, {
             startIfStopped: req.body?.activateConnector === true || req.body?.startConnector === true,
@@ -2965,7 +2977,7 @@ export function createApiRouter(
         : requested ?? previousReasoningEffort;
       const result = writeStartupReasoningEffort(reasoningEffort);
       const botDefinitionSync = result.source === 'custom'
-        ? await updateCurrentCustomDefinitionReasoningEffort(reasoningEffort)
+        ? updateCurrentCustomDefinitionReasoningEffort(reasoningEffort)
         : undefined;
       const restartInfo = req.body?.restartConnector === true || req.body?.activateConnector === true
         ? activateCatsCompanyConnector(serviceManager, {
@@ -2992,7 +3004,7 @@ export function createApiRouter(
     }
   });
 
-  router.post('/model-source/custom/apply', async (req, res) => {
+  router.post('/model-source/custom/apply', (req, res) => {
     try {
       const activeBotConfig = resolveActiveBotLLMConfig({ runtimeRoot: runtimeDataRoot() });
       const botId = currentBoundBotId();
@@ -3010,7 +3022,7 @@ export function createApiRouter(
           if (!savedCustom) {
             throw httpError('Set custom model fields in Settings before selecting the custom source.', 409);
           }
-          botDefinitionSync = await syncBoundBotModelToCloud(botId, savedCustom);
+          botDefinitionSync = toBotDefinitionSyncPayload(definitionService.publish(botId, savedCustom));
         }
         const activation = activateCatsCompanyConnector(serviceManager, {
           startIfStopped: req.body?.activateConnector === true || req.body?.startConnector === true,
@@ -3277,7 +3289,7 @@ export function createApiRouter(
     try {
       const localSkillManager = new SkillManager();
       await localSkillManager.loadSkills();
-      const activeSkills = await Promise.all(localSkillManager.getAllSkills().map(skillToDashboardPayload));
+      const activeSkills = localSkillManager.getAllSkills().map(skillToDashboardPayload);
       const disabledSkills = findAllDisabledSkills(PathResolver.getSkillsPath());
       res.json([...activeSkills, ...disabledSkills]);
     } catch (e: any) {
@@ -3450,24 +3462,17 @@ export function createApiRouter(
     const bodyBlocking = bodyStatus.state === 'conflict' || bodyStatus.state === 'auth_error';
     const chatReady = connected && runtime.bodyConfigured && !bodyBlocking;
     const boundBotId = String(state.botUid || '').trim();
-    // 云端模型以 CatsCompany 服务端配置为权威。直接拉取云端当前选择，
-    // 而不是读取本地 override 文件（新契约下成功应用后本地 override 会被清除）。
-    let cloudModelOverride: Record<string, unknown> | null = null;
-    if (boundBotId && state.token) {
-      try {
-        const cloudSelection = await pullCloudBotModelSelection({ botId: boundBotId, auth: state });
-        if (cloudSelection && cloudSelection.kind !== 'local') {
-          cloudModelOverride = {
-            kind: cloudSelection.kind ?? 'catalog',
-            modelId: cloudSelection.modelId,
-            model: cloudSelection.modelId,
-            reasoningEffort: cloudSelection.reasoningEffort || '',
-          };
-        }
-      } catch (error) {
-        Logger.warning(`CatsCo 云端模型状态拉取失败，本地面板按无云端覆盖展示: ${sanitizeCatsErrorMessage(error instanceof Error ? error.message : String(error))}`);
-      }
-    }
+    const cloudDefinition = boundBotId
+      ? createBotDefinitionSyncService({ runtimeRoot: runtimeDataRoot() }).readCloudModelOverride(boundBotId)
+      : undefined;
+    const cloudModelOverride = cloudDefinition ? {
+      kind: cloudDefinition.model.kind,
+      modelId: cloudDefinition.model.kind === 'catalog' ? cloudDefinition.model.modelId : 'custom',
+      model: cloudDefinition.model.kind === 'catalog'
+        ? cloudDefinition.model.modelId
+        : cloudDefinition.model.model,
+      reasoningEffort: cloudDefinition.model.reasoningEffort || '',
+    } : null;
 
     res.json({
       connected,
@@ -4136,14 +4141,9 @@ export function createApiRouter(
         definitionService.storeCatalogRuntime(
           selectedRelayCatalogRuntime(botId, selectedModel, ensured.plainKey, reasoningEffort),
         );
-        // “启动模型”面板 = 设备本地配置：只更新本地 Definition，不推送云端。
-        // 云端模型以 webapp 设置为权威，设备不得用本地选择覆盖云端配置。
-        const localResult = definitionService.updateModel(botId, {
-          kind: 'catalog',
-          modelId: selectedModel.id,
-          reasoningEffort,
-        });
-        botDefinitionSync = toBotDefinitionSyncPayload(localResult) ?? undefined;
+        botDefinitionSync = toBotDefinitionSyncPayload(
+          definitionService.publish(botId, { kind: 'catalog', modelId: selectedModel.id }),
+        );
       }
       const restartInfo = activateCatsCompanyConnector(serviceManager, {
         startIfStopped: req.body?.activateConnector === true || req.body?.startConnector === true,
@@ -4194,6 +4194,35 @@ export function createApiRouter(
       res.json(data);
     } catch (e: any) {
       res.status(e.status || 500).json({ error: e.message, data: e.data });
+    }
+  });
+
+  router.get('/cats/download', async (req, res) => {
+    try {
+      const state = trustCatsAuthStateEndpoints(getCatsAuthState());
+      if (!state.token) return res.status(401).json({ error: 'CatsCo user token is missing' });
+
+      const remoteUrl = resolveTrustedCatsAttachmentUrl(state.httpBaseUrl, req.query.url);
+      const remoteResponse = await fetch(remoteUrl, {
+        headers: { Authorization: `Bearer ${state.token}` },
+        redirect: 'follow',
+      });
+      if (!remoteResponse.ok) {
+        throw httpError(`CatsCo attachment download failed (${remoteResponse.status})`, remoteResponse.status);
+      }
+
+      const fileName = String(req.query.name || path.basename(remoteUrl.pathname) || 'download');
+      const contentType = remoteResponse.headers.get('content-type');
+      const bytes = Buffer.from(await remoteResponse.arrayBuffer());
+      if (contentType) res.setHeader('Content-Type', contentType);
+      res.setHeader('Content-Disposition', catsAttachmentDisposition(fileName));
+      res.setHeader('Content-Length', String(bytes.length));
+      res.setHeader('Cache-Control', 'private, no-store');
+      res.setHeader('X-Content-Type-Options', 'nosniff');
+      return res.send(bytes);
+    } catch (e: any) {
+      const status = Number(e?.status) || 500;
+      return res.status(status).json({ error: e?.message || 'CatsCo attachment download failed' });
     }
   });
 

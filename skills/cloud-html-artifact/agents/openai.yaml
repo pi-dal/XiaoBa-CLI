@@ -1,0 +1,4 @@
+interface:
+  display_name: "Cloud HTML Artifact"
+  short_description: "Publish built static web output through employee HTTPS."
+  default_prompt: "Use $cloud-html-artifact to create an isolated publication copy of this already-built browser-runnable directory, add the official CatsCo v2 Standard Footer with its bundled green mark, fixed copy, and matching green CTA, verify its required horizontal and narrow stacked layouts using the footer-first policy, publish the prepared copy from the current virtual employee server, ensure its canonical trusted HTTPS host, verify its version and latest URLs, and add it to the server-local artifact index."

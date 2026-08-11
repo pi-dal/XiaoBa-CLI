@@ -339,22 +339,17 @@ export function dependenciesSatisfied(
  * satisfied dependencies, has an expired lease, or has reached its retry deadline.
  * Successful results are never re-run.
  */
-export function isLeaseExpired(lease: QuantumLease | undefined, now: Date): boolean {
-  if (!lease) return true;
-  const expiresAt = Date.parse(lease.expiresAt);
-  return !Number.isFinite(expiresAt) || expiresAt <= now.getTime();
-}
-
 export function isQuantumRunnable(
   job: GraphJobView,
   quantum: ReviewQuantumRecord,
-  now: Date = new Date(),
+  now: Date,
 ): boolean {
   if (job.disposition !== 'active') return false;
   if (quantum.state === 'succeeded' || quantum.state === 'terminal_failed') return false;
 
   if (quantum.state === 'leased') {
-    return isLeaseExpired(quantum.lease, now);
+    if (!quantum.lease) return true; // fail-open reclaim of malformed lease
+    return new Date(quantum.lease.expiresAt).getTime() <= now.getTime();
   }
 
   if (quantum.state === 'retry_wait') {
@@ -384,65 +379,12 @@ export function criticalPathRank(quantum: ReviewQuantumRecord): number {
 
 export function listRunnableQuanta(
   job: GraphJobView,
-  now: Date = new Date(),
+  now: Date,
 ): ReviewQuantumRecord[] {
   return Object.values(job.quanta)
     .filter(quantum => isQuantumRunnable(job, quantum, now))
     .sort((a, b) => criticalPathRank(a) - criticalPathRank(b)
       || a.quantumId.localeCompare(b.quantumId, 'en'));
-}
-
-export const STRANDED_JOB_TERMINAL_REASON =
-  'review_job_stranded: active Job has no runnable Quantum, retry deadline, or valid lease';
-
-/**
- * Fail closed when an active graph has no current or future progress path.
- * Expired leases must be reclaimed before calling this helper. A future retry
- * or an unexpired lease is progress, while dependency-blocked pending nodes
- * alone are not. This also repairs legacy Jobs whose upstream Reader is
- * terminal_failed but whose downstream nodes were left pending.
- */
-export function convergeStrandedJob(
-  job: GraphJobView,
-  now: Date = new Date(),
-): boolean {
-  if (job.disposition !== 'active') return false;
-
-  // A succeeded commit is a terminal graph fact even when an older writer
-  // left the top-level disposition stale. Domain layers restore any
-  // outcome-specific metadata, such as semantic-defer state.
-  const derivedDisposition = deriveJobDisposition(job);
-  if (derivedDisposition === 'completed') {
-    job.disposition = 'completed';
-    job.terminalReason = undefined;
-    job.nextDueAt = undefined;
-    job.updatedAt = now.toISOString();
-    return true;
-  }
-  if (listRunnableQuanta(job, now).length > 0) return false;
-
-  const hasFutureProgress = Object.values(job.quanta).some(quantum => {
-    if (quantum.state === 'retry_wait') {
-      if (!quantum.nextRetryAt) return false;
-      const retryAt = Date.parse(quantum.nextRetryAt);
-      return Number.isFinite(retryAt) && retryAt > now.getTime();
-    }
-    return quantum.state === 'leased'
-      && quantum.lease !== undefined
-      && !isLeaseExpired(quantum.lease, now);
-  });
-  if (hasFutureProgress) return false;
-
-  const failedQuantum = Object.values(job.quanta)
-    .filter(quantum => quantum.state === 'terminal_failed')
-    .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt, 'en'))[0];
-  job.disposition = 'terminal_failed';
-  job.terminalReason = failedQuantum?.failureMessage
-    ? `${STRANDED_JOB_TERMINAL_REASON}: ${failedQuantum.failureMessage}`
-    : STRANDED_JOB_TERMINAL_REASON;
-  job.nextDueAt = undefined;
-  job.updatedAt = now.toISOString();
-  return true;
 }
 
 /**
@@ -529,56 +471,14 @@ export function claimQuantum(
   return { ok: true, quantum: claimed, lease };
 }
 
-export interface RenewQuantumLeaseOptions {
-  leaseId: string;
-  ownerWakeId: string;
-  leaseMs?: number;
-  now?: Date;
-}
-
-export type RenewQuantumLeaseResult =
-  | { ok: true; quantum: ReviewQuantumRecord; lease: QuantumLease }
-  | { ok: false; reason: 'missing' | 'lease_mismatch' | 'lease_expired' | 'job_not_active' };
-
-/** Extend one still-live lease without changing its identity or attempt budget. */
-export function renewQuantumLease(
-  job: GraphJobView,
-  quantumId: string,
-  options: RenewQuantumLeaseOptions,
-): RenewQuantumLeaseResult {
-  const quantum = job.quanta[quantumId];
-  if (!quantum) return { ok: false, reason: 'missing' };
-  if (job.disposition !== 'active') return { ok: false, reason: 'job_not_active' };
-  if (
-    quantum.state !== 'leased'
-    || !quantum.lease
-    || quantum.lease.leaseId !== options.leaseId
-    || quantum.lease.ownerWakeId !== options.ownerWakeId
-  ) {
-    return { ok: false, reason: 'lease_mismatch' };
-  }
-  const now = options.now ?? new Date();
-  if (isLeaseExpired(quantum.lease, now)) return { ok: false, reason: 'lease_expired' };
-  const lease: QuantumLease = {
-    ...quantum.lease,
-    expiresAt: new Date(now.getTime() + (options.leaseMs ?? DEFAULT_QUANTUM_LEASE_MS)).toISOString(),
-  };
-  const renewed: ReviewQuantumRecord = { ...quantum, lease, updatedAt: now.toISOString() };
-  job.quanta[quantumId] = renewed;
-  job.updatedAt = renewed.updatedAt;
-  job.nextDueAt = computeJobNextDueAt(job);
-  return { ok: true, quantum: renewed, lease };
-}
-
 export type CompleteQuantumResult =
   | { ok: true; quantum: ReviewQuantumRecord; alreadySucceeded: boolean }
-  | { ok: false; reason: 'missing' | 'lease_mismatch' | 'lease_expired' | 'not_leased' | 'job_not_active' };
+  | { ok: false; reason: 'missing' | 'lease_mismatch' | 'not_leased' | 'job_not_active' };
 
 export interface CompleteQuantumOptions {
   result: unknown;
-  /** Only the matching durable lease identity may complete. */
-  leaseId: string;
-  ownerWakeId: string;
+  /** When set, only the matching lease owner may complete. */
+  leaseId?: string;
   transcriptPath?: string;
   now?: Date;
 }
@@ -610,21 +510,17 @@ export function completeQuantum(
     return { ok: false, reason: 'job_not_active' };
   }
 
-  if (quantum.state !== 'leased' || !quantum.lease) {
+  if (quantum.state === 'terminal_failed') {
     return { ok: false, reason: 'not_leased' };
   }
 
-  if (
-    quantum.lease.leaseId !== options.leaseId
-    || quantum.lease.ownerWakeId !== options.ownerWakeId
-  ) {
-    return { ok: false, reason: 'lease_mismatch' };
+  if (options.leaseId !== undefined) {
+    if (quantum.lease && quantum.lease.leaseId !== options.leaseId) {
+      return { ok: false, reason: 'lease_mismatch' };
+    }
   }
 
   const now = options.now ?? new Date();
-  if (isLeaseExpired(quantum.lease, now)) {
-    return { ok: false, reason: 'lease_expired' };
-  }
   const nowIso = now.toISOString();
   const resultHash = sha256Hex(stableStringify(options.result));
   const transcriptPaths = options.transcriptPath
@@ -640,7 +536,6 @@ export function completeQuantum(
     nextRetryAt: undefined,
     failureMessage: undefined,
     failureKind: undefined,
-    failureReason: undefined,
     transcriptPaths,
     updatedAt: nowIso,
   };
@@ -651,54 +546,6 @@ export function completeQuantum(
   return { ok: true, quantum: succeeded, alreadySucceeded: false };
 }
 
-export interface ReleaseQuantumOptions {
-  leaseId: string;
-  ownerWakeId: string;
-  message?: string;
-  reason?: ReviewQuantumRecord['failureReason'];
-  now?: Date;
-}
-
-/**
- * Release a cancelled lease without consuming a retry attempt. This is used for
- * lifecycle/external cancellation, where the Quantum itself did not fail.
- */
-export function releaseQuantum(
-  job: GraphJobView,
-  quantumId: string,
-  options: ReleaseQuantumOptions,
-): { ok: true; quantum: ReviewQuantumRecord } | { ok: false; reason: 'missing' | 'lease_mismatch' | 'lease_expired' | 'job_not_active' } {
-  const quantum = job.quanta[quantumId];
-  if (!quantum) return { ok: false, reason: 'missing' };
-  if (job.disposition !== 'active') return { ok: false, reason: 'job_not_active' };
-  if (
-    quantum.state !== 'leased'
-    || !quantum.lease
-    || quantum.lease.leaseId !== options.leaseId
-    || quantum.lease.ownerWakeId !== options.ownerWakeId
-  ) {
-    return { ok: false, reason: 'lease_mismatch' };
-  }
-
-  const now = options.now ?? new Date();
-  if (isLeaseExpired(quantum.lease, now)) {
-    return { ok: false, reason: 'lease_expired' };
-  }
-  const released: ReviewQuantumRecord = {
-    ...quantum,
-    state: 'pending',
-    lease: undefined,
-    nextRetryAt: undefined,
-    failureMessage: options.message,
-    failureReason: options.reason,
-    updatedAt: now.toISOString(),
-  };
-  job.quanta[quantumId] = released;
-  job.updatedAt = released.updatedAt;
-  job.nextDueAt = computeJobNextDueAt(job);
-  return { ok: true, quantum: released };
-}
-
 export interface FailQuantumOptions {
   message: string;
   retryBaseMs?: number;
@@ -706,14 +553,13 @@ export interface FailQuantumOptions {
   maxAttempts?: number;
   /** When true, mark terminal_failed immediately. */
   terminal?: boolean;
-  leaseId: string;
-  ownerWakeId: string;
+  leaseId?: string;
   now?: Date;
 }
 
 export type FailQuantumResult =
   | { ok: true; quantum: ReviewQuantumRecord }
-  | { ok: false; reason: 'missing' | 'already_succeeded' | 'lease_mismatch' | 'lease_expired' | 'job_not_active' };
+  | { ok: false; reason: 'missing' | 'already_succeeded' | 'lease_mismatch' | 'job_not_active' };
 
 /**
  * Record a local provider/schema failure. Retries only this Quantum with
@@ -728,21 +574,14 @@ export function failQuantum(
   if (!quantum) return { ok: false, reason: 'missing' };
   if (job.disposition !== 'active') return { ok: false, reason: 'job_not_active' };
   if (quantum.state === 'succeeded') return { ok: false, reason: 'already_succeeded' };
-  if (quantum.state !== 'leased' || !quantum.lease) {
-    return { ok: false, reason: 'lease_mismatch' };
-  }
 
-  if (
-    quantum.lease.leaseId !== options.leaseId
-    || quantum.lease.ownerWakeId !== options.ownerWakeId
-  ) {
-    return { ok: false, reason: 'lease_mismatch' };
+  if (options.leaseId !== undefined) {
+    if (quantum.lease && quantum.lease.leaseId !== options.leaseId) {
+      return { ok: false, reason: 'lease_mismatch' };
+    }
   }
 
   const now = options.now ?? new Date();
-  if (isLeaseExpired(quantum.lease, now)) {
-    return { ok: false, reason: 'lease_expired' };
-  }
   const nowIso = now.toISOString();
   const attempts = quantum.attempts + 1;
   const maxAttempts = options.maxAttempts ?? DEFAULT_MAX_ATTEMPTS;
@@ -799,9 +638,12 @@ export function reclaimExpiredLeases(
   if (job.disposition !== 'active') return [];
   const reclaimed: ReviewQuantumRecord[] = [];
   const nowIso = now.toISOString();
+  const nowMs = now.getTime();
+
   for (const [quantumId, quantum] of Object.entries(job.quanta)) {
     if (quantum.state !== 'leased') continue;
-    const expired = isLeaseExpired(quantum.lease, now);
+    const expired = !quantum.lease
+      || new Date(quantum.lease.expiresAt).getTime() <= nowMs;
     if (!expired) continue;
     const pending: ReviewQuantumRecord = {
       ...quantum,

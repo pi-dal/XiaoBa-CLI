@@ -21,7 +21,7 @@ import {
 } from './learning-episode';
 import type { LearningEpisode, LearningEpisodeStatus } from './learning-episode';
 import type { DistilledKnowledgeCandidate } from './capability-distiller';
-import type { CurrentSkillRegistryState, SkillEvolutionRuntime } from './skill-evolution';
+import type { SkillEvolutionRuntime } from './skill-evolution';
 import type {
   BoundedSourceEvidence,
   EvidenceBundle,
@@ -54,16 +54,6 @@ export interface EpisodeSettlementEvidence {
   readonly sourceFilePath: string;
   readonly turn: number;
   readonly byteRange?: { start: number; end: number };
-}
-
-/**
- * One coherent Skill catalog view for a batch of Evidence Bundle builds.
- * The Registry and its referenced-skill projections must come from the same
- * point in time when callers yield between individual bundles.
- */
-export interface EvidenceBundleSkillCatalogSnapshot {
-  readonly registry: CurrentSkillRegistryState;
-  readonly referencedSkillSnapshots: readonly ReferencedSkillSnapshot[];
 }
 
 /**
@@ -330,8 +320,6 @@ function selectBoundedRelatedCurrentSkills(
  * @param capsuleStore      Optional capsule store; when present, external-origin episodes are reconstructed from their capsule.
  * @param isExternalEpisode Optional predicate marking an episode as external-origin (requires a persisted capsule).
  * @param skillLoadFacts    Optional runtime-owned `GeneratedSkillLoadFact` entries from the SkillUsageLedger. Only facts whose `episodeId` matches the episode's `agentTurnEpisodeId` authorize a dependency. External/capsule semantic observations are never used for dependency authorization.
- * @param referencedSkillSnapshots Optional legacy precomputed referenced-skill list.
- * @param skillCatalogSnapshot Optional coherent Registry + referenced-skill view for a yielded batch.
  */
 export function buildEpisodeEvidenceBundle(
   episode: LearningEpisode,
@@ -340,8 +328,6 @@ export function buildEpisodeEvidenceBundle(
   capsuleStore?: EvidenceCapsuleStore,
   isExternalEpisode?: (episodeId: string) => boolean,
   skillLoadFacts?: readonly GeneratedSkillLoadFact[],
-  referencedSkillSnapshots?: readonly ReferencedSkillSnapshot[],
-  skillCatalogSnapshot?: EvidenceBundleSkillCatalogSnapshot,
 ): EvidenceBundle {
   const completionEvidence: readonly SkillEvidenceRef[] = episode.completionEvidence
     .filter(evidence => evidence.kind !== 'contradiction')
@@ -357,12 +343,10 @@ export function buildEpisodeEvidenceBundle(
     turn: settlementEntry.turn,
     ...(settlementEntry.byteRange ? { byteRange: settlementEntry.byteRange } : {}),
   }];
-  const registry = skillCatalogSnapshot?.registry ?? skillEvolution.getRegistry();
+  const registry = skillEvolution.getRegistry();
 
   const bundleId = `v3:learning-episode:${episode.episodeId}`;
-  const allReferencedSkillSnapshots = skillCatalogSnapshot?.referencedSkillSnapshots
-    ?? referencedSkillSnapshots
-    ?? skillEvolution.getReferencedSkillSnapshots();
+  const allReferencedSkillSnapshots = skillEvolution.getReferencedSkillSnapshots();
   const referencedSkills = selectRuntimeOwnedReferencedSkills(
     skillLoadFacts,
     episode,
