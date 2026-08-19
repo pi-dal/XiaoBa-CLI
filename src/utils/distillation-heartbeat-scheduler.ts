@@ -16,17 +16,22 @@
  * See ADR 0001 → "Runtime Heartbeat Log Distillation".
  */
 
-import * as fs from 'fs';
 import { getDistillationHeartbeatConfig } from './distillation-heartbeat-config';
+import {
+  MemoryPressureGuard,
+  readSystemMemoryPressureSample,
+  type MemoryPressureObservation,
+  type MemoryPressureSample,
+} from './distillation-memory-pressure';
 import type { DueWorkPlanner } from './due-work-planner';
 import { Logger } from './logger';
-import { PathResolver } from './path-resolver';
 import type { HeartbeatSchedulerOwnerLock } from './heartbeat-scheduler-owner-lock';
-import type { RuntimeLearning } from './runtime-learning';
 import type {
+  RuntimeLearning,
   RuntimeLearningReason,
   RuntimeLearningHeartbeatResult,
 } from './runtime-learning';
+import { isRuntimeLearningReason } from './runtime-learning';
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -38,7 +43,6 @@ import type {
 
 const MIN_TIMEOUT_MS = 60 * 1000;
 const MAX_TIMEOUT_MS = 2_147_483_647;
-const SESSION_LOG_APPEND_DEBOUNCE_MS = 1_000;
 /**
  * Minimum delay before a deadline-driven reschedule when the planner
  * returns a due item already in the past. Without this floor, a
@@ -49,6 +53,36 @@ const SESSION_LOG_APPEND_DEBOUNCE_MS = 1_000;
  */
 const MIN_NEXT_WAKE_BACKOFF_MS = 30 * 1000;
 const MAX_NEXT_WAKE_BACKOFF_MS = 10 * 60 * 1000;
+
+function formatBytes(value: number | null): string {
+  if (value === null || !Number.isFinite(value)) return 'n/a';
+  if (value >= 1024 ** 3) return `${(value / 1024 ** 3).toFixed(2)}GiB`;
+  if (value >= 1024 ** 2) return `${(value / 1024 ** 2).toFixed(1)}MiB`;
+  return `${Math.round(value / 1024)}KiB`;
+}
+
+function formatPercent(value: number | null): string {
+  return value === null || !Number.isFinite(value) ? 'n/a' : `${value.toFixed(1)}%`;
+}
+
+export function rotateOperationalRetryForDiscovery(
+  deadlineDeltaMs: number,
+  consecutiveOperationalRetries: number,
+): { delayMs: number; reason: 'operational-retry' | 'scheduled'; consecutiveOperationalRetries: number } {
+  const count = consecutiveOperationalRetries + 1;
+  if (count < 3) {
+    return {
+      delayMs: deadlineDeltaMs,
+      reason: 'operational-retry',
+      consecutiveOperationalRetries: count,
+    };
+  }
+  return {
+    delayMs: Math.max(deadlineDeltaMs, MIN_NEXT_WAKE_BACKOFF_MS),
+    reason: 'scheduled',
+    consecutiveOperationalRetries: 0,
+  };
+}
 
 function emptyWakeResult(ran = false): RuntimeLearningHeartbeatResult {
   return {
@@ -89,17 +123,16 @@ export class DistillationHeartbeatScheduler {
   private readonly workingDirectory: string;
   private readonly runtimeLearning: RuntimeLearning;
   private readonly ownerLock: HeartbeatSchedulerOwnerLock | null;
+  private readonly readMemoryPressureSample: () => MemoryPressureSample;
+  private readonly memoryPressureGuard: MemoryPressureGuard;
   private timer: NodeJS.Timeout | null = null;
-  private sessionLogAppendWakeTimer: NodeJS.Timeout | null = null;
-  private sessionLogAppendSignalPath: string | null = null;
-  private sessionLogAppendSignalListener: ((current: fs.Stats, previous: fs.Stats) => void) | null = null;
+  /** Kept alive while suspended so only confirmed low pressure can resume work. */
+  private pressureTimer: NodeJS.Timeout | null = null;
   private started = false;
   private stopped = false;
   private readonly pendingWakeReasons = new Set<RuntimeLearningReason>();
   private activeWake: Promise<RuntimeLearningHeartbeatResult> | null = null;
   private scheduledWake: Promise<void> | null = null;
-  /** Monotonically increases across starts to fence delayed stop callbacks. */
-  private lifecycleGeneration = 0;
   /**
    * Consecutive count of reschedules where the planner returned a due
    * deadline in the past (deadlineDelta === 0). Each consecutive immediate
@@ -107,7 +140,7 @@ export class DistillationHeartbeatScheduler {
    * A normal scheduled interval resets the counter to zero.
    */
   private consecutiveImmediateReschedules = 0;
-  /** Prevent an overdue operational retry from starving session discovery. */
+  /** Periodically run discovery without delaying an active operational backlog. */
   private consecutiveOperationalRetries = 0;
 
   /**
@@ -120,10 +153,15 @@ export class DistillationHeartbeatScheduler {
     workingDirectory: string,
     runtimeLearning: RuntimeLearning,
     ownerLock?: HeartbeatSchedulerOwnerLock | null,
+    options: { readMemoryPressureSample?: () => MemoryPressureSample } = {},
   ) {
     this.workingDirectory = workingDirectory;
     this.runtimeLearning = runtimeLearning;
     this.ownerLock = ownerLock ?? null;
+    this.readMemoryPressureSample = options.readMemoryPressureSample ?? (() => readSystemMemoryPressureSample());
+    this.memoryPressureGuard = new MemoryPressureGuard(
+      getDistillationHeartbeatConfig(workingDirectory).memoryPressure,
+    );
   }
 
   // -----------------------------------------------------------------------
@@ -161,24 +199,26 @@ export class DistillationHeartbeatScheduler {
       return;
     }
 
-    this.lifecycleGeneration += 1;
-    const startGeneration = this.lifecycleGeneration;
     this.started = true;
     this.stopped = false;
-    const heartbeat = this.runtimeLearning?.loadHeartbeatRecord?.();
-    for (const reason of [
-      ...(this.runtimeLearning?.getPendingHeartbeatReasons?.() ?? []),
-      ...(heartbeat?.inProgress?.reasons ?? []),
-    ]) {
+    this.memoryPressureGuard.restore(this.runtimeLearning.loadHeartbeatRecord().memoryPressure);
+    this.runtimeLearning.setMemoryPressureMode(this.memoryPressureGuard.mode);
+    for (const reason of this.runtimeLearning?.getPendingHeartbeatReasons?.() ?? []) {
       this.pendingWakeReasons.add(reason);
     }
-    this.persistPendingWakeReasons();
-    this.startSessionLogAppendWatcher();
     Logger.info('[DistillationHeartbeat] scheduler started');
+
+    const initialPressure = this.observeMemoryPressure();
+    this.startMemoryPressurePolling();
+    if (initialPressure.mode === 'suspended') {
+      this.deferWakeForMemoryPressure('startup');
+      Logger.warning('[DistillationHeartbeat] startup wake deferred: memory pressure is hard');
+      return;
+    }
 
     const startupWake = (async () => {
       await this.runHeartbeat('startup');
-      if (!this.stopped && this.lifecycleGeneration === startGeneration) {
+      if (!this.stopped) {
         this.scheduleNextRun();
       }
     })();
@@ -187,19 +227,8 @@ export class DistillationHeartbeatScheduler {
   }
 
   async stop(): Promise<boolean> {
-    const stopGeneration = this.lifecycleGeneration;
-    const releaseOwnerIfStillStopped = () => {
-      if (
-        this.stopped
-        && !this.started
-        && this.lifecycleGeneration === stopGeneration
-      ) {
-        this.ownerLock?.release();
-      }
-    };
     this.stopped = true;
     this.started = false;
-    this.stopSessionLogAppendWatcher();
     this.consecutiveImmediateReschedules = 0;
     const stopStartedAtMs = Date.now();
     const sharedReviewDeadlineMs = this.getSharedReviewDeadlineMs();
@@ -211,6 +240,10 @@ export class DistillationHeartbeatScheduler {
     if (this.timer) {
       clearTimeout(this.timer);
       this.timer = null;
+    }
+    if (this.pressureTimer) {
+      clearInterval(this.pressureTimer);
+      this.pressureTimer = null;
     }
     if (this.activeWake) {
       let activeWakeCompleted = false;
@@ -241,8 +274,8 @@ export class DistillationHeartbeatScheduler {
         // supervisor kills this process). Releasing at the deadline would let
         // a new connector take over while the old writer is still alive.
         void awaitableWake.then(
-          releaseOwnerIfStillStopped,
-          releaseOwnerIfStillStopped,
+          () => this.ownerLock?.release(),
+          () => this.ownerLock?.release(),
         );
       }
       if (activeWakeCompleted) {
@@ -258,9 +291,7 @@ export class DistillationHeartbeatScheduler {
           });
         }
       }
-      if (activeWakeCompleted && this.activeWake === awaitableWake) {
-        this.activeWake = null;
-      }
+      this.activeWake = null;
     }
 
     if (this.scheduledWake) {
@@ -293,11 +324,9 @@ export class DistillationHeartbeatScheduler {
       const remainingMs = Math.max(1, sharedReviewDeadlineMs - (Date.now() - stopStartedAtMs));
       let runtimeDrainTimer: NodeJS.Timeout | null = null;
       let runtimeDrainCompleted = false;
-      let runtimeDrained = false;
       await Promise.race([
-        runtimeDrain.then(drained => {
+        runtimeDrain.then(() => {
           runtimeDrainCompleted = true;
-          runtimeDrained = drained !== false;
         }).finally(() => {
           if (runtimeDrainTimer) {
             clearTimeout(runtimeDrainTimer);
@@ -308,18 +337,7 @@ export class DistillationHeartbeatScheduler {
           runtimeDrainTimer = setTimeout(resolve, remainingMs);
         }),
       ]);
-      if (!runtimeDrainCompleted || !runtimeDrained) {
-        cleanShutdown = false;
-        const waitForDrain = this.runtimeLearning?.waitForDrain;
-        if (typeof waitForDrain === 'function') {
-          // Keep the process-wide writer lease until an over-deadline backfill
-          // or wake actually leaves the RuntimeLearning writer boundary.
-          void waitForDrain.call(this.runtimeLearning).then(
-            releaseOwnerIfStillStopped,
-            releaseOwnerIfStillStopped,
-          );
-        }
-      }
+      if (!runtimeDrainCompleted) cleanShutdown = false;
     }
 
     Logger.info('[DistillationHeartbeat] scheduler stopped');
@@ -353,6 +371,15 @@ export class DistillationHeartbeatScheduler {
       }
     }
 
+    // A hard-pressure abort can persist reasons after the scheduler cleared
+    // its in-memory Set. Restore all durable demand before taking another
+    // decision, not only the external-continuation lane.
+    this.restoreDurablePendingWakeReasons();
+    const pressure = this.observeMemoryPressure();
+    if (pressure.mode === 'suspended') {
+      return this.deferWakeForMemoryPressure(reason);
+    }
+
     if (this.activeWake) {
       this.pendingWakeReasons.add(reason);
       this.persistPendingWakeReasons();
@@ -365,10 +392,14 @@ export class DistillationHeartbeatScheduler {
       let lastResult = emptyWakeResult(true);
       let isCoalescedWake = false;
       while (!this.stopped && this.pendingWakeReasons.size > 0) {
-          const nextReasons = [...this.pendingWakeReasons];
-          if (nextReasons.includes('session-log-append')) {
-            this.clearSessionLogAppendWakeTimer();
+          const cyclePressure = this.observeMemoryPressure();
+          if (cyclePressure.mode === 'suspended') {
+            this.persistPendingWakeReasons();
+            break;
           }
+          const nextReasons = [...this.pendingWakeReasons];
+          this.pendingWakeReasons.clear();
+          this.persistPendingWakeReasons();
           try {
             this.runtimeLearning.markHeartbeatInProgress?.(
               nextReasons,
@@ -379,15 +410,9 @@ export class DistillationHeartbeatScheduler {
                 lastHeartbeatAt: this.ownerLock.record.lastHeartbeatAt,
               } : undefined,
             );
-            this.pendingWakeReasons.clear();
-            this.persistPendingWakeReasons();
             lastResult = await this.runtimeLearning.wake(nextReasons, { coalesced: isCoalescedWake });
             isCoalescedWake = true;
-            for (const pending of this.runtimeLearning.getPendingHeartbeatReasons?.() ?? []) {
-              if (pending === 'external-continuation') {
-                this.pendingWakeReasons.add(pending);
-              }
-            }
+            this.restoreDurablePendingWakeReasons();
           } catch (error: any) {
             Logger.warning(`[DistillationHeartbeat] runtime wake failed: ${error.message}`);
             return emptyWakeResult(false);
@@ -396,104 +421,15 @@ export class DistillationHeartbeatScheduler {
       return lastResult;
     };
 
-    const wakePromise = wakeCycle();
-    this.activeWake = wakePromise;
+    this.activeWake = wakeCycle();
     try {
-      return await wakePromise;
+      const result = await this.activeWake;
+      return result;
     } finally {
-      if (this.activeWake === wakePromise) {
+      if (this.activeWake) {
         this.activeWake = null;
       }
     }
-  }
-
-  /**
-   * Request an owner wake without coupling appenders to RuntimeLearning.
-   * Session-log requests are durably marked immediately and coalesced into a
-   * single discovery wake per debounce window.
-   */
-  requestWake(reason: RuntimeLearningReason = 'session-log-append'): void {
-    this.pendingWakeReasons.add(reason);
-    this.persistPendingWakeReasons();
-    if (this.stopped || !this.started) return;
-
-    if (reason !== 'session-log-append') {
-      void this.runHeartbeat(reason).catch(error => {
-        Logger.warning(`[DistillationHeartbeat] requested wake failed: ${error instanceof Error ? error.message : String(error)}`);
-      });
-      return;
-    }
-
-    if (this.sessionLogAppendWakeTimer) return;
-    const requestGeneration = this.lifecycleGeneration;
-    this.sessionLogAppendWakeTimer = setTimeout(() => {
-      this.sessionLogAppendWakeTimer = null;
-      if (
-        this.stopped
-        || !this.started
-        || this.lifecycleGeneration !== requestGeneration
-      ) {
-        return;
-      }
-      void this.runHeartbeat('session-log-append')
-        .then(() => {
-          if (this.lifecycleGeneration === requestGeneration) {
-            this.rescheduleAfterEventWake();
-          }
-        })
-        .catch(error => {
-          Logger.warning(`[DistillationHeartbeat] session append wake failed: ${error instanceof Error ? error.message : String(error)}`);
-        });
-    }, SESSION_LOG_APPEND_DEBOUNCE_MS);
-    this.sessionLogAppendWakeTimer.unref?.();
-  }
-
-  private startSessionLogAppendWatcher(): void {
-    if (this.sessionLogAppendSignalListener) return;
-    const runtimeRoot = PathResolver.getRuntimeDataRoot(process.env, this.workingDirectory);
-    const signalPath = PathResolver.getSessionLogAppendSignalPath(runtimeRoot);
-    this.sessionLogAppendSignalPath = signalPath;
-    this.sessionLogAppendSignalListener = (current, previous) => {
-      if (
-        current.mtimeMs === previous.mtimeMs
-        && current.ctimeMs === previous.ctimeMs
-        && current.ino === previous.ino
-      ) {
-        return;
-      }
-      this.requestWake('session-log-append');
-    };
-    fs.watchFile(
-      signalPath,
-      { interval: 250, persistent: false },
-      this.sessionLogAppendSignalListener,
-    );
-  }
-
-  private clearSessionLogAppendWakeTimer(): void {
-    if (!this.sessionLogAppendWakeTimer) return;
-    clearTimeout(this.sessionLogAppendWakeTimer);
-    this.sessionLogAppendWakeTimer = null;
-  }
-
-  private stopSessionLogAppendWatcher(): void {
-    this.clearSessionLogAppendWakeTimer();
-    if (!this.sessionLogAppendSignalListener || !this.sessionLogAppendSignalPath) return;
-    fs.unwatchFile(
-      this.sessionLogAppendSignalPath,
-      this.sessionLogAppendSignalListener,
-    );
-    this.sessionLogAppendSignalListener = null;
-    this.sessionLogAppendSignalPath = null;
-  }
-
-  private rescheduleAfterEventWake(): void {
-    if (this.stopped || !this.started) return;
-    if (this.timer) {
-      clearTimeout(this.timer);
-      this.timer = null;
-    }
-    this.scheduleNextRun();
   }
 
   private persistPendingWakeReasons(): void {
@@ -502,12 +438,80 @@ export class DistillationHeartbeatScheduler {
     );
   }
 
+  /** Preserve deferred background demand when hard pressure closes admission. */
+  private deferWakeForMemoryPressure(reason: RuntimeLearningReason): RuntimeLearningHeartbeatResult {
+    this.pendingWakeReasons.add(reason);
+    this.persistPendingWakeReasons();
+    this.runtimeLearning.markHeartbeatStatus('memory_suspended', {
+      reason,
+      pendingWakeReasons: Array.from(this.pendingWakeReasons).sort(),
+    });
+    return emptyWakeResult(false);
+  }
+
+  /** Merge restart-safe RuntimeLearning demand into this scheduler generation. */
+  private restoreDurablePendingWakeReasons(): void {
+    for (const reason of this.runtimeLearning.getPendingHeartbeatReasons?.() ?? []) {
+      this.pendingWakeReasons.add(reason);
+    }
+  }
+
+  private startMemoryPressurePolling(): void {
+    if (this.pressureTimer || this.stopped) return;
+    const { pollIntervalMs } = getDistillationHeartbeatConfig(this.workingDirectory).memoryPressure;
+    this.pressureTimer = setInterval(() => {
+      this.observeMemoryPressure();
+    }, pollIntervalMs);
+    this.pressureTimer.unref?.();
+  }
+
+  /** Deterministic seam for pressure state-machine regression tests. */
+  observeMemoryPressureForTesting(sample: MemoryPressureSample): MemoryPressureObservation {
+    return this.observeMemoryPressure(sample);
+  }
+
+  private observeMemoryPressure(sample?: MemoryPressureSample): MemoryPressureObservation {
+    const observation = this.memoryPressureGuard.observe(sample ?? this.readMemoryPressureSample());
+    this.runtimeLearning.setMemoryPressureMode(observation.mode);
+    this.runtimeLearning.markMemoryPressureObservation(observation);
+    if (observation.transition !== 'none') {
+      Logger.warning(
+        `[DistillationHeartbeat] memory pressure ${observation.transition} `
+        + `(cgroup=${formatPercent(observation.sample.cgroupPercent)}, `
+        + `hostAvailable=${formatBytes(observation.sample.hostMemAvailableBytes)}, `
+        + `nodeRss=${formatBytes(observation.sample.nodeRssBytes)})`,
+      );
+    }
+    if (observation.transition === 'suspended') {
+      if (this.timer) {
+        clearTimeout(this.timer);
+        this.timer = null;
+      }
+      // RuntimeLearning.setMemoryPressureMode is the single owner of active
+      // wake cancellation, durable pending-reason preservation, and record
+      // schedule clearing. The scheduler only owns its live timeout.
+    }
+    if (
+      !this.stopped
+      && (observation.transition === 'recovered-to-degraded'
+        || observation.transition === 'recovered-to-normal')
+    ) {
+      this.scheduleNextRun(0, 'scheduled');
+    }
+    return observation;
+  }
+
   // -----------------------------------------------------------------------
   // Scheduling
   // -----------------------------------------------------------------------
 
-  private scheduleNextRun(): void {
+  private scheduleNextRun(
+    forcedDelayMs?: number,
+    forcedReason?: RuntimeLearningReason,
+  ): void {
     if (this.stopped) return;
+    if (this.memoryPressureGuard.mode === 'suspended') return;
+
     if (this.timer) {
       clearTimeout(this.timer);
       this.timer = null;
@@ -519,27 +523,30 @@ export class DistillationHeartbeatScheduler {
       Math.max(MIN_TIMEOUT_MS, config.intervalHours * 60 * 60 * 1000),
     );
 
-    let nextDelay: number;
-    let wakeReason: RuntimeLearningReason;
+    let nextDelay: number = forcedDelayMs ?? 0;
+    let wakeReason: RuntimeLearningReason = forcedReason ?? 'scheduled';
     let isImmediateReschedule = false;
-    try {
+    if (forcedDelayMs === undefined) try {
       const plan = this.getActivePlanner().plan();
       if (plan.nextWakeTime !== null) {
         const deadlineDelta = Math.max(0, plan.nextWakeTime - plan.now.getTime());
         if (deadlineDelta < intervalDelay) {
           nextDelay = deadlineDelta;
-          wakeReason = plan.nextWakeReason as RuntimeLearningReason;
+          wakeReason = isRuntimeLearningReason(plan.nextWakeReason)
+            ? plan.nextWakeReason
+            : 'scheduled';
           if (deadlineDelta === 0) {
             isImmediateReschedule = true;
           }
           if (wakeReason === 'operational-retry') {
-            this.consecutiveOperationalRetries += 1;
-            if (this.consecutiveOperationalRetries >= 3) {
-              wakeReason = 'scheduled';
-              nextDelay = intervalDelay;
-              isImmediateReschedule = false;
-              this.consecutiveOperationalRetries = 0;
-            }
+            const rotation = rotateOperationalRetryForDiscovery(
+              deadlineDelta,
+              this.consecutiveOperationalRetries,
+            );
+            this.consecutiveOperationalRetries = rotation.consecutiveOperationalRetries;
+            wakeReason = rotation.reason;
+            nextDelay = rotation.delayMs;
+            isImmediateReschedule = nextDelay === 0;
           } else {
             this.consecutiveOperationalRetries = 0;
           }
@@ -597,18 +604,10 @@ export class DistillationHeartbeatScheduler {
       } : undefined,
     );
 
-    const scheduledGeneration = this.lifecycleGeneration;
     this.timer = setTimeout(() => {
-      if (
-        this.stopped
-        || !this.started
-        || this.lifecycleGeneration !== scheduledGeneration
-      ) {
-        return;
-      }
       const scheduledTask = (async () => {
         await this.runHeartbeat(wakeReason);
-        if (!this.stopped && this.lifecycleGeneration === scheduledGeneration) {
+        if (!this.stopped) {
           this.scheduleNextRun();
         }
       })();

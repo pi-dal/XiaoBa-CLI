@@ -2,6 +2,7 @@ import { ContentBlock, Message } from '../types';
 import { randomUUID } from 'crypto';
 import type {
   ExecutionScope,
+  ScopedArtifactContext,
   ScopedDeviceGrant,
   ScopedDeviceSelection,
   ScopedLocalDeviceGrant,
@@ -39,6 +40,7 @@ import {
   withSyntheticObservationTiming,
 } from './synthetic-observation';
 import { MemorySidecarBranchHandle, startMemorySidecarBranch } from './sidecar-memory-branch';
+import type { CheckpointCompactionCoordinator } from './checkpoint-compaction';
 
 const EMPTY_FINAL_RESPONSE_MESSAGE = '模型本轮未返回有效内容。请重新发送上一条消息；若仍失败，请切换模型或稍后再试。';
 
@@ -80,6 +82,7 @@ export interface RunAgentTurnParams {
   deviceRpc?: DeviceRpcTransport;
   thinToolRpc?: ThinToolRpcTransport;
   targetRoutes?: TargetRoutes;
+  artifactContext?: ScopedArtifactContext;
   localFileGrants?: ScopedLocalFileGrant[];
   pendingUserInputProvider?: PendingUserInputProvider;
   abortSignal?: AbortSignal;
@@ -110,6 +113,8 @@ export interface AgentTurnControllerOptions {
   branchLogRoot?: string;
   getCurrentDirectory: () => string;
   updateCurrentDirectory: (directory: string) => void;
+  checkpointCompactionCoordinator?: CheckpointCompactionCoordinator;
+  persistCheckpoint?: (messages: Message[]) => void | Promise<void>;
 }
 
 interface MemoryBranchSlot {
@@ -159,6 +164,7 @@ export class AgentTurnController {
       deviceGrants: params.deviceGrants,
       deviceSelection: params.deviceSelection,
       targetRoutes: params.targetRoutes,
+      artifactContext: params.artifactContext,
       localFileGrants: params.localFileGrants,
       durableMessages: params.messages,
       runtimeFeedback: params.runtimeFeedback,
@@ -182,6 +188,7 @@ export class AgentTurnController {
       deviceRpc: params.deviceRpc,
       thinToolRpc: params.thinToolRpc,
       targetRoutes: params.targetRoutes,
+      artifactContext: params.artifactContext,
       localFileGrants: params.localFileGrants,
       executionContext: turnContext.executionContext,
       pendingUserInputProvider: params.pendingUserInputProvider,
@@ -269,6 +276,7 @@ export class AgentTurnController {
     deviceRpc?: DeviceRpcTransport;
     thinToolRpc?: ThinToolRpcTransport;
     targetRoutes?: TargetRoutes;
+    artifactContext?: ScopedArtifactContext;
     localFileGrants?: ScopedLocalFileGrant[];
     executionContext?: import('./runtime-context-builder').ExecutionContextSnapshot;
     pendingUserInputProvider?: PendingUserInputProvider;
@@ -288,6 +296,8 @@ export class AgentTurnController {
         pendingUserInputProvider: options.pendingUserInputProvider,
         syntheticObservationProvider: options.syntheticObservationProvider,
         episodeId: options.episodeId,
+        checkpointCompactionCoordinator: this.options.checkpointCompactionCoordinator,
+        onCompactionCheckpoint: this.options.persistCheckpoint,
         // AgentSession/ContextWindowManager compacts durable history before the turn.
         // Runner-level compaction can fold transient runtime feedback into summary.
         enableCompression: false,
@@ -315,6 +325,7 @@ export class AgentTurnController {
           deviceRpc: options.deviceRpc,
           thinToolRpc: options.thinToolRpc,
           targetRoutes: options.targetRoutes,
+          artifactContext: options.artifactContext,
           executionContext: options.executionContext,
           localFileGrants: options.localFileGrants,
           confirmToolExecution: options.confirmToolExecution,

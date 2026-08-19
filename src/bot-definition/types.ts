@@ -12,6 +12,12 @@ export interface CatalogBotModelDefinition {
   kind: 'catalog';
   modelId: string;
   reasoningEffort?: ReasoningEffort;
+  /**
+   * Cloud-authoritative context window for the catalog model when the server
+   * ships it. When present it must win over any device-local profile value so
+   * the catalog cannot drift from what devices actually send upstream.
+   */
+  contextWindowTokens?: number;
 }
 
 /**
@@ -32,6 +38,16 @@ export interface CustomBotModelDefinition {
 
 export type BotModelDefinition = CatalogBotModelDefinition | CustomBotModelDefinition;
 
+/**
+ * Cloud-only handoff marker. It means the device keeps its current runnable
+ * model while the remaining portable fields continue to sync from CatsCompany.
+ * It must never replace the runnable model in the local Definition cache.
+ */
+export interface LocalBotModelHandoffDefinition {
+  kind: 'local';
+  modelId: 'local';
+}
+
 export interface BotPromptDefinition {
   selected: 'default' | 'custom';
   customSystemPrompt?: string;
@@ -40,11 +56,24 @@ export interface BotPromptDefinition {
 /**
  * The deliberately small, portable part of a bot.
  */
+
+export interface BotSkillRef {
+  source: 'skillhub';
+  skillId: string;
+  version: string;
+  contentHash: string;
+}
+
 export interface BotDefinition {
   schema: typeof BOT_DEFINITION_SCHEMA;
   botId: string;
   model: BotModelDefinition;
   prompt?: BotPromptDefinition;
+  skills?: BotSkillRef[];
+}
+
+export interface CloudBotDefinition extends Omit<BotDefinition, 'model'> {
+  model: BotModelDefinition | LocalBotModelHandoffDefinition;
 }
 
 export interface LocalModelProfile {
@@ -75,6 +104,8 @@ export interface LocalModelProfile {
 export interface BotCatalogModelRuntime {
   schema: typeof BOT_CATALOG_MODEL_RUNTIME_SCHEMA;
   botId: string;
+  /** Owner binding for relay credentials. Legacy records may omit it; those are reusable on the bound device and backfilled on reuse. */
+  ownerUid?: string;
   modelId: string;
   provider: 'anthropic' | 'openai';
   apiBase: string;
@@ -107,6 +138,13 @@ export interface BotCustomModelProfile {
 
 export interface BotDefinitionSyncResult {
   botId: string;
-  direction: 'local_to_simulated_cloud' | 'simulated_cloud_to_local' | 'bootstrap_to_simulated_cloud' | 'cloud_to_local';
+  direction:
+    | 'local_cache_update'
+    | 'legacy_simulated_cloud_to_local'
+    | 'legacy_bootstrap_to_local'
+    | 'cloud_to_local'
+    | 'local_to_simulated_cloud'
+    | 'simulated_cloud_to_local'
+    | 'bootstrap_to_simulated_cloud';
   definition: BotDefinition;
 }

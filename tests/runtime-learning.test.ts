@@ -28,6 +28,7 @@ import { DueWorkPlanner, reviewContinuationPathForEpisodeStore } from '../src/ut
 import { DistilledKnowledgeCandidate } from '../src/utils/capability-distiller';
 import {
   EvidenceBundle,
+  SKILL_EVOLUTION_SCHEMA_VERSION,
   SkillEvolutionOptions,
   SkillEvolutionRuntime,
 } from '../src/utils/skill-evolution';
@@ -41,6 +42,10 @@ import { emptyCurrentSkillRegistryState, saveCurrentSkillRegistry } from '../src
 import { bootstrapSemanticReassessmentOnce } from '../src/utils/distilled-skill-bootstrap';
 import { DistillationHeartbeatScheduler } from '../src/utils/distillation-heartbeat-scheduler';
 import { getDistillationHeartbeatConfig } from '../src/utils/distillation-heartbeat-config';
+import type {
+  MemoryPressureObservation,
+  MemoryPressureSample,
+} from '../src/utils/distillation-memory-pressure';
 import {
   loadEvidenceReviewJobStore,
   saveEvidenceReviewJobStore,
@@ -57,6 +62,7 @@ import {
 import { listRunnableQuanta } from '../src/utils/evidence-review-graph-core';
 import {
   ExternalSessionLogSourceAdapter,
+  type SessionLogSourceIdentity,
   type ExternalSourceReader,
   type SessionLogSourceResource,
 } from '../src/utils/session-log-source';
@@ -127,6 +133,35 @@ function frozenEpisodeSource(
     content,
     sourceFilePath,
     turn,
+  };
+}
+
+function eligibleReviewEpisode(
+  episodeId: string,
+  runtimeSessionId: string,
+): LearningEpisode {
+  return {
+    schemaVersion: 3,
+    episodeId,
+    runtimeSessionId,
+    sourceFilePath: `${episodeId}.jsonl`,
+    deliveryTurn: 1,
+    completionEvidence: [{
+      ref: `${episodeId}#1`,
+      sourceFilePath: `${episodeId}.jsonl`,
+      turn: 1,
+      kind: 'artifact-delivery',
+      detail: 'send_file: delivered',
+    }],
+    contradictionSignals: [],
+    sourceEvidence: [frozenEpisodeSource(`${episodeId}#1`, `${episodeId}.jsonl`, 1)],
+    semanticObservations: [{
+      kind: 'user-intent',
+      value: `Deliver ${episodeId}.`,
+      sourceRefs: [`${episodeId}#intent`],
+    }],
+    settlementDeadline: new Date(0).toISOString(),
+    status: 'eligible',
   };
 }
 
@@ -206,17 +241,18 @@ function seedDueReviewContinuation(episodeStorePath: string): void {
   }, null, 2));
 }
 
-async function advanceJobReadyForSkillAuthor(
+async function advanceJobReadyForQuantum(
   env: TestEnv,
   jobId: string,
+  kind: 'skill_author' | 'skill_verifier' | 'commit',
 ): Promise<string> {
   const engine = env.skillEvolution.getEvidenceReviewEngine();
 
-  while (true) {
+  for (let step = 0; step < 32; step++) {
     const current = engine.loadStore().jobs[jobId]!;
     const runnable = listRunnableQuanta(current, new Date());
     assert.ok(runnable.length > 0, 'expected seeded job to stay runnable');
-    if (runnable.some(quantum => quantum.kind === 'skill_author')) {
+    if (runnable.some(quantum => quantum.kind === kind)) {
       return current.jobId;
     }
     const next = runnable[0]!;
@@ -228,6 +264,20 @@ async function advanceJobReadyForSkillAuthor(
     );
     assert.ok(advanced.executedQuantumIds.includes(next.quantumId));
   }
+  const current = engine.loadStore().jobs[jobId];
+  const runnableKinds = current
+    ? listRunnableQuanta(current, new Date()).map(quantum => quantum.kind)
+    : [];
+  throw new Error(
+    `Job ${jobId} did not reach ${kind} after 32 steps; disposition=${current?.disposition}; runnable=${runnableKinds.join(',')}`,
+  );
+}
+
+async function advanceJobReadyForSkillAuthor(
+  env: TestEnv,
+  jobId: string,
+): Promise<string> {
+  return advanceJobReadyForQuantum(env, jobId, 'skill_author');
 }
 
 async function seedActiveJobReadyForSkillAuthor(
@@ -241,6 +291,36 @@ async function seedActiveJobReadyForSkillAuthor(
     workClass: 'live_learning',
   });
   return advanceJobReadyForSkillAuthor(env, job.jobId);
+}
+
+function durableQuantumProgress(env: TestEnv): number {
+  const jobs = env.skillEvolution.getEvidenceReviewEngine().loadStore().jobs;
+  return Object.values(jobs).reduce((total, job) => total + Object.values(job.quanta).reduce(
+    (jobTotal, quantum) => jobTotal + (quantum.state === 'succeeded' ? 1 : 0) + quantum.attempts,
+    0,
+  ), 0);
+}
+
+async function wakeUntil(
+  env: TestEnv,
+  done: () => boolean,
+  maxWakes = 64,
+  onWake?: (result: Awaited<ReturnType<RuntimeLearning['wake']>>) => void,
+): Promise<Awaited<ReturnType<RuntimeLearning['wake']>>> {
+  for (let wake = 0; wake < maxWakes; wake++) {
+    const before = durableQuantumProgress(env);
+    const result = await env.runtimeLearning.wake('manual');
+    onWake?.(result);
+    const after = durableQuantumProgress(env);
+    const maxQuantaPerWake = Math.max(
+      1,
+      Math.floor(env.runtimeLearning.getConfig().skillEvolutionReviewMaxQuantaPerWake),
+    );
+    assert.ok(after - before >= 0 && after - before <= maxQuantaPerWake,
+      `one heartbeat may advance at most ${maxQuantaPerWake} Quanta; observed progress delta ${after - before}`);
+    if (done()) return result;
+  }
+  throw new Error(`Durable review did not converge after ${maxWakes} wakes.`);
 }
 
 function futureTurn(
@@ -396,6 +476,9 @@ function setupEnv(
     CATSCO_USER_DATA_DIR: process.env.CATSCO_USER_DATA_DIR,
     XIAOBA_ELECTRON_USER_DATA_DIR: process.env.XIAOBA_ELECTRON_USER_DATA_DIR,
     XIAOBA_SKILL_EVOLUTION_REASSESSMENT_MANIFEST_FILE: process.env.XIAOBA_SKILL_EVOLUTION_REASSESSMENT_MANIFEST_FILE,
+    XIAOBA_SKILL_EVOLUTION_REVIEWER_CONCURRENCY: process.env.XIAOBA_SKILL_EVOLUTION_REVIEWER_CONCURRENCY,
+    XIAOBA_SKILL_EVOLUTION_REVIEW_MAX_CANDIDATES: process.env.XIAOBA_SKILL_EVOLUTION_REVIEW_MAX_CANDIDATES,
+    XIAOBA_SKILL_EVOLUTION_REVIEW_MAX_QUANTA_PER_WAKE: process.env.XIAOBA_SKILL_EVOLUTION_REVIEW_MAX_QUANTA_PER_WAKE,
     XIAOBA_EXTERNAL_SESSION_LOG_SOURCES_ENABLED: process.env.XIAOBA_EXTERNAL_SESSION_LOG_SOURCES_ENABLED,
     XIAOBA_EXTERNAL_SESSION_LOG_ENABLED_PROVIDERS: process.env.XIAOBA_EXTERNAL_SESSION_LOG_ENABLED_PROVIDERS,
     XIAOBA_EXTERNAL_SESSION_LOG_SELECTED_PROVIDER: process.env.XIAOBA_EXTERNAL_SESSION_LOG_SELECTED_PROVIDER,
@@ -415,6 +498,9 @@ function setupEnv(
   delete process.env.XIAOBA_ELECTRON_USER_DATA_DIR;
   process.env.XIAOBA_RUNTIME_ROOT = root;
   process.env.XIAOBA_SKILL_EVOLUTION_REASSESSMENT_MANIFEST_FILE = reassessmentManifestPath;
+  delete process.env.XIAOBA_SKILL_EVOLUTION_REVIEWER_CONCURRENCY;
+  delete process.env.XIAOBA_SKILL_EVOLUTION_REVIEW_MAX_CANDIDATES;
+  process.env.XIAOBA_SKILL_EVOLUTION_REVIEW_MAX_QUANTA_PER_WAKE = '1';
   process.env.XIAOBA_EXTERNAL_SESSION_LOG_SOURCES_ENABLED = 'false';
   delete process.env.XIAOBA_EXTERNAL_SESSION_LOG_ENABLED_PROVIDERS;
   delete process.env.XIAOBA_EXTERNAL_SESSION_LOG_SELECTED_PROVIDER;
@@ -587,6 +673,29 @@ describe('RuntimeLearning — test environment isolation', () => {
         else process.env[key] = value;
       }
       fs.rmSync(hostileRoot, { recursive: true, force: true });
+    }
+  });
+
+  test('bounds the per-wake review Quantum batch configuration', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'xiaoba-runtime-config-'));
+    try {
+      assert.equal(getDistillationHeartbeatConfig(root, {
+        XIAOBA_RUNTIME_ROOT: root,
+      }).skillEvolutionReviewMaxQuantaPerWake, 8);
+      assert.equal(getDistillationHeartbeatConfig(root, {
+        XIAOBA_RUNTIME_ROOT: root,
+        XIAOBA_SKILL_EVOLUTION_REVIEW_MAX_QUANTA_PER_WAKE: '16',
+      }).skillEvolutionReviewMaxQuantaPerWake, 8);
+      assert.equal(getDistillationHeartbeatConfig(root, {
+        XIAOBA_RUNTIME_ROOT: root,
+        XIAOBA_SKILL_EVOLUTION_REVIEW_MAX_QUANTA_PER_WAKE: '1',
+      }).skillEvolutionReviewMaxQuantaPerWake, 1);
+      assert.equal(getDistillationHeartbeatConfig(root, {
+        XIAOBA_RUNTIME_ROOT: root,
+        XIAOBA_SKILL_EVOLUTION_REVIEW_MAX_QUANTA_PER_WAKE: '17',
+      }).skillEvolutionReviewMaxQuantaPerWake, 8);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
     }
   });
 });
@@ -1001,17 +1110,275 @@ describe('RuntimeLearning — AC3: Due Review', () => {
   beforeEach(() => { env = setupEnv(0); }); // Immediate settlement
   afterEach(() => { env.restore(); env.teardown(); });
 
+  test('preserves the standard review limits', () => {
+    const config = env.runtimeLearning.getConfig();
+
+    assert.equal(config.skillEvolutionReviewerConcurrency, 3);
+    assert.equal(config.skillEvolutionReviewMaxCandidates, 100);
+  });
+
+  test('builds each admission once, shares one skill snapshot, and yields between admissions', async () => {
+    const episodeIds = [
+      'episode-admission-a',
+      'episode-admission-b',
+      'episode-admission-c',
+      'episode-admission-d',
+    ];
+    const episodes: Record<string, LearningEpisode> = {};
+    for (const episodeId of episodeIds) {
+      episodes[episodeId] = eligibleReviewEpisode(episodeId, 'runtime-admission-yield');
+    }
+    env.runtimeLearning.getEpisodeStore().save({ schemaVersion: 3, episodes });
+
+    const originalGetReferencedSkillSnapshots = env.skillEvolution.getReferencedSkillSnapshots;
+    const originalEnqueueReview = env.skillEvolution.enqueueReview;
+    let referencedSnapshotLoads = 0;
+    let admissions = 0;
+    let admissionsWhenEventLoopRegainedControl: number | undefined;
+    env.skillEvolution.getReferencedSkillSnapshots = () => {
+      referencedSnapshotLoads++;
+      return originalGetReferencedSkillSnapshots.call(env.skillEvolution);
+    };
+    env.skillEvolution.enqueueReview = (bundle: EvidenceBundle) => {
+      admissions++;
+      if (admissions === 1) {
+        setImmediate(() => {
+          admissionsWhenEventLoopRegainedControl = admissions;
+        });
+      }
+      return originalEnqueueReview.call(env.skillEvolution, bundle);
+    };
+
+    try {
+      await env.runtimeLearning.wake('startup');
+      await new Promise<void>(resolve => setImmediate(resolve));
+
+      assert.equal(referencedSnapshotLoads, 1);
+      assert.equal(admissions, episodeIds.length);
+      assert.equal(admissionsWhenEventLoopRegainedControl, 1);
+    } finally {
+      env.skillEvolution.getReferencedSkillSnapshots = originalGetReferencedSkillSnapshots;
+      env.skillEvolution.enqueueReview = originalEnqueueReview;
+    }
+  });
+
+  test('keeps a yielded admission batch on one coherent Skill catalog snapshot', async () => {
+    const capabilityHandle = 'cap_coherent_admission_snapshot';
+    const initialRoutingName = 'coherent-admission-snapshot';
+    const skillFilePath = path.join(env.outputDir, capabilityHandle, 'SKILL.md');
+    const writeSkill = (routingName: string): string => {
+      const content = [
+        '---',
+        `name: ${routingName}`,
+        'description: Keep the review catalog coherent.',
+        'user-invocable: true',
+        `x-xiaoba-capability-handle: ${capabilityHandle}`,
+        '---',
+        '',
+        'Keep the review catalog coherent.',
+        '',
+      ].join('\n');
+      fs.mkdirSync(path.dirname(skillFilePath), { recursive: true });
+      fs.writeFileSync(skillFilePath, content, 'utf8');
+      return crypto.createHash('sha256').update(content).digest('hex');
+    };
+    const initialGuidanceHash = writeSkill(initialRoutingName);
+    const initialRegistry = emptyCurrentSkillRegistryState();
+    initialRegistry.catalogRevision = 1;
+    initialRegistry.capabilities[capabilityHandle] = {
+      handle: capabilityHandle,
+      revision: 1,
+      routingName: initialRoutingName,
+      description: 'Keep the review catalog coherent.',
+      skillFilePath,
+      guidanceHash: initialGuidanceHash,
+      evidenceRefs: [],
+      referencedSkills: [],
+      createdAt: new Date(0).toISOString(),
+      updatedAt: new Date(0).toISOString(),
+    };
+    saveCurrentSkillRegistry(env.registryPath, initialRegistry);
+
+    const episodeIds = ['episode-coherent-catalog-a', 'episode-coherent-catalog-b'];
+    const episodes: Record<string, LearningEpisode> = {};
+    const ledger = new SkillUsageLedger(path.join(env.root, 'data', 'skill-usage-ledger.jsonl'));
+    for (const episodeId of episodeIds) {
+      const agentTurnEpisodeId = `turn-${episodeId}`;
+      episodes[episodeId] = {
+        ...eligibleReviewEpisode(episodeId, 'runtime-coherent-catalog'),
+        agentTurnEpisodeId,
+      };
+      ledger.recordGeneratedSkillLoad({
+        runtimeSessionId: 'runtime-coherent-catalog',
+        episodeId: agentTurnEpisodeId,
+        skill: {
+          capabilityHandle,
+          routingName: initialRoutingName,
+          skillFilePath,
+          guidanceHash: initialGuidanceHash,
+        },
+      });
+    }
+    env.runtimeLearning.getEpisodeStore().save({ schemaVersion: 3, episodes });
+
+    const originalEnqueueReview = env.skillEvolution.enqueueReview;
+    const admittedBundles: EvidenceBundle[] = [];
+    let registryChanged = false;
+    env.skillEvolution.enqueueReview = (bundle: EvidenceBundle) => {
+      admittedBundles.push(bundle);
+      const result = originalEnqueueReview.call(env.skillEvolution, bundle);
+      if (admittedBundles.length === 1) {
+        setImmediate(() => {
+          const nextRoutingName = 'coherent-admission-snapshot-v2';
+          const nextGuidanceHash = writeSkill(nextRoutingName);
+          const nextRegistry = emptyCurrentSkillRegistryState();
+          nextRegistry.catalogRevision = 2;
+          nextRegistry.capabilities[capabilityHandle] = {
+            ...initialRegistry.capabilities[capabilityHandle]!,
+            revision: 2,
+            routingName: nextRoutingName,
+            guidanceHash: nextGuidanceHash,
+            updatedAt: new Date().toISOString(),
+          };
+          saveCurrentSkillRegistry(env.registryPath, nextRegistry);
+          registryChanged = true;
+        });
+      }
+      return result;
+    };
+
+    try {
+      await env.runtimeLearning.wake('startup');
+
+      assert.equal(registryChanged, true);
+      assert.equal(admittedBundles.length, episodeIds.length);
+      for (const bundle of admittedBundles) {
+        assert.equal(bundle.referencedSkills[0]?.name, initialRoutingName);
+        assert.equal(bundle.referencedSkills[0]?.guidanceHash, initialGuidanceHash);
+        assert.equal(bundle.relatedCurrentSkills[0]?.routingName, initialRoutingName);
+        assert.equal(bundle.relatedCurrentSkills[0]?.guidanceHash, initialGuidanceHash);
+      }
+    } finally {
+      env.skillEvolution.enqueueReview = originalEnqueueReview;
+    }
+  });
+
+  test('stops remaining admissions when drain starts at an admission yield', async () => {
+    const episodeIds = ['episode-drain-admission-a', 'episode-drain-admission-b'];
+    const episodes: Record<string, LearningEpisode> = {};
+    for (const episodeId of episodeIds) {
+      episodes[episodeId] = eligibleReviewEpisode(episodeId, 'runtime-drain-admission');
+    }
+    env.runtimeLearning.getEpisodeStore().save({ schemaVersion: 3, episodes });
+
+    const originalEnqueueReview = env.skillEvolution.enqueueReview;
+    const firstAdmission = createDeferred<void>();
+    const drainStarted = createDeferred<void>();
+    let admissions = 0;
+    let drainPromise: Promise<boolean> | undefined;
+    env.skillEvolution.enqueueReview = (bundle: EvidenceBundle) => {
+      const result = originalEnqueueReview.call(env.skillEvolution, bundle);
+      admissions++;
+      if (admissions === 1) {
+        firstAdmission.resolve();
+        setImmediate(() => {
+          drainPromise = env.runtimeLearning.drain(1_000);
+          drainStarted.resolve();
+        });
+      }
+      return result;
+    };
+
+    let wake: Promise<RuntimeLearningHeartbeatResult> | undefined;
+    try {
+      wake = env.runtimeLearning.wake('startup');
+      await firstAdmission.promise;
+      await drainStarted.promise;
+      await wake;
+
+      assert.equal(admissions, 1);
+      assert.ok(drainPromise);
+      assert.equal(await drainPromise, true);
+      assert.equal(env.skillEvolution.getReviewedOrQueuedBundleIds().size, 1);
+
+      const continuationPath = reviewContinuationPathForEpisodeStore(env.episodeStorePath);
+      const continuation = JSON.parse(fs.readFileSync(continuationPath, 'utf8')) as {
+        episodeIds: string[];
+      };
+      assert.deepEqual(continuation.episodeIds, [episodeIds[1]!]);
+    } finally {
+      env.skillEvolution.enqueueReview = originalEnqueueReview;
+      if (wake) await Promise.allSettled([wake]);
+      if (drainPromise) await Promise.allSettled([drainPromise]);
+    }
+  });
+
+  test('stops deferred bundle rebuilds when drain starts at a rebuild yield', async () => {
+    const episodeIds = ['episode-drain-deferred-a', 'episode-drain-deferred-b'];
+    const episodes: Record<string, LearningEpisode> = {};
+    for (const episodeId of episodeIds) {
+      episodes[episodeId] = eligibleReviewEpisode(episodeId, 'runtime-deferred-drain');
+    }
+    env.runtimeLearning.getEpisodeStore().save({ schemaVersion: 3, episodes });
+
+    const originalGetDeferredBundleIds = env.skillEvolution.getDeferredReviewBundleIds;
+    const originalReactivateDeferredReviews = env.skillEvolution.reactivateDeferredReviews;
+    const drainStarted = createDeferred<void>();
+    let drainPromise: Promise<boolean> | undefined;
+    let rebuiltBundles: readonly EvidenceBundle[] | undefined;
+    env.skillEvolution.getDeferredReviewBundleIds = () => {
+      setImmediate(() => {
+        drainPromise = env.runtimeLearning.drain(1_000);
+        drainStarted.resolve();
+      });
+      return episodeIds.map(episodeId => `v3:learning-episode:${episodeId}`);
+    };
+    env.skillEvolution.reactivateDeferredReviews = bundles => {
+      rebuiltBundles = bundles;
+      return [];
+    };
+
+    let wake: Promise<RuntimeLearningHeartbeatResult> | undefined;
+    try {
+      wake = env.runtimeLearning.wake('startup');
+      await drainStarted.promise;
+      await wake;
+
+      assert.equal(rebuiltBundles?.length, 1);
+      assert.ok(drainPromise);
+      assert.equal(await drainPromise, true);
+    } finally {
+      env.skillEvolution.getDeferredReviewBundleIds = originalGetDeferredBundleIds;
+      env.skillEvolution.reactivateDeferredReviews = originalReactivateDeferredReviews;
+      if (wake) await Promise.allSettled([wake]);
+      if (drainPromise) await Promise.allSettled([drainPromise]);
+    }
+  });
+
   test('an accepted single episode bootstraps a Current Skill without a prior Skill load', async () => {
     const [delivery, acceptance] = deliveryPair(-2); // 2 hours ago
     writeLog(env.logFile, [delivery, acceptance]);
 
-    // With settlementWindowMs=0, the full cycle runs in one wake:
-    // ingestion → settlement (due) → review (eligible episode)
+    // The first wake ingests, settles, and durably admits the review. Later
+    // wakes advance at most one graph Quantum until the transition commits.
     const result = await env.runtimeLearning.wake('startup');
 
     assert.ok(result.ingestion.admittedEpisodes >= 1);
     assert.ok(result.maturation.becameEligible >= 1);
-    assert.equal(result.review.reviewedEpisodes, 1);
+    assert.equal(result.review.reviewedEpisodes, 0);
+    assert.equal(env.skillEvolution.getReviewedOrQueuedBundleIds().size, 1);
+
+    const commitWake = await wakeUntil(
+      env,
+      () => Object.keys(readOrEmpty(env.registryPath)?.capabilities ?? {}).length === 1,
+    );
+    assert.equal(commitWake.review.reviewedEpisodes, 1);
+    assert.equal(commitWake.review.reviewedQueueEntries, 0);
+    assert.equal(commitWake.review.transitionsByKind.create_current_skill, 1);
+    const afterCommitWake = await env.runtimeLearning.wake('manual');
+    assert.equal(afterCommitWake.review.reviewedEpisodes, 0);
+    assert.equal(afterCommitWake.review.transitionsByKind.create_current_skill, undefined);
+    assert.equal(env.skillEvolution.getAudit().filter(entry => entry.transition === 'create_current_skill').length, 1);
     assert.equal(env.branchCalls.author, 1);
     assert.equal(env.branchCalls.verifier, 1);
 
@@ -1019,6 +1386,25 @@ describe('RuntimeLearning — AC3: Due Review', () => {
     assert.equal(Object.keys(registry?.capabilities ?? {}).length, 1);
     const heartbeat = readOrEmpty(path.join(env.root, 'data', 'heartbeat-record.json'));
     assert.equal(heartbeat?.backlog?.eligibleEpisodes, 0);
+  });
+
+  test('projects the durable commit outcome when a commit-time gate rejects the draft', async () => {
+    env.skillEvolutionOptions.manualSkillNames = ['test-report-delivery'];
+    const [delivery, acceptance] = deliveryPair(-2);
+    writeLog(env.logFile, [delivery, acceptance]);
+
+    await env.runtimeLearning.wake('startup');
+    const commitWake = await wakeUntil(
+      env,
+      () => Object.values(env.skillEvolution.getEvidenceReviewEngine().loadStore().jobs)
+        .some(job => job.disposition === 'completed'),
+    );
+
+    assert.equal(commitWake.review.reviewedEpisodes, 1);
+    assert.equal(commitWake.review.transitionsByKind.reject_candidate, 1);
+    assert.equal(commitWake.review.transitionsByKind.create_current_skill, undefined);
+    assert.equal(Object.keys(readOrEmpty(env.registryPath)?.capabilities ?? {}).length, 0);
+    assert.equal(env.skillEvolution.getAudit()[0]?.transition, 'reject_candidate');
   });
 
   test('a settled delivery without explicit acceptance still enters capability review', async () => {
@@ -1035,7 +1421,12 @@ describe('RuntimeLearning — AC3: Due Review', () => {
     const result = await env.runtimeLearning.wake('startup');
 
     assert.ok(result.ingestion.admittedEpisodes >= 1, 'the delivery remains available for later correction');
-    assert.equal(result.review.reviewedEpisodes, 1);
+    assert.equal(result.review.reviewedEpisodes, 0);
+    assert.equal(env.skillEvolution.getReviewedOrQueuedBundleIds().size, 1);
+    await wakeUntil(
+      env,
+      () => Object.keys(readOrEmpty(env.registryPath)?.capabilities ?? {}).length === 1,
+    );
     assert.equal(env.branchCalls.author, 1);
     assert.equal(env.branchCalls.verifier, 1);
     const registry = readOrEmpty(env.registryPath);
@@ -1077,7 +1468,13 @@ describe('RuntimeLearning — AC3: Due Review', () => {
     const result = await env.runtimeLearning.wake('startup');
 
     assert.equal(result.ingestion.admittedEpisodes, 1);
-    assert.equal(result.review.transitionsByKind.create_current_skill, 1);
+    assert.equal(result.review.reviewedEpisodes, 0);
+    await wakeUntil(
+      env,
+      () => Object.values(readOrEmpty(env.registryPath)?.capabilities ?? {})
+        .some((record: any) => record.routingName === 'use-npm-for-node-tasks'),
+    );
+    assert.equal(env.skillEvolution.getAudit().filter(entry => entry.transition === 'create_current_skill').length, 1);
     const records = Object.values(readOrEmpty(env.registryPath).capabilities) as Array<{ routingName: string }>;
     assert.deepEqual(records.map(record => record.routingName), ['use-npm-for-node-tasks']);
   });
@@ -1134,6 +1531,8 @@ describe('RuntimeLearning — AC3: Due Review', () => {
     assert.equal(result.ingestion.admittedEpisodes, 1);
     const state = readOrEmpty(env.episodeStorePath);
     assert.equal(Object.keys(state?.episodes ?? {}).length, 1);
+    assert.equal(env.skillEvolution.getReviewedOrQueuedBundleIds().size, 1);
+    await wakeUntil(env, () => env.branchCalls.verifier === 1);
     assert.equal(env.branchCalls.author, 1);
     assert.equal(env.branchCalls.verifier, 1);
   });
@@ -1258,7 +1657,12 @@ describe('RuntimeLearning — AC3: Due Review', () => {
 
     const result = await env.runtimeLearning.wake('startup');
 
-    assert.equal(result.review.transitionsByKind.append_evidence, 1);
+    assert.equal(result.review.reviewedEpisodes, 0);
+    await wakeUntil(
+      env,
+      () => readOrEmpty(env.registryPath)?.capabilities?.[capabilityHandle]?.revision === 2,
+    );
+    assert.equal(env.skillEvolution.getAudit().filter(entry => entry.transition === 'append_evidence').length, 1);
     assert.equal(authorCalls, 1);
     assert.equal(verifierCalls, 1);
     const updated = readOrEmpty(env.registryPath);
@@ -1270,7 +1674,7 @@ describe('RuntimeLearning — AC3: Due Review', () => {
     ));
   });
 
-  test('one wake creates from a transferable single episode and defers an unobserved candidate', async () => {
+  test('durable wakes create from a transferable episode and defer an unobserved candidate', async () => {
     const customEnv = setupEnv(0, {
       authorFixture: ({ bundle }) => {
         const hasObservation = (bundle.semanticObservations?.length ?? 0) > 0;
@@ -1331,8 +1735,28 @@ describe('RuntimeLearning — AC3: Due Review', () => {
 
       const result = await customEnv.runtimeLearning.wake('startup');
 
-      assert.equal(result.review.transitionsByKind.create_current_skill, 1);
-      assert.equal(result.review.transitionsByKind.defer, 1);
+      assert.equal(result.review.reviewedEpisodes, 0);
+      assert.equal(customEnv.skillEvolution.getReviewedOrQueuedBundleIds().size, 2);
+      let reportedEpisodes = 0;
+      let reportedCreates = 0;
+      let reportedDefers = 0;
+      await wakeUntil(customEnv, () => {
+        const state = loadEvidenceReviewJobStore(
+          evidenceReviewJobStorePathForReviewQueue(customEnv.reviewQueuePath),
+        );
+        return Object.values(state.jobs).filter(job => (
+          job.disposition === 'completed' || job.disposition === 'deferred'
+        )).length === 2;
+      }, 128, wake => {
+        reportedEpisodes += wake.review.reviewedEpisodes;
+        reportedCreates += wake.review.transitionsByKind.create_current_skill ?? 0;
+        reportedDefers += wake.review.transitionsByKind.defer ?? 0;
+      });
+      assert.equal(reportedEpisodes, 2);
+      assert.equal(reportedCreates, 1);
+      assert.equal(reportedDefers, 1);
+      assert.equal(customEnv.skillEvolution.getAudit().filter(entry => entry.transition === 'create_current_skill').length, 1);
+      assert.equal(customEnv.skillEvolution.getAudit().filter(entry => entry.transition === 'defer').length, 1);
       assert.equal(Object.values(readOrEmpty(customEnv.registryPath)?.capabilities ?? {}).length, 1);
       const jobs = loadEvidenceReviewJobStore(
         evidenceReviewJobStorePathForReviewQueue(customEnv.reviewQueuePath),
@@ -1360,6 +1784,93 @@ describe('RuntimeLearning — AC3: Due Review', () => {
 
     assert.equal(result.review.status, 'succeeded');
     assert.ok(result.review.operationalRetries >= 0);
+  });
+
+  test('a targeted wake reconciles a stranded non-operational Job before review is due', async () => {
+    const bundle: EvidenceBundle = {
+      ...runtimeReviewBundle('test-stranded-entry'),
+      sourceEvidence: [
+        {
+          ref: 'session.jsonl#12',
+          role: 'problem-action',
+          content: 'The bounded workflow was requested and completed.',
+        },
+        {
+          ref: 'session.jsonl#13',
+          role: 'verification',
+          content: 'The bounded result was accepted.',
+        },
+      ],
+    };
+    const engine = env.skillEvolution.getEvidenceReviewEngine();
+    const job = engine.createJob({
+      bundle,
+      candidate: bundle.episode as DistilledKnowledgeCandidate,
+      workClass: 'live_learning',
+    });
+    const state = engine.loadStore();
+    const stranded = state.jobs[job.jobId]!;
+    const roots = Object.values(stranded.quanta)
+      .filter(quantum => quantum.dependencyQuantumIds.length === 0);
+    assert.ok(roots.length >= 2);
+    for (const quantum of roots) {
+      quantum.state = 'succeeded';
+      quantum.updatedAt = new Date(0).toISOString();
+    }
+    const failedRoot = roots[0]!;
+    failedRoot.state = 'terminal_failed';
+    failedRoot.attempts = 5;
+    failedRoot.failureKind = 'invalid_completion_schema';
+    failedRoot.failureReason = 'schema-validation-error';
+    failedRoot.failureMessage = 'invalid_completion_schema: reader returned empty completion';
+    for (const quantum of Object.values(stranded.quanta)) {
+      if (quantum.state !== 'pending') continue;
+      (quantum as { dependencyQuantumIds: readonly string[] }).dependencyQuantumIds = [failedRoot.quantumId];
+    }
+    stranded.disposition = 'active';
+    stranded.nextDueAt = undefined;
+    engine.saveStore(state);
+
+    const result = await env.runtimeLearning.wake('operational-retry');
+    const repaired = engine.loadStore().jobs[job.jobId]!;
+
+    assert.equal(result.review.status, 'skipped');
+    assert.equal(repaired.disposition, 'terminal_failed');
+    assert.equal(repaired.nextDueAt, undefined);
+    assert.match(repaired.terminalReason ?? '', /review_job_stranded/);
+    assert.equal(
+      fs.existsSync(`${evidenceReviewJobStorePathForReviewQueue(env.reviewQueuePath)}.before-stranded-job-reconcile-v1`),
+      true,
+    );
+  });
+
+  test('one wake advances a bounded serial batch across Jobs and at most one Quantum per Job', async () => {
+    const engine = env.skillEvolution.getEvidenceReviewEngine();
+    const jobIds = Array.from({ length: 10 }, (_, index) => {
+      const bundle = runtimeReviewBundle(`v3:batch-${index}.jsonl:0:20:batch-review-${index}`);
+      return engine.ensureJob({
+        bundle,
+        candidate: bundle.episode as DistilledKnowledgeCandidate,
+        workClass: 'live_learning',
+      }).jobId;
+    });
+    (env.runtimeLearning.getConfig() as any).skillEvolutionReviewMaxQuantaPerWake = 8;
+    seedDueReviewContinuation(env.episodeStorePath);
+
+    const before = engine.loadStore();
+    await env.runtimeLearning.wake('manual');
+    const after = engine.loadStore();
+
+    const progressByJob = jobIds.map(jobId => {
+      const succeededBefore = Object.values(before.jobs[jobId]!.quanta)
+        .filter(quantum => quantum.state === 'succeeded').length;
+      const succeededAfter = Object.values(after.jobs[jobId]!.quanta)
+        .filter(quantum => quantum.state === 'succeeded').length;
+      return succeededAfter - succeededBefore;
+    });
+    assert.equal(progressByJob.reduce((sum, value) => sum + value, 0), 8);
+    assert.equal(progressByJob.filter(value => value === 1).length, 8);
+    assert.equal(progressByJob.every(value => value >= 0 && value <= 1), true);
   });
 
   test('candidate cap persists a restart-safe continuation and schedules it', async () => {
@@ -1396,7 +1907,8 @@ describe('RuntimeLearning — AC3: Due Review', () => {
     (env.runtimeLearning.getConfig() as any).skillEvolutionReviewMaxCandidates = 1;
 
     const result = await env.runtimeLearning.wake('startup');
-    assert.equal(result.review.reviewedEpisodes, 1);
+    assert.equal(result.review.reviewedEpisodes, 0);
+    assert.equal(env.skillEvolution.getReviewedOrQueuedBundleIds().size, 1);
     const continuationPath = reviewContinuationPathForEpisodeStore(env.episodeStorePath);
     const continuation = JSON.parse(fs.readFileSync(continuationPath, 'utf8')) as {
       episodeIds: string[];
@@ -1675,8 +2187,8 @@ describe('RuntimeLearning — AC3: Due Review', () => {
     const historicalWake = await env.runtimeLearning.wake('manual');
 
     assert.equal(retryWake.review.reviewedEpisodes, 0);
-    assert.equal(liveWake.review.reviewedEpisodes, 1);
-    assert.equal(historicalWake.review.reviewedEpisodes, 1);
+    assert.equal(liveWake.review.reviewedEpisodes, 0);
+    assert.equal(historicalWake.review.reviewedEpisodes, 0);
     const reviewed = env.skillEvolution.getReviewedOrQueuedBundleIds();
     assert.equal(reviewed.has(`v3:learning-episode:${live.episodeId}`), true);
     assert.equal(reviewed.has(`v3:learning-episode:${historical.episodeId}`), true);
@@ -1690,7 +2202,7 @@ describe('RuntimeLearning — AC3: Due Review', () => {
     );
   });
 
-  test('drain leaves an in-flight review to the scheduler shared deadline', async () => {
+  test('drain cancels an in-flight review without consuming its attempt', async () => {
     const episodeId = 'episode-drain-cancel';
     env.runtimeLearning.getEpisodeStore().save({
       schemaVersion: 3,
@@ -1720,37 +2232,43 @@ describe('RuntimeLearning — AC3: Due Review', () => {
         },
       },
     });
-    let started!: () => void;
-    const startedPromise = new Promise<void>(resolve => { started = resolve; });
-    const originalReview = env.skillEvolution.reviewAndApply.bind(env.skillEvolution);
+    await env.runtimeLearning.wake('startup');
+    const job = Object.values(env.skillEvolution.getEvidenceReviewEngine().loadStore().jobs)
+      .find(candidate => candidate.bundle.bundleId === `v3:learning-episode:${episodeId}`)!;
+    await advanceJobReadyForSkillAuthor(env, job.jobId);
+
+    const engine = env.skillEvolution.getEvidenceReviewEngine();
+    const originalAuthor = (engine as any).options.runSkillAuthor;
+    const started = createDeferred<void>();
+    const release = createDeferred<void>();
     let observedAbort = false;
-    let completeReview!: (result: any) => void;
-    env.skillEvolution.reviewAndApply = async (_bundle: any, signal?: AbortSignal) => {
-      started();
-      return await new Promise<any>((resolve, reject) => {
-        completeReview = resolve;
-        const abort = () => {
-          observedAbort = true;
-          reject(new Error('runtime shutdown aborted review'));
-        };
-        if (signal?.aborted) abort();
-        else signal?.addEventListener('abort', abort, { once: true });
-      });
+    (engine as any).options.runSkillAuthor = async (input: { signal?: AbortSignal }) => {
+      started.resolve();
+      input.signal?.addEventListener('abort', () => { observedAbort = true; }, { once: true });
+      await release.promise;
+      return originalAuthor(input);
     };
 
+    let wake: Promise<Awaited<ReturnType<RuntimeLearning['wake']>>> | undefined;
     try {
-      const wake = env.runtimeLearning.wake('startup');
-      await startedPromise;
-      await env.runtimeLearning.drain(100);
-      assert.equal(observedAbort, false);
-      completeReview({ transition: 'defer', verified: false, rounds: 1 });
+      wake = env.runtimeLearning.wake('manual');
+      await started.promise;
+      assert.equal(await env.runtimeLearning.drain(20), false);
+      assert.equal(observedAbort, true);
+      release.resolve();
       const result = await wake;
-      assert.equal(observedAbort, false);
+      assert.equal(observedAbort, true);
       assert.equal(result.review.status, 'succeeded');
-      assert.equal(env.skillEvolution.getAudit().length, 0);
-      assert.equal(countActiveOperational(loadEvidenceReviewJobStore(evidenceReviewJobStorePathForReviewQueue(env.reviewQueuePath))), 0);
+      const persisted = engine.loadStore().jobs[job.jobId]!;
+      const author = Object.values(persisted.quanta).find(quantum => quantum.kind === 'skill_author')!;
+      assert.equal(author.state, 'pending');
+      assert.equal(author.failureReason, 'runtime-shutdown');
+      assert.equal(author.nextRetryAt, undefined);
+      assert.equal(author.attempts, 0);
     } finally {
-      env.skillEvolution.reviewAndApply = originalReview;
+      release.resolve();
+      if (wake) await Promise.allSettled([wake]);
+      (engine as any).options.runSkillAuthor = originalAuthor;
     }
   });
 
@@ -1786,21 +2304,21 @@ describe('RuntimeLearning — AC3: Due Review', () => {
     });
 
     const originalRunMaturation = (env.runtimeLearning as any).runMaturation.bind(env.runtimeLearning);
-    const originalReview = env.skillEvolution.reviewAndApply.bind(env.skillEvolution);
+    const originalEnqueueReview = env.skillEvolution.enqueueReview.bind(env.skillEvolution);
     let releaseMaturation!: () => void;
     const maturationBlocked = new Promise<void>(resolve => { releaseMaturation = resolve; });
     let maturationStarted!: () => void;
     const maturationStartedPromise = new Promise<void>(resolve => { maturationStarted = resolve; });
-    let reviewCalls = 0;
+    let reviewAdmissions = 0;
 
     (env.runtimeLearning as any).runMaturation = async (...args: any[]) => {
       maturationStarted();
       await maturationBlocked;
       return originalRunMaturation(...args);
     };
-    env.skillEvolution.reviewAndApply = async (...args: any[]) => {
-      reviewCalls += 1;
-      return originalReview(...args);
+    env.skillEvolution.enqueueReview = (bundle: EvidenceBundle) => {
+      reviewAdmissions += 1;
+      return originalEnqueueReview(bundle);
     };
 
     try {
@@ -1809,17 +2327,19 @@ describe('RuntimeLearning — AC3: Due Review', () => {
       await env.runtimeLearning.drain(100);
       releaseMaturation();
       const result = await wake;
-      assert.equal(reviewCalls, 0);
+      assert.equal(reviewAdmissions, 0);
       assert.equal(result.review.reviewedEpisodes, 0);
       assert.equal(env.runtimeLearning.getEpisodeStore().load().episodes[episodeId]?.status, 'eligible');
-      assert.equal(countActiveOperational(loadEvidenceReviewJobStore(evidenceReviewJobStorePathForReviewQueue(env.reviewQueuePath))), 0);
+      const store = loadEvidenceReviewJobStore(evidenceReviewJobStorePathForReviewQueue(env.reviewQueuePath));
+      assert.equal(Object.keys(store.jobs).length, 0);
     } finally {
+      releaseMaturation();
       (env.runtimeLearning as any).runMaturation = originalRunMaturation;
-      env.skillEvolution.reviewAndApply = originalReview;
+      env.skillEvolution.enqueueReview = originalEnqueueReview;
     }
   });
 
-  test('drain waits for a timing-out active review to durably queue operational retry before wake exit', async () => {
+  test('drain releases an in-flight review without creating an operational retry', async () => {
     const episodeId = 'episode-drain-review-timeout';
     env.runtimeLearning.getEpisodeStore().save({
       schemaVersion: 3,
@@ -1850,37 +2370,35 @@ describe('RuntimeLearning — AC3: Due Review', () => {
       },
     });
 
-    const originalReview = env.skillEvolution.reviewAndApply.bind(env.skillEvolution);
-    let started!: () => void;
-    const startedPromise = new Promise<void>(resolve => { started = resolve; });
-    env.skillEvolution.reviewAndApply = async (bundle: any) => {
-      started();
-      await new Promise(resolve => setTimeout(resolve, 50));
-      seedOperationalFailure(env.reviewQueuePath, bundle, 'simulated active review deadline expiry during drain', new Date());
-      return {
-        transition: 'reject_candidate' as const,
-        verified: false,
-        rounds: 1,
-        queued: 'operational' as const,
-        queueEntryId: findOperationalJobByBundleId(
-          loadEvidenceReviewJobStore(evidenceReviewJobStorePathForReviewQueue(env.reviewQueuePath)),
-          bundle.bundleId,
-        )?.jobId,
-      };
-    };
+    await env.runtimeLearning.wake('startup');
+    const job = Object.values(env.skillEvolution.getEvidenceReviewEngine().loadStore().jobs)
+      .find(candidate => candidate.bundle.bundleId === `v3:learning-episode:${episodeId}`)!;
+    await advanceJobReadyForSkillAuthor(env, job.jobId);
+
+    const engine = env.skillEvolution.getEvidenceReviewEngine();
+    const originalAuthor = (engine as any).options.runSkillAuthor;
+    const started = createDeferred<void>();
+    (engine as any).options.runSkillAuthor = ({ signal }: { signal?: AbortSignal }) => new Promise((_resolve, reject) => {
+      started.resolve();
+      const abort = () => reject(new Error('provider surfaced a generic timeout error'));
+      if (signal?.aborted) abort();
+      else signal?.addEventListener('abort', abort, { once: true });
+    });
 
     try {
-      const wake = env.runtimeLearning.wake('startup');
-      await startedPromise;
-      await env.runtimeLearning.drain(200);
+      const wake = env.runtimeLearning.wake('manual');
+      await started.promise;
+      assert.equal(await env.runtimeLearning.drain(500), true);
       const result = await wake;
-      const entry = findOperationalJobByBundleId(loadEvidenceReviewJobStore(evidenceReviewJobStorePathForReviewQueue(env.reviewQueuePath)), `v3:learning-episode:${episodeId}`);
-      assert.ok(entry);
-      assert.equal(result.review.reviewedEpisodes, 1);
-      assert.equal(result.review.operationalQueueReviews, 0);
-      assert.equal(result.review.reviewTimeoutCount, 1);
+      assert.equal(result.review.reviewedEpisodes, 0);
+      const persisted = engine.loadStore().jobs[job.jobId]!;
+      const author = Object.values(persisted.quanta).find(quantum => quantum.kind === 'skill_author')!;
+      assert.equal(author.state, 'pending');
+      assert.equal(author.failureReason, 'runtime-shutdown');
+      assert.equal(author.nextRetryAt, undefined);
+      assert.equal(author.attempts, 0);
     } finally {
-      env.skillEvolution.reviewAndApply = originalReview;
+      (engine as any).options.runSkillAuthor = originalAuthor;
     }
   });
 
@@ -1915,34 +2433,39 @@ describe('RuntimeLearning — AC3: Due Review', () => {
       },
     });
 
-    let reviewStarted!: () => void;
-    const reviewStartedPromise = new Promise<void>(resolve => { reviewStarted = resolve; });
-    let releaseReview!: () => void;
-    const reviewGate = new Promise<void>(resolve => { releaseReview = resolve; });
-    const originalReview = env.skillEvolution.reviewAndApply.bind(env.skillEvolution);
-    env.skillEvolution.reviewAndApply = async (...args: any[]) => {
-      reviewStarted();
-      await reviewGate;
-      return originalReview(...args);
+    await env.runtimeLearning.wake('startup');
+    const job = Object.values(env.skillEvolution.getEvidenceReviewEngine().loadStore().jobs)
+      .find(candidate => candidate.bundle.bundleId === `v3:learning-episode:${episodeId}`)!;
+    await advanceJobReadyForSkillAuthor(env, job.jobId);
+
+    const engine = env.skillEvolution.getEvidenceReviewEngine();
+    const originalAuthor = (engine as any).options.runSkillAuthor;
+    const reviewStarted = createDeferred<void>();
+    const reviewGate = createDeferred<void>();
+    (engine as any).options.runSkillAuthor = async (input: unknown) => {
+      reviewStarted.resolve();
+      await reviewGate.promise;
+      return originalAuthor(input);
     };
 
+    let wake: Promise<Awaited<ReturnType<RuntimeLearning['wake']>>> | undefined;
+    let drainPromise: Promise<boolean> | undefined;
     try {
-      const wake = env.runtimeLearning.wake('startup');
-      await reviewStartedPromise;
+      wake = env.runtimeLearning.wake('manual');
+      await reviewStarted.promise;
 
-      // Drain must observe the active wake promise (activeWakeResults) and wait
-      // boundedly while the wake finishes durable settlement.
+      // Drain must observe the active wake promise and wait boundedly while the
+      // already-leased Quantum finishes durable settlement.
       const drainStarted = Date.now();
-      const drainPromise = env.runtimeLearning.drain(500);
-      // Give drain a tick to set shutdownDrainRequested before release.
+      drainPromise = env.runtimeLearning.drain(500);
       await new Promise(resolve => setImmediate(resolve));
       assert.equal(
         (env.runtimeLearning as any).shutdownDrainRequested,
         true,
         'drain arms the stop-new-leases gate',
       );
-      releaseReview();
-      await drainPromise;
+      reviewGate.resolve();
+      assert.equal(await drainPromise, true);
       const result = await wake;
       assert.ok(Date.now() - drainStarted < 2_000, 'drain returns after wake settlement within bound');
       assert.equal(
@@ -1950,13 +2473,25 @@ describe('RuntimeLearning — AC3: Due Review', () => {
         0,
         'active wake tracking cleared after settlement',
       );
-      // Wake may complete review that already started; new fair leases are gated.
-      assert.ok(
-        result.review.status === 'succeeded' || result.review.status === 'partial',
-        `wake settled under drain: ${result.review.status}`,
+      assert.equal(result.review.status, 'succeeded');
+      const persisted = engine.loadStore().jobs[job.jobId]!;
+      const author = Object.values(persisted.quanta).find(quantum => quantum.kind === 'skill_author')!;
+      assert.equal(author.state, 'pending');
+      assert.equal(author.failureReason, 'runtime-shutdown');
+      assert.equal(author.attempts, 0);
+      assert.equal(Object.values(persisted.quanta).some(quantum => quantum.state === 'leased'), false);
+      assert.equal(
+        listRunnableQuanta(persisted, new Date()).some(quantum => quantum.kind === 'skill_verifier'),
+        false,
+        'downstream verifier remains blocked while the cancelled author is pending',
       );
     } finally {
-      env.skillEvolution.reviewAndApply = originalReview;
+      reviewGate.resolve();
+      await Promise.allSettled([
+        ...(drainPromise ? [drainPromise] : []),
+        ...(wake ? [wake] : []),
+      ]);
+      (engine as any).options.runSkillAuthor = originalAuthor;
     }
   });
 });
@@ -2005,7 +2540,8 @@ describe('Issue 70 — Wake reason union and mask-free due-work', () => {
     assert.equal(result.discovery.scanned, false);
     assert.equal(result.maturation.status, 'succeeded');
     assert.equal(result.maturation.becameEligible, 1);
-    assert.equal(result.review.reviewedEpisodes, 1);
+    assert.equal(result.review.reviewedEpisodes, 0);
+    assert.equal(env.skillEvolution.getReviewedOrQueuedBundleIds().has('v3:learning-episode:issue-70-settling'), true);
     const operationalJob = findOperationalJobByBundleId(
       loadEvidenceReviewJobStore(evidenceReviewJobStorePathForReviewQueue(env.reviewQueuePath)),
       'issue-70-operational',
@@ -2029,7 +2565,8 @@ describe('Issue 70 — Wake reason union and mask-free due-work', () => {
     assert.equal(result.ingestion.admittedEpisodes, 1);
     assert.equal(result.maturation.status, 'succeeded');
     assert.equal(result.review.status, 'succeeded');
-    assert.ok(result.review.reviewedEpisodes >= 1);
+    assert.equal(result.review.reviewedEpisodes, 0);
+    assert.equal(env.skillEvolution.getReviewedOrQueuedBundleIds().size, 1);
   });
 });
 
@@ -2453,6 +2990,10 @@ describe('RuntimeLearning — AC5: Discovery', () => {
     const [delivery, acceptance] = deliveryPair(-2);
     writeLog(env.logFile, [delivery, acceptance]);
     await env.runtimeLearning.wake('startup');
+    await wakeUntil(
+      env,
+      () => Object.keys(readOrEmpty(env.registryPath)?.capabilities ?? {}).length === 1,
+    );
 
     const registry = readOrEmpty(env.registryPath);
     assert.equal(Object.keys(registry?.capabilities ?? {}).length, 1);
@@ -2465,6 +3006,7 @@ describe('RuntimeLearning — AC5: Discovery', () => {
     const [delivery, acceptance] = deliveryPair(-2);
     writeLog(env.logFile, [delivery, acceptance]);
     await env.runtimeLearning.wake('startup');
+    await wakeUntil(env, () => env.skillEvolution.getAudit().length === 1);
 
     const episodes = Object.values(
       env.runtimeLearning.getEpisodeStore().load().episodes,
@@ -2661,18 +3203,15 @@ describe('Issue 2 — Generic wake reconciliation', () => {
 
     assert.equal(result.review.status, 'succeeded',
       `expected 'succeeded' got '${result.review.status}'`);
-    assert.equal(result.review.reviewedEpisodes, 1,
-      'expected 1 reviewed episode');
+    assert.equal(result.review.reviewedEpisodes, 0,
+      'the first wake durably admits rather than drains the review');
+    assert.equal(env.skillEvolution.getReviewedOrQueuedBundleIds().size, 1);
+    await wakeUntil(env, () => env.skillEvolution.getAudit().length === 1);
     assert.ok(env.branchCalls.author > branchCallsBefore.author,
       `expected author call, was ${env.branchCalls.author} before ${branchCallsBefore.author}`);
     assert.ok(env.branchCalls.verifier > branchCallsBefore.verifier,
       `expected verifier call, was ${env.branchCalls.verifier} before ${branchCallsBefore.verifier}`);
-
-    // A transition was recorded
-    const foundCreation = Object.entries(result.review.transitionsByKind)
-      .some(([kind, count]) => kind === 'create_current_skill' && (count as number) >= 1);
-    assert.ok(foundCreation,
-      `expected create_current_skill, got ${JSON.stringify(result.review.transitionsByKind)}`);
+    assert.equal(env.skillEvolution.getAudit()[0]?.transition, 'create_current_skill');
   });
 });
 
@@ -2682,21 +3221,20 @@ describe('Issue 3 — Review failure status', () => {
   beforeEach(() => { env = setupEnv(0); });
   afterEach(() => { env.restore(); env.teardown(); });
 
-  test('per-episode review failure reports failed status with error message', async () => {
+  test('per-episode review admission failure reports failed status with error message', async () => {
     const [delivery, acceptance] = deliveryPair(-2);
     delivery.episode_id = 'turn-review-failure';
     recordReviewAdmissionLoad(env, delivery.episode_id, delivery.session_id);
     writeLog(env.logFile, [delivery, acceptance]);
 
-    // Override reviewAndApply to throw on first call
-    const originalReviewAndApply = env.skillEvolution.reviewAndApply.bind(env.skillEvolution);
+    const originalEnqueueReview = env.skillEvolution.enqueueReview.bind(env.skillEvolution);
     let callCount = 0;
-    env.skillEvolution.reviewAndApply = async (bundle: any) => {
+    env.skillEvolution.enqueueReview = (bundle: any) => {
       callCount++;
       if (callCount === 1) {
-        throw new Error('Simulated episode review failure');
+        throw new Error('Simulated episode review admission failure');
       }
-      return originalReviewAndApply(bundle);
+      return originalEnqueueReview(bundle);
     };
 
     try {
@@ -2707,12 +3245,51 @@ describe('Issue 3 — Review failure status', () => {
       assert.ok(result.review.errorMessage, 'expected error message');
       assert.ok(result.review.errorMessage!.includes('episode review(s) failed'),
         `expected episode failure in message, got: ${result.review.errorMessage}`);
-
-      // Episode was not reviewed but counts still have the correct value
       assert.equal(result.review.reviewedEpisodes, 0,
-        'expected 0 reviewed episodes (the only episode failed)');
+        'expected 0 reviewed episodes (the only admission failed)');
     } finally {
-      env.skillEvolution.reviewAndApply = originalReviewAndApply;
+      env.skillEvolution.enqueueReview = originalEnqueueReview;
+    }
+  });
+
+  test('Author Quantum failure persists one retry without an audit', async () => {
+    const [delivery, acceptance] = deliveryPair(-2);
+    delivery.episode_id = 'turn-author-quantum-failure';
+    recordReviewAdmissionLoad(env, delivery.episode_id, delivery.session_id);
+    writeLog(env.logFile, [delivery, acceptance]);
+
+    await env.runtimeLearning.wake('startup');
+    const engine = env.skillEvolution.getEvidenceReviewEngine();
+    const job = Object.values(engine.loadStore().jobs).find(candidate => (
+      candidate.bundle.bundleId === 'v3:learning-episode:turn-author-quantum-failure'
+    ))!;
+    await advanceJobReadyForSkillAuthor(env, job.jobId);
+    const originalAuthor = (engine as any).options.runSkillAuthor;
+    (engine as any).options.runSkillAuthor = async () => {
+      throw Object.assign(new Error('simulated Author provider failure'), {
+        kind: 'branch_failure',
+        reviewFailureReason: 'reader-error',
+      });
+    };
+
+    try {
+      const before = durableQuantumProgress(env);
+      const result = await env.runtimeLearning.wake('manual');
+      const after = durableQuantumProgress(env);
+      assert.equal(after - before, 1, 'the failing wake records exactly one Quantum attempt');
+      assert.equal(result.review.reviewedEpisodes, 0);
+      assert.equal(result.review.operationalRetries, 1);
+      assert.equal(result.review.reviewFailureCount, 1);
+      assert.equal(result.review.reviewTimeoutCount, 0);
+      const persisted = engine.loadStore().jobs[job.jobId]!;
+      const author = Object.values(persisted.quanta).find(quantum => quantum.kind === 'skill_author')!;
+      assert.equal(author.state, 'retry_wait');
+      assert.equal(author.attempts, 1);
+      assert.equal(author.failureKind, 'branch_failure');
+      assert.equal(author.failureReason, 'reader-error');
+      assert.equal(env.skillEvolution.getAudit().length, 0);
+    } finally {
+      (engine as any).options.runSkillAuthor = originalAuthor;
     }
   });
 
@@ -2790,6 +3367,134 @@ describe('Issue 4 — Heartbeat single-write', () => {
     assert.equal(env.runtimeLearning.loadHeartbeatRecord().backlog.operationalReviews, 1);
   });
 
+  test('projects retrying candidate lifecycle from durable review state and fails closed on corruption', () => {
+    seedOperationalFailure(
+      env.reviewQueuePath,
+      runtimeReviewBundle('heartbeat-candidate-lifecycle'),
+      'Pending operational recovery',
+      new Date('2099-01-01T00:00:00.000Z'),
+    );
+
+    env.runtimeLearning.markHeartbeatStatus('quiet');
+    const healthy = env.runtimeLearning.loadHeartbeatRecord().candidateLifecycle;
+    assert.deepEqual(healthy, {
+      status: 'healthy',
+      total: 1,
+      admitted: 0,
+      reviewing: 0,
+      retryWaiting: 1,
+      deferred: 0,
+      applied: 0,
+      rejected: 0,
+      superseded: 0,
+      failed: 0,
+    });
+
+    const jobStorePath = evidenceReviewJobStorePathForReviewQueue(env.reviewQueuePath);
+    fs.writeFileSync(jobStorePath, '{not-json', 'utf8');
+
+    env.runtimeLearning.markHeartbeatStatus('quiet');
+    const corrupt = env.runtimeLearning.loadHeartbeatRecord().candidateLifecycle;
+    assert.equal(corrupt.status, 'corrupt');
+    assert.equal(corrupt.total, 0);
+    assert.equal(corrupt.reason, 'evidence-review-job-store-corrupt');
+  });
+
+  test('does not project a previously observed Job Store disappearance as a fresh queue', () => {
+    seedOperationalFailure(
+      env.reviewQueuePath,
+      runtimeReviewBundle('heartbeat-candidate-store-deleted'),
+      'Pending operational recovery',
+      new Date('2099-01-01T00:00:00.000Z'),
+    );
+    env.runtimeLearning.markHeartbeatStatus('quiet');
+
+    const jobStorePath = evidenceReviewJobStorePathForReviewQueue(env.reviewQueuePath);
+    fs.unlinkSync(jobStorePath);
+    env.runtimeLearning.markHeartbeatStatus('quiet');
+
+    const lifecycle = env.runtimeLearning.loadHeartbeatRecord().candidateLifecycle;
+    assert.equal(lifecycle.status, 'corrupt');
+    assert.equal(lifecycle.total, 0);
+    assert.equal(lifecycle.reason, 'evidence-review-job-store-missing');
+  });
+
+  test('uses a Review commit receipt to detect a missing Job Store without heartbeat history', () => {
+    fs.mkdirSync(path.dirname(env.auditPath), { recursive: true });
+    fs.writeFileSync(env.auditPath, `${JSON.stringify({
+      schemaVersion: SKILL_EVOLUTION_SCHEMA_VERSION,
+      transitionId: 'transition-missing-review-job-store',
+      transition: 'create_current_skill',
+      bundleId: 'bundle-missing-review-job-store',
+      reviewCommitKey: 'job-missing-review-job-store:commit',
+      occurredAt: '2026-08-14T00:00:00.000Z',
+      reviewerVersion: 'test-reviewer',
+      promptVersion: 'test-prompt',
+      evidenceRefs: [],
+      involvedCapabilityHandles: [],
+      registryReadSet: [],
+      priorGuidanceHash: null,
+      resultingGuidanceHash: null,
+      branchTranscriptPaths: [],
+      rationale: 'The audit proves an Evidence Review Job existed.',
+    })}\n`, 'utf8');
+
+    env.runtimeLearning.markHeartbeatStatus('quiet');
+
+    const lifecycle = env.runtimeLearning.loadHeartbeatRecord().candidateLifecycle;
+    assert.equal(lifecycle.status, 'corrupt');
+    assert.equal(lifecycle.total, 0);
+    assert.equal(lifecycle.reason, 'evidence-review-job-store-missing');
+  });
+
+  test('marks candidate lifecycle corrupt when its transition audit is unreadable', () => {
+    fs.mkdirSync(path.dirname(env.auditPath), { recursive: true });
+    fs.writeFileSync(env.auditPath, '{not-json\n', 'utf8');
+
+    env.runtimeLearning.markHeartbeatStatus('quiet');
+
+    const lifecycle = env.runtimeLearning.loadHeartbeatRecord().candidateLifecycle;
+    assert.equal(lifecycle.status, 'corrupt');
+    assert.equal(lifecycle.total, 0);
+    assert.equal(lifecycle.reason, 'transition-audit-unavailable');
+  });
+
+  test('does not treat a malformed persisted candidate projection as a healthy empty queue', () => {
+    const heartbeatPath = getDistillationHeartbeatConfig(env.root).heartbeatRecordPath;
+    fs.mkdirSync(path.dirname(heartbeatPath), { recursive: true });
+    fs.writeFileSync(heartbeatPath, JSON.stringify({
+      schemaVersion: 1,
+      candidateLifecycle: {
+        status: 'healthy',
+        total: 1,
+        admitted: 0,
+        reviewing: 0,
+        retryWaiting: 0,
+        deferred: 0,
+        applied: 0,
+        rejected: 0,
+        superseded: 0,
+        failed: 0,
+      },
+    }), 'utf8');
+
+    const lifecycle = env.runtimeLearning.loadHeartbeatRecord().candidateLifecycle;
+    assert.equal(lifecycle.status, 'corrupt');
+    assert.equal(lifecycle.total, 0);
+    assert.equal(lifecycle.reason, 'heartbeat-projection-corrupt');
+  });
+
+  test('does not treat an unreadable heartbeat record as a healthy empty queue', () => {
+    const heartbeatPath = getDistillationHeartbeatConfig(env.root).heartbeatRecordPath;
+    fs.mkdirSync(path.dirname(heartbeatPath), { recursive: true });
+    fs.writeFileSync(heartbeatPath, '{not-json', 'utf8');
+
+    const lifecycle = env.runtimeLearning.loadHeartbeatRecord().candidateLifecycle;
+    assert.equal(lifecycle.status, 'corrupt');
+    assert.equal(lifecycle.total, 0);
+    assert.equal(lifecycle.reason, 'heartbeat-projection-corrupt');
+  });
+
   test('failed heartbeat status persists not-ready diagnostics and later success recovers', () => {
     env.runtimeLearning.markHeartbeatStatus('failed');
     let record = env.runtimeLearning.loadHeartbeatRecord();
@@ -2858,6 +3563,7 @@ describe('Issue 4 — Heartbeat single-write', () => {
     writeLog(env.logFile, [delivery, acceptance]);
 
     await env.runtimeLearning.wake('startup');
+    await wakeUntil(env, () => env.runtimeLearning.getSkillEvolution().getAudit().length === 1);
     const before = env.runtimeLearning.loadHeartbeatRecord();
     const firstAudit = env.runtimeLearning.getSkillEvolution().getAudit();
     const firstCreateCount = firstAudit.filter(entry => entry.transition === 'create_current_skill').length;
@@ -2880,6 +3586,172 @@ describe('Issue 4 — Heartbeat single-write', () => {
       firstCreate.branchTranscriptPaths,
       'transcript references should be preserved across restart',
     );
+  });
+});
+
+describe('RuntimeLearning — memory-pressure admission', () => {
+  let env: TestEnv;
+
+  beforeEach(() => { env = setupEnv(0); });
+  afterEach(() => { env.restore(); env.teardown(); });
+
+  test('hard pressure preserves durable demand and prevents another model Quantum', async () => {
+    const engine = env.skillEvolution.getEvidenceReviewEngine();
+    const bundle = runtimeReviewBundle('memory-pressure-hard-stop');
+    const jobId = await seedActiveJobReadyForSkillAuthor(env, bundle);
+    seedDueReviewContinuation(env.episodeStorePath);
+
+    let authorCalls = 0;
+    const originalAuthor = (engine as any).options.runSkillAuthor;
+    (engine as any).options.runSkillAuthor = async (...args: any[]) => {
+      authorCalls += 1;
+      return originalAuthor(...args);
+    };
+    try {
+      env.runtimeLearning.setMemoryPressureMode('suspended');
+      const result = await env.runtimeLearning.wake('manual');
+
+      assert.equal(result.ran, false);
+      assert.equal(authorCalls, 0);
+      assert.equal(env.runtimeLearning.loadHeartbeatRecord().lastRunStatus, 'memory_suspended');
+      assert.deepEqual(env.runtimeLearning.getPendingHeartbeatReasons(), ['manual']);
+      assert.equal(
+        Object.values(engine.loadStore().jobs[jobId]!.quanta)
+          .some(quantum => quantum.kind === 'skill_author' && quantum.attempts > 0),
+        false,
+      );
+    } finally {
+      (engine as any).options.runSkillAuthor = originalAuthor;
+    }
+  });
+
+  test('degraded mode caps live model Quanta to one without mutating normal config', async () => {
+    const engine = env.skillEvolution.getEvidenceReviewEngine();
+    const jobIds = Array.from({ length: 3 }, (_, index) => engine.ensureJob({
+      bundle: runtimeReviewBundle(`memory-pressure-degraded-${index}`),
+      candidate: runtimeReviewBundle(`memory-pressure-degraded-${index}`).episode as DistilledKnowledgeCandidate,
+      workClass: 'live_learning',
+    }).jobId);
+    (env.runtimeLearning.getConfig() as any).skillEvolutionReviewMaxQuantaPerWake = 8;
+    seedDueReviewContinuation(env.episodeStorePath);
+    env.runtimeLearning.setMemoryPressureMode('degraded');
+
+    const before = durableQuantumProgress(env);
+    await env.runtimeLearning.wake('manual');
+    const after = durableQuantumProgress(env);
+
+    assert.equal(after - before, 1);
+    assert.equal(env.runtimeLearning.getConfig().skillEvolutionReviewMaxQuantaPerWake, 8);
+    assert.equal(jobIds.length, 3);
+  });
+
+  test('persists memory observations for restart-safe suspended recovery', () => {
+    const observation: MemoryPressureObservation = {
+      mode: 'suspended',
+      level: 'hard',
+      transition: 'suspended',
+      recoverySamples: 0,
+      sample: {
+        sampledAt: '2026-08-13T00:00:00.000Z',
+        cgroupCurrentBytes: 900,
+        cgroupMaxBytes: 1000,
+        cgroupPercent: 90,
+        hostMemAvailableBytes: 100,
+        nodeRssBytes: 50,
+        reasons: ['cgroup-hard'],
+      },
+    };
+    env.runtimeLearning.markMemoryPressureObservation(observation);
+    const restarted = createRestartableRuntimeLearning(env.root);
+
+    assert.equal(restarted.loadHeartbeatRecord().memoryPressure?.mode, 'suspended');
+    restarted.setMemoryPressureMode('suspended');
+    assert.equal(restarted.getMemoryPressureMode(), 'suspended');
+  });
+
+  test('hard pressure does not reject an explicit bounded external backfill', async () => {
+    env.runtimeLearning.setMemoryPressureMode('suspended');
+    const identity: SessionLogSourceIdentity = {
+      sourceId: 'memory-pressure-backfill-source',
+      label: 'Memory pressure test backfill source',
+      category: 'external',
+      provider: 'fixture',
+      reader: 'fixture',
+    };
+    const resource: SessionLogSourceResource = {
+      resourceRef: 'fixture-thread',
+      firstEventIdentity: { eventId: 'fixture-event-1', position: 0 },
+    };
+    const source = {
+      identity,
+      discoverResources: () => [resource],
+      read: (_resource: SessionLogSourceResource) => ({
+        events: [],
+        status: 'stable' as const,
+        exhausted: true,
+        newCursor: { resourceRef: resource.resourceRef, position: 0, processedCount: 0 },
+      }),
+    };
+
+    const result = await env.runtimeLearning.runExternalBackfill({
+      operationId: 'memory-pressure-explicit-backfill',
+      triggeredBy: 'test-operator',
+      provider: identity.provider,
+      sourceId: identity.sourceId,
+      range: { startPosition: 0, endPosition: 0, resourceRefs: [resource.resourceRef] },
+      limits: { maxResources: 1, maxBytes: 1024, maxElapsedMs: 1_000 },
+    }, source);
+
+    assert.notEqual(result.backfill.status, 'source_failed');
+    assert.equal(env.runtimeLearning.getMemoryPressureMode(), 'suspended');
+  });
+
+  test('scheduler persists startup demand during hard pressure and resumes after staged recovery', async () => {
+    const lowPressureSample = (): MemoryPressureSample => ({
+      sampledAt: new Date().toISOString(),
+      cgroupCurrentBytes: 400 * 1024 * 1024,
+      cgroupMaxBytes: 1024 * 1024 * 1024,
+      cgroupPercent: 40,
+      hostMemAvailableBytes: 2 * 1024 * 1024 * 1024,
+      nodeRssBytes: 100 * 1024 * 1024,
+      reasons: [],
+    });
+    const hardPressureSample: MemoryPressureSample = {
+      ...lowPressureSample(),
+      cgroupCurrentBytes: 900 * 1024 * 1024,
+      cgroupPercent: 90,
+      hostMemAvailableBytes: 400 * 1024 * 1024,
+      reasons: ['fixture-hard-pressure'],
+    };
+    const scheduler = new DistillationHeartbeatScheduler(
+      env.root,
+      env.runtimeLearning,
+      null,
+      { readMemoryPressureSample: () => hardPressureSample },
+    );
+
+    try {
+      await scheduler.start();
+      const deferred = env.runtimeLearning.loadHeartbeatRecord();
+      assert.equal(env.runtimeLearning.getMemoryPressureMode(), 'suspended');
+      assert.deepEqual(deferred.pendingWakeReasons, ['startup']);
+      assert.equal(deferred.lastRunStatus, 'memory_suspended');
+
+      for (let sampleIndex = 0; sampleIndex < 3; sampleIndex++) {
+        const observation = scheduler.observeMemoryPressureForTesting(lowPressureSample());
+        assert.equal(observation.mode, sampleIndex === 2 ? 'degraded' : 'suspended');
+      }
+      assert.equal(env.runtimeLearning.getMemoryPressureMode(), 'degraded');
+
+      for (let sampleIndex = 0; sampleIndex < 3; sampleIndex++) {
+        const observation = scheduler.observeMemoryPressureForTesting(lowPressureSample());
+        assert.equal(observation.mode, sampleIndex === 2 ? 'normal' : 'degraded');
+      }
+      assert.equal(env.runtimeLearning.getMemoryPressureMode(), 'normal');
+      assert.deepEqual(env.runtimeLearning.loadHeartbeatRecord().pendingWakeReasons, ['startup']);
+    } finally {
+      await scheduler.stop();
+    }
   });
 });
 
@@ -2918,19 +3790,9 @@ describe('Issue #83 — controlled production acceptance', () => {
     });
     const hangingStarted = createDeferred<void>();
     const releaseHanging = createDeferred<void>();
-    const originalReview = env.skillEvolution.reviewAndApply.bind(env.skillEvolution);
     (env.skillEvolution as any).options.operationalRetryMs = 60_000;
-    env.skillEvolution.reviewAndApply = async (bundle, signal) => {
-      const sourceFilePath = (bundle.episode as { sourceUnit?: { filePath?: string } }).sourceUnit?.filePath;
-      if (sourceFilePath !== 'episode-acceptance-timeout.jsonl') {
-        return originalReview(bundle, signal);
-      }
-      hangingStarted.resolve();
-      await releaseHanging.promise;
-      const timeout = new AbortController();
-      timeout.abort('review-timeout');
-      return originalReview(bundle, timeout.signal);
-    };
+    let engine: ReturnType<SkillEvolutionRuntime['getEvidenceReviewEngine']> | undefined;
+    let originalAuthor: ((input: any) => Promise<any>) | undefined;
 
     try {
       env.runtimeLearning.getEpisodeStore().save({
@@ -2940,16 +3802,36 @@ describe('Issue #83 — controlled production acceptance', () => {
             'episode-acceptance-timeout',
             'Deliver the timeout acceptance report.',
           ),
-          'episode-acceptance-healthy': makeEpisode(
-            'episode-acceptance-healthy',
-            'Deliver the healthy acceptance report.',
-          ),
         },
       });
 
       const scheduler = new DistillationHeartbeatScheduler(env.root, env.runtimeLearning);
+      await scheduler.runHeartbeat('startup');
+      engine = env.skillEvolution.getEvidenceReviewEngine();
+      const timeoutJob = Object.values(engine.loadStore().jobs).find(job => (
+        job.bundle.bundleId === 'v3:learning-episode:episode-acceptance-timeout'
+      ))!;
+      await advanceJobReadyForSkillAuthor(env, timeoutJob.jobId);
+      originalAuthor = (engine as any).options.runSkillAuthor;
+      (engine as any).options.runSkillAuthor = async (input: { bundle: EvidenceBundle }) => {
+        const sourceFilePath = (input.bundle.episode as { sourceUnit?: { filePath?: string } }).sourceUnit?.filePath;
+        if (sourceFilePath !== 'episode-acceptance-timeout.jsonl') return originalAuthor!(input);
+        hangingStarted.resolve();
+        await releaseHanging.promise;
+        throw Object.assign(new Error('simulated active review deadline expiry'), {
+          kind: 'branch_timeout',
+          reviewFailureReason: 'attempt-deadline-exceeded',
+        });
+      };
+
       const startup = scheduler.runHeartbeat('startup');
       await hangingStarted.promise;
+      const currentEpisodes = env.runtimeLearning.getEpisodeStore().load();
+      currentEpisodes.episodes['episode-acceptance-healthy'] = makeEpisode(
+        'episode-acceptance-healthy',
+        'Deliver the healthy acceptance report.',
+      );
+      env.runtimeLearning.getEpisodeStore().save(currentEpisodes);
       const targeted = scheduler.runHeartbeat('settlement-deadline');
 
       assert.deepEqual(
@@ -2960,6 +3842,18 @@ describe('Issue #83 — controlled production acceptance', () => {
 
       releaseHanging.resolve();
       await Promise.all([startup, targeted]);
+
+      const heartbeat = env.runtimeLearning.loadHeartbeatRecord();
+      assert.equal(heartbeat.lastRunStatus, 'coalesced');
+      assert.deepEqual(heartbeat.lastPendingWakeReasons, ['settlement-deadline']);
+      assert.deepEqual(heartbeat.pendingWakeReasons, []);
+      assert.equal(heartbeat.inProgress, undefined);
+      assert.ok(heartbeat.runCount >= 2);
+
+      await wakeUntil(env, () => env.skillEvolution.getAudit().some(entry => (
+        entry.transition === 'create_current_skill'
+        && entry.bundleId === 'v3:learning-episode:episode-acceptance-healthy'
+      )), 128);
 
       const queue = loadEvidenceReviewJobStore(evidenceReviewJobStorePathForReviewQueue(env.reviewQueuePath));
       const opJobs = Object.values(queue.jobs).filter(j => j.disposition === 'active' && j.workClass === 'operational_recovery');
@@ -2985,14 +3879,9 @@ describe('Issue #83 — controlled production acceptance', () => {
         2,
       );
 
-      const heartbeat = env.runtimeLearning.loadHeartbeatRecord();
-      assert.equal(heartbeat.lastRunStatus, 'coalesced');
-      assert.deepEqual(heartbeat.lastPendingWakeReasons, ['settlement-deadline']);
-      assert.deepEqual(heartbeat.pendingWakeReasons, []);
-      assert.equal(heartbeat.inProgress, undefined);
-      assert.ok(heartbeat.runCount >= 2);
     } finally {
-      env.skillEvolution.reviewAndApply = originalReview;
+      releaseHanging.resolve();
+      if (engine && originalAuthor) (engine as any).options.runSkillAuthor = originalAuthor;
       env.restore();
       env.teardown();
     }
@@ -3276,7 +4165,10 @@ describe('RuntimeLearning — Provenance (AC4 follow-up)', () => {
     const result = await runtimeLearning.wake('startup');
     assert.equal(result.review.status, 'succeeded',
       `expected 'succeeded' got '${result.review.status}'`);
-    assert.ok(result.review.reviewedEpisodes >= 1, 'expected reviewed episodes');
+    assert.equal(result.review.reviewedEpisodes, 0);
+    for (let wake = 0; wake < 64 && !capturedCandidate; wake++) {
+      await runtimeLearning.wake('manual');
+    }
 
     // The captured candidate must have non-zero source byte range
     assert.ok(capturedCandidate, 'expected captured candidate');

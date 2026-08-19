@@ -3,7 +3,9 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { defaultDistilledOutputDir, PathResolver } from '../utils/path-resolver';
 import { SkillParser } from './skill-parser';
+import { seedBundledManualSkills } from './bundled-skill-seed';
 import { Logger } from '../utils/logger';
+import { withProcessExclusiveLock } from '../utils/process-exclusive-lock';
 import {
   loadCurrentSkillRegistry,
   reconcileActiveGeneratedSkillArtifacts,
@@ -50,6 +52,10 @@ export class SkillManager {
     this.skills.clear();
 
     const skillsPath = PathResolver.getSkillsPath();
+    // Seed source-controlled manual Skills before discovery. This is a
+    // no-network, no-overwrite cold-start path; generated Skills remain
+    // registry-owned and are never copied from the application bundle.
+    seedBundledManualSkills();
     // Load the Registry before walking generated output so discovery can
     // treat it as the source of truth for active generated capabilities.
     this.refreshRegistrySnapshot();
@@ -63,7 +69,13 @@ export class SkillManager {
    */
   private async loadSkillsFromPath(basePath: string): Promise<void> {
     try {
-      const skillFiles = PathResolver.findSkillFiles(basePath);
+      const generatedOutputDir = path.resolve(defaultDistilledOutputDir(basePath));
+      const skillFiles = PathResolver.findSkillFiles(basePath, {
+        // Generated capabilities are loaded from the Registry below. Skipping
+        // this subtree before recursion prevents dashboard checks from walking
+        // every historical/generated artifact on each request.
+        shouldSkipDirectory: directoryPath => path.resolve(directoryPath) === generatedOutputDir,
+      });
 
       for (const filePath of skillFiles) {
         try {
@@ -74,8 +86,30 @@ export class SkillManager {
           Logger.warning(`Failed to load skill from ${filePath}: ${error.message}`);
         }
       }
+
+      this.loadActiveGeneratedSkills();
     } catch (error: any) {
       // 目录不存在或无法访问，静默处理
+    }
+  }
+
+  /** Load only the Registry-owned generated capabilities, without discovery traversal. */
+  private loadActiveGeneratedSkills(): void {
+    if (this.registryLoadFailed) return;
+
+    for (const record of Object.values(this.registry?.capabilities ?? {})) {
+      if (!isGeneratedSkillPath(record.skillFilePath)) continue;
+      try {
+        const skill = SkillParser.parse(record.skillFilePath);
+        if (skill.metadata.name !== record.routingName) {
+          throw new Error(
+            `Generated skill route does not match Registry: file=${skill.metadata.name} registry=${record.routingName}`,
+          );
+        }
+        this.skills.set(skill.metadata.name, skill);
+      } catch (error: any) {
+        Logger.warning(`Failed to load active generated skill ${record.handle}: ${error.message}`);
+      }
     }
   }
 
@@ -166,21 +200,31 @@ export class SkillManager {
 
   private loadAndEnforceActiveSkillInvariants(): CurrentSkillRegistryState {
     const registryPath = PathResolver.getSkillEvolutionRegistryPath();
-    const loaded = loadCurrentSkillRegistry(registryPath);
-    // Fail closed / restore from authoritative history only. Never invent guidance.
-    const reconciled = reconcileActiveGeneratedSkillArtifacts(
-      loaded,
-      defaultDistilledOutputDir(PathResolver.getSkillsPath()),
-    );
-    if (reconciled.repaired) {
-      try {
-        // Persist restored paths only after successful artifact recovery.
-        saveCurrentSkillRegistry(registryPath, reconciled.state);
-      } catch (error: any) {
-        Logger.warning(`Failed to persist repaired generated skill Registry: ${error.message}`);
-      }
+    const journalPath = PathResolver.getSkillEvolutionJournalPath();
+    const outputDir = defaultDistilledOutputDir(PathResolver.getSkillsPath());
+    try {
+      // Artifact reconciliation can restore SKILL.md and persist Registry paths,
+      // so the entire check is a writer. Serialize it with journal recovery and
+      // re-read only after acquiring the lock; stale catalog snapshots must
+      // never overwrite a Capability Transition that committed while waiting.
+      return withProcessExclusiveLock(`${journalPath}.lock`, () => {
+        if (fs.existsSync(journalPath)) {
+          // The transition owner (or startup recovery) owns this pending journal.
+          // Serving a possibly half-applied Registry would violate the active
+          // generated-skill invariant, so this read path fails closed.
+          throw new Error('Generated skill transition journal requires recovery before catalog refresh.');
+        }
+        const latest = reconcileActiveGeneratedSkillArtifacts(
+          loadCurrentSkillRegistry(registryPath),
+          outputDir,
+        );
+        if (latest.repaired) saveCurrentSkillRegistry(registryPath, latest.state);
+        return latest.state;
+      }, { retryAttempts: 50, retryDelayMs: 5 });
+    } catch (error: any) {
+      Logger.warning(`Failed to enforce generated skill Registry invariants: ${error.message}`);
+      throw error;
     }
-    return reconciled.state;
   }
 
   private async refreshCatalogIfChanged(): Promise<void> {

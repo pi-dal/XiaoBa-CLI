@@ -20,7 +20,6 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 
 import { Logger } from '../utils/logger';
-import { PathResolver } from '../utils/path-resolver';
 import { getDistillationHeartbeatConfig } from '../utils/distillation-heartbeat-config';
 import type { DistillationHeartbeatConfig, ExternalHistoryMode } from '../utils/distillation-heartbeat-config';
 import {
@@ -654,8 +653,9 @@ async function handleBackfill(
   }
 
   const ownerLock = acquireHeartbeatSchedulerOwnerLock({
-    runtimeRoot: PathResolver.getRuntimeDataRoot(process.env, workingDirectory),
+    runtimeRoot: workingDirectory,
     command: process.argv.join(' '),
+    env: process.env,
   });
   if (!ownerLock.acquired) {
     throw new Error(

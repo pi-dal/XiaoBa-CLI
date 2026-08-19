@@ -1,8 +1,0 @@
-{
-  "schema": "xiaoba.bot-skill-local.v1",
-  "localSkillId": "eb5c03d1-1b17-4d17-914e-2e3407850c9e",
-  "origin": {
-    "skillId": "lin/build-code-graph",
-    "version": "1.0.0"
-  }
-}

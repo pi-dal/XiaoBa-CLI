@@ -2,6 +2,21 @@ const { app, BrowserWindow, Tray, Menu, nativeImage, ipcMain, dialog, shell } = 
 const path = require('path');
 const fs = require('fs');
 const { normalizeUpdateError } = require('./update-errors');
+const { shouldDisableHardwareAcceleration } = require('./gpu-compat');
+const { createRendererGoneGuard } = require('./renderer-gone');
+
+// The Electron host is the trust boundary for a real local desktop runtime.
+// Both development and packaged apps execute this entrypoint before starting
+// the embedded Dashboard and its CatsCo connector child.
+process.env.XIAOBA_RUNTIME_ROLE = 'desktop';
+
+// Compatibility: render with software (SwiftShader) on Intel Macs, where
+// OCLP-patched macOS with legacy NVIDIA GPUs (e.g. GTX 675MX in the Late-2012
+// iMac) crash the GPU process on launch. Other platforms keep hardware
+// acceleration; XIAOBA_DISABLE_GPU=1 forces software rendering anywhere.
+if (shouldDisableHardwareAcceleration()) {
+  app.disableHardwareAcceleration();
+}
 
 const DASHBOARD_PORT = resolveDashboardPort(process.env.XIAOBA_DASHBOARD_PORT);
 const DEEP_LINK_PROTOCOL = 'catsco';
@@ -486,7 +501,8 @@ async function startServer() {
   }
 
   // 闂備礁鎲￠懝楣冨嫉椤掑嫷鏁嗛柣鎰惈缁€鍐煕濞戝崬鐏ｉ柡?skills 闂?userData闂備焦瀵х粙鎴︽偋閸涱垱宕叉慨妯垮煐閸嬧晜绻涢崱妯虹仸闁哄棗绻橀弻鐔煎级閹存繃些闂佷紮绲婚崝搴ㄥ箟濡ゅ懎宸濇い鏍ㄧ〒閺?skills闂?
-  // Skills are user-managed. New installs start empty; SkillHub installs populate this directory.
+  // Skills remain user-managed after bootstrapping. New installs receive
+  // bundled offline manual Skills; SkillHub installs populate additional ones.
   const promptsDest = path.join(userDataPath, 'prompts');
   const promptsSrc = path.join(appRoot, 'prompts');
   if (!fs.existsSync(promptsDest) && fs.existsSync(promptsSrc)) {
@@ -571,7 +587,32 @@ function createWindow() {
   });
 
   mainWindow.on('closed', () => {
+    rendererGoneGuard.dispose();
     mainWindow = null;
+  });
+
+  // Bounded auto-recovery for transient renderer crashes (e.g. software-renderer
+  // hiccups on old Intel Macs). Only crashed/oom/abnormal-exit reload, at most
+  // MAX_RELOADS_IN_WINDOW times within the recovery window; unrecoverable
+  // failures surface an error dialog instead of looping forever.
+  const rendererGoneGuard = createRendererGoneGuard({
+    window: mainWindow,
+    log: (message) => console.error('[desktop] renderer recovery:', message),
+  });
+  mainWindow.webContents.on('render-process-gone', (_event, details) => {
+    if (app.isQuitting) return;
+    const outcome = rendererGoneGuard.onRenderProcessGone(details?.reason);
+    if (!outcome.recovered) {
+      console.error('[desktop] renderer process gone, no auto-recovery:', details?.reason, outcome.reason);
+      dialog.showErrorBox('CatsCo 运行异常', '界面渲染进程异常退出，无法自动恢复，请重新打开应用。');
+    }
+  });
+  mainWindow.webContents.on('did-finish-load', () => {
+    // Do NOT clear the retry budget immediately on load: a crash -> reload ->
+    // load loop would reset its own budget every round and bypass the cap.
+    // The guard clears it only after the page stays loaded for a stability
+    // period (30s), keeping the bounded retry effective.
+    rendererGoneGuard.onLoadFinished();
   });
 }
 
@@ -862,6 +903,12 @@ app.whenReady().then(async () => {
 
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') app.quit();
+});
+
+app.on('child-process-gone', (_event, details) => {
+  // Observability for utility/GPU crashes; hardware acceleration is disabled
+  // above, so this mainly fires for unexpected utility process failures.
+  console.error('[desktop] child process gone:', details?.type, details?.reason);
 });
 
 let isDrainingForQuit = false;

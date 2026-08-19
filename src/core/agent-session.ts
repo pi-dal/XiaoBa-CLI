@@ -1,6 +1,7 @@
 import { Message } from '../types';
 import type {
   ExecutionScope,
+  ScopedArtifactContext,
   ScopedDeviceGrant,
   ScopedDeviceSelection,
   ScopedLocalDeviceGrant,
@@ -28,7 +29,7 @@ import { PromptManager } from '../utils/prompt-manager';
 import { Logger } from '../utils/logger';
 import { SessionTurnLogger } from '../utils/session-turn-logger';
 import { Metrics } from '../utils/metrics';
-import { ContextWindowManager, type ContextCompactionStatusEvent } from './context-window-manager';
+import { ContextWindowManager } from './context-window-manager';
 import {
   RuntimeFeedbackInbox,
   RuntimeFeedbackInput,
@@ -43,7 +44,15 @@ import { SubAgentManager } from './sub-agent-manager';
 import type { PendingUserInputProvider } from './conversation-runner';
 import { resolveModelContextWindow } from '../utils/model-context-window';
 import { parseSessionKeyV2 } from './session-router';
-import { MODEL_IMAGE_SAFETY_MESSAGE, isModelImageSafetyError } from '../utils/model-error-classifier';
+import {
+  classifyModelError,
+  isModelImageSafetyError,
+  type ModelErrorCategory,
+} from '../utils/model-error-classifier';
+import {
+  readModelErrorDiagnostics,
+  type ModelErrorPhase,
+} from '../utils/model-error-observability';
 import { stripAssistantArtifactsFromMessages } from '../utils/transcript-artifacts';
 import type { PromptTraceSnapshot } from '../utils/prompt-observability';
 import { toPromptTurnMetadata } from '../utils/prompt-observability';
@@ -53,14 +62,32 @@ import {
   reconcileCurrentBotPromptBeforeTurn,
   scheduleCurrentBotPromptReconcile,
 } from '../bot-definition/prompt-sync';
+import { scheduleCurrentBotSkillSync } from '../bot-skills/runtime';
+import { collectRemoteContextWatermarks } from './remote-context-watermarks';
+import {
+  CheckpointCompactionCoordinator,
+  type CheckpointCompactionPhase,
+  isCheckpointCompactionEnabled,
+} from './checkpoint-compaction';
+import { estimateToolsTokens } from './token-estimator';
+import type { SessionRuntimeLogEvent, TurnErrorPayload } from '../utils/session-log-schema';
 
 export type { RuntimeFeedbackInput, RuntimeFeedbackOptions } from './runtime-feedback-inbox';
 
+export interface DurableRemoteContextEntry {
+  source: string;
+  id: number;
+  role?: 'user' | 'assistant';
+  content: string;
+}
+
 export const BUSY_MESSAGE = '正在处理上一条消息，请稍候...';
-export const ERROR_MESSAGE = '不好意思，刚才处理出了点问题，你再试一次？';
-export const MODEL_TIMEOUT_MESSAGE = '模型中转请求超时了，我已经保留本轮已完成的工具结果和上下文。你可以直接说“继续”，我会从这里接上。';
-export const MODEL_TRANSIENT_ERROR_MESSAGE = '当前模型服务临时异常，刚才这次请求没有完成。我已经保留上下文；你可以稍后重试，或临时切换到其他模型继续。';
-export const EMPTY_MODEL_RESPONSE_MESSAGE = '模型本轮未返回有效内容，自动重试后仍未恢复。请重新发送上一条消息；若仍失败，请切换模型或稍后再试。';
+export const ERROR_MESSAGE = '本次处理未能完成，请稍后再试。';
+export const MODEL_TIMEOUT_MESSAGE = '模型响应超时，本轮上下文已保留，请稍后继续。';
+export const MODEL_TRANSIENT_ERROR_MESSAGE = '模型服务暂时不可用，请稍后再试。';
+export const EMPTY_MODEL_RESPONSE_MESSAGE = '模型本轮未返回有效内容，请重新发送上一条消息；若仍失败，请切换模型或稍后再试。';
+export const MODEL_RECOVERY_FAILED_MESSAGE = '模型服务暂时不稳定，系统已尝试自动恢复但仍未成功，请稍后继续。';
+export const MODEL_REQUEST_FAILED_MESSAGE = '模型服务暂时不稳定，本次处理未能完成，请稍后继续。';
 export const CONTEXT_COMPACTION_START_MESSAGE = '正在压缩上下文，整理较早的对话内容。';
 export const CONTEXT_COMPACTION_COMPLETE_MESSAGE = '上下文压缩完成，继续处理当前请求。';
 export const CONTEXT_COMPACTION_ERROR_MESSAGE = '上下文压缩失败，已保留原上下文继续处理。';
@@ -78,9 +105,8 @@ export interface AgentServices {
   };
   toolManager: ToolManager;
   skillManager: SkillManager;
-  /** Authoritative runtime data root shared by session logs and background owners. */
-  runtimeDataRoot?: string;
-
+  /** Optional test seam for the after-turn Bot Skill workspace sync scheduler. */
+  afterTurnSkillSyncScheduler?: () => void;
 }
 
 export type SystemPromptProvider = () => Promise<string> | string;
@@ -121,6 +147,8 @@ export interface HandleMessageOptions {
   deviceRpc?: DeviceRpcTransport;
   thinToolRpc?: ThinToolRpcTransport;
   targetRoutes?: TargetRoutes;
+  /** 当前 turn 的服务端确认 Artifact 共同焦点。 */
+  artifactContext?: ScopedArtifactContext;
   /** 当前 turn 已授权的本地文件资源。 */
   localFileGrants?: ScopedLocalFileGrant[];
   /** 当前 turn 专属、给 agent 可见的运行时反馈 */
@@ -185,6 +213,8 @@ export class AgentSession {
   private turnContextBuilder = new TurnContextBuilder();
   private turnController: AgentTurnController;
   private contextWindowManager: ContextWindowManager;
+  private checkpointCompactionCoordinator: CheckpointCompactionCoordinator;
+  private readonly useCheckpointCompaction: boolean;
   private skillRuntime: SessionSkillRuntime;
   private runtimeFeedbackInbox = new RuntimeFeedbackInbox();
   private planRuntime = new PlanRuntime();
@@ -199,7 +229,7 @@ export class AgentSession {
     private readonly sessionRoute?: SessionRoute,
   ) {
     const type = sessionType || this.extractSessionType(key);
-    this.sessionTurnLogger = new SessionTurnLogger(type, key, services.runtimeDataRoot);
+    this.sessionTurnLogger = new SessionTurnLogger(type, key);
     this.turnLogRecorder = new TurnLogRecorder(this.sessionTurnLogger);
     const modelConfig = typeof (services.aiService as any).getConfig === 'function'
       ? (services.aiService as any).getConfig()
@@ -212,6 +242,11 @@ export class AgentSession {
       maxContextTokens: contextWindow.promptBudgetTokens,
       summaryContentBudget: contextWindow.summaryBudgetTokens,
     });
+    this.checkpointCompactionCoordinator = new CheckpointCompactionCoordinator(
+      services.aiService,
+      { maxContextTokens: contextWindow.promptBudgetTokens },
+    );
+    this.useCheckpointCompaction = isCheckpointCompactionEnabled();
     this.skillRuntime = new SessionSkillRuntime(services.skillManager, key);
     this.lifecycleManager = new SessionLifecycleManager({
       sessionKey: key,
@@ -236,6 +271,14 @@ export class AgentSession {
       branchLogRoot: getDistillationHeartbeatConfig(this.defaultDirectory).branchLogRoot,
       getCurrentDirectory: () => this.currentDirectory,
       updateCurrentDirectory: directory => this.updateCurrentDirectory(directory),
+      checkpointCompactionCoordinator: this.useCheckpointCompaction
+        ? this.checkpointCompactionCoordinator
+        : undefined,
+      persistCheckpoint: messages => {
+        if (!this.persistCheckpoint(messages)) {
+          throw new Error('Failed to persist continuation checkpoint');
+        }
+      },
     });
 
     const runtimeFeedbackInbox = this.runtimeFeedbackInbox;
@@ -368,22 +411,32 @@ export class AgentSession {
       this.messages.push(...restoredMessages);
       Logger.info(`[会话 ${this.key}] 已恢复 ${restoredMessages.length} 条消息`);
 
-      const usage = this.contextWindowManager.getUsageInfo(this.messages);
+      const usage = this.getContextUsageInfo(this.messages);
       Logger.info(`[${this.key}] 恢复后上下文: ${usage.usedTokens}/${usage.maxTokens} tokens (${usage.usagePercent}%)`);
 
       const compactionSignal = initSignal;
       const messagesBeforeRestoreCompaction = stripAssistantArtifactsFromMessages(this.messages);
-      const compactedMessages = await this.contextWindowManager.compactIfNeeded(messagesBeforeRestoreCompaction, {
-        sessionKey: this.key,
-        reason: '恢复后',
-        signal: compactionSignal,
-        onStatus: this.createContextCompactionNotifier(options.callbacks),
-      });
-      if (compactionSignal?.aborted || this.interruptRequested) {
-        Logger.info(`[会话 ${this.key}] 当前请求已取消，忽略恢复压缩在中断后的返回`);
+      const compactionResult = await this.compactContextIfNeeded(
+        messagesBeforeRestoreCompaction,
+        'restore',
+        '恢复后',
+        compactionSignal,
+        options.callbacks,
+      );
+      if (compactionSignal?.aborted || this.interruptRequested || lifecycleGeneration !== this.lifecycleGeneration) {
+        Logger.info(`[会话 ${this.key}] 当前请求已取消或会话已重置，忽略恢复压缩的旧结果`);
         return;
       }
-      this.messages = compactedMessages;
+      if (compactionResult.compacted) {
+        if (this.persistCheckpoint(compactionResult.messages)) {
+          this.messages = compactionResult.messages;
+        } else {
+          Logger.warning(`[会话 ${this.key}] 恢复检查点持久化失败，保留原始上下文`);
+          this.messages = messagesBeforeRestoreCompaction;
+        }
+      } else {
+        this.messages = compactionResult.messages;
+      }
     }
 
     if (injectedContext.length > 0) {
@@ -395,19 +448,89 @@ export class AgentSession {
 
   private static readonly MAX_INJECTED_CONTEXT = 30;
 
-  /** 静默注入上下文消息，不触发 AI 推理。超过上限自动丢弃最早的注入消息。 */
+  /** 静默注入瞬时运行上下文，不触发 AI 推理。超过上限自动丢弃最早的注入消息。 */
   injectContext(text: string): void {
     this.messages.push({ role: 'user', content: text, __injected: true });
     this.lastActiveAt = Date.now();
     this.enforceInjectedContextLimit();
   }
 
+  /**
+   * 追加远端耐久会话历史。先恢复本地会话，再纳入统一 token 压缩并落盘；
+   * 调用方只有在返回 true 后才能推进远端游标，避免崩溃或写盘失败造成永久漏历史。
+   */
+  async appendDurableContext(
+    inputs: Array<string | DurableRemoteContextEntry>,
+    cursorUpdate?: { source: string; cursor: number },
+  ): Promise<boolean> {
+    const lifecycleGeneration = this.lifecycleGeneration;
+    await this.init();
+    if (lifecycleGeneration !== this.lifecycleGeneration) return false;
+
+    const knownRemoteIds = new Set(this.messages
+      .filter(message => message.__remoteContextSource && Number(message.__remoteContextId) > 0)
+      .map(message => `${message.__remoteContextSource}:${message.__remoteContextId}`));
+    const remoteContextWatermarks = collectRemoteContextWatermarks(this.messages);
+    const durableEntries = inputs
+      .map(input => typeof input === 'string'
+        ? { content: input }
+        : input)
+      .filter(entry => typeof entry.content === 'string' && entry.content.trim())
+      .filter(entry => {
+        if (!('source' in entry) || !('id' in entry) || !entry.source || entry.id <= 0) return true;
+        const key = `${entry.source}:${entry.id}`;
+        if (
+          knownRemoteIds.has(key)
+          || entry.id <= (remoteContextWatermarks[entry.source] || 0)
+        ) {
+          return false;
+        }
+        knownRemoteIds.add(key);
+        return true;
+      });
+    if (durableEntries.length === 0) {
+      return cursorUpdate
+        ? this.lifecycleManager.saveRemoteContextCursor(cursorUpdate.source, cursorUpdate.cursor)
+        : true;
+    }
+    const messagesBeforeAppend = [...this.messages];
+    this.messages.push(...durableEntries.map(entry => ({
+      role: 'role' in entry && entry.role === 'assistant' ? 'assistant' as const : 'user' as const,
+      content: entry.content,
+      ...('source' in entry && 'id' in entry ? {
+        __remoteContextSource: entry.source,
+        __remoteContextId: entry.id,
+      } : {}),
+    })));
+    const messagesBeforeCompaction = stripAssistantArtifactsFromMessages(this.messages);
+    const compactionResult = await this.compactContextIfNeeded(
+      messagesBeforeCompaction,
+      'restore',
+      '群聊历史补入',
+    );
+    if (lifecycleGeneration !== this.lifecycleGeneration) return false;
+    this.messages = compactionResult.messages;
+    this.lastActiveAt = Date.now();
+    if (!this.lifecycleManager.saveContext(this.messages)) {
+      this.messages = messagesBeforeAppend;
+      return false;
+    }
+    if (!cursorUpdate) return true;
+    if (this.lifecycleManager.saveRemoteContextCursor(cursorUpdate.source, cursorUpdate.cursor)) return true;
+
+    this.messages = messagesBeforeAppend;
+    if (!this.lifecycleManager.saveContext(this.messages)) {
+      Logger.error(`[${this.key}] 远端游标落盘失败后，本地历史回滚也失败`);
+    }
+    return false;
+  }
+
   getRemoteContextCursor(source: string): number {
     return this.lifecycleManager.loadRemoteContextCursor(source);
   }
 
-  saveRemoteContextCursor(source: string, cursor: number): void {
-    this.lifecycleManager.saveRemoteContextCursor(source, cursor);
+  saveRemoteContextCursor(source: string, cursor: number): boolean {
+    return this.lifecycleManager.saveRemoteContextCursor(source, cursor);
   }
 
   /**
@@ -471,6 +594,7 @@ export class AgentSession {
       let deviceRpc: DeviceRpcTransport | undefined;
       let thinToolRpc: ThinToolRpcTransport | undefined;
       let targetRoutes: TargetRoutes | undefined;
+      let artifactContext: ScopedArtifactContext | undefined;
       let localFileGrants: ScopedLocalFileGrant[] | undefined;
       let runtimeFeedbackInputs: RuntimeFeedbackInput[] = [];
       let pendingUserInputProvider: PendingUserInputProvider | undefined;
@@ -486,6 +610,7 @@ export class AgentSession {
           || 'deviceRpc' in callbacksOrOptions
           || 'thinToolRpc' in callbacksOrOptions
           || 'targetRoutes' in callbacksOrOptions
+          || 'artifactContext' in callbacksOrOptions
           || 'localFileGrants' in callbacksOrOptions
           || 'callbacks' in callbacksOrOptions
           || 'runtimeFeedback' in callbacksOrOptions
@@ -503,6 +628,7 @@ export class AgentSession {
           deviceRpc = opts.deviceRpc;
           thinToolRpc = opts.thinToolRpc;
           targetRoutes = opts.targetRoutes;
+          artifactContext = opts.artifactContext;
           localFileGrants = opts.localFileGrants;
           runtimeFeedbackInputs = opts.runtimeFeedback || [];
           pendingUserInputProvider = opts.pendingUserInputProvider;
@@ -526,6 +652,8 @@ export class AgentSession {
       this.interruptRequested = false;
       this.activeAbortController = new AbortController();
       this.lastActiveAt = Date.now();
+      const turnStartedAt = Date.now();
+      let failurePhase: ModelErrorPhase = 'pre_turn_compaction';
 
       try {
         await reconcileCurrentBotPromptBeforeTurn();
@@ -536,19 +664,30 @@ export class AgentSession {
 
       try {
         const messagesBeforeCompaction = stripAssistantArtifactsFromMessages(this.messages);
-        const compactedMessages = await this.contextWindowManager.compactIfNeeded(messagesBeforeCompaction, {
-          sessionKey: this.key,
-          reason: '处理前',
-          signal: this.activeAbortController.signal,
-          onStatus: this.createContextCompactionNotifier(callbacks),
-        });
+        const compactionResult = await this.compactContextIfNeeded(
+          messagesBeforeCompaction,
+          'pre_turn',
+          '处理前',
+          this.activeAbortController.signal,
+          callbacks,
+        );
         if (this.interruptRequested || this.activeAbortController.signal.aborted) {
           Logger.info(`[会话 ${this.key}] 当前请求已取消，忽略压缩在中断后的返回`);
           this.saveInterruptedContextIfCurrent(lifecycleGeneration);
           return { text: '已停止当前请求。', visibleToUser: true, taskOutcome: 'cancelled' };
         }
-        this.messages = compactedMessages;
+        if (compactionResult.compacted) {
+          if (this.persistCheckpoint(compactionResult.messages)) {
+            this.messages = compactionResult.messages;
+          } else {
+            Logger.warning(`[会话 ${this.key}] 处理前检查点持久化失败，保留原始上下文`);
+            this.messages = messagesBeforeCompaction;
+          }
+        } else {
+          this.messages = compactionResult.messages;
+        }
 
+        failurePhase = 'session_init';
         await this.init({
           callbacks,
           signal: this.activeAbortController.signal,
@@ -558,6 +697,7 @@ export class AgentSession {
           this.saveInterruptedContextIfCurrent(lifecycleGeneration);
           return { text: '已停止当前请求。', visibleToUser: true, taskOutcome: 'cancelled' };
         }
+        failurePhase = 'agent_turn';
         const result = await this.turnController.run({
           input: text,
           messages: this.messages,
@@ -574,6 +714,7 @@ export class AgentSession {
           deviceRpc,
           thinToolRpc,
           targetRoutes,
+          artifactContext,
           localFileGrants,
           pendingUserInputProvider,
           abortSignal: this.activeAbortController.signal,
@@ -586,6 +727,7 @@ export class AgentSession {
           return { text: '已停止当前请求。', visibleToUser: true, taskOutcome: 'cancelled' };
         }
         this.messages = result.messages;
+        failurePhase = 'result_persistence';
         this.lifecycleManager.saveContext(this.messages);
         return { ...result, taskOutcome: 'completed' };
       } catch (err: any) {
@@ -597,13 +739,12 @@ export class AgentSession {
         }
 
         const recoveredMessages = this.getPartialMessagesFromError(err);
+        const partialProgressPreserved = recoveredMessages
+          ? this.hasRecoverablePartialProgress(recoveredMessages)
+          : false;
         if (recoveredMessages) {
           this.messages = recoveredMessages;
         }
-
-        // 不删除用户消息，而是添加一个错误回复，保持上下文连贯
-        // 这样用户说"继续"时可以接上
-        Logger.error(`[会话 ${this.key}] 处理失败: ${err.message}`);
 
         // 识别多模态相关错误
         const errorMsg = err.message || String(err);
@@ -612,22 +753,70 @@ export class AgentSession {
         const isModelTimeoutError = this.isModelTimeoutError(err);
         const isTransientProviderError = this.isTransientProviderError(err);
         const isEmptyModelResponseError = this.isEmptyModelResponseError(err);
-        const relayBudgetErrorReply = this.formatRelayBudgetErrorReply(err);
+        const isRelayBudgetError = this.isRelayBudgetError(err);
+        const closestDiagnostics = readModelErrorDiagnostics(err);
+        const classified = classifyModelError(err, {
+          isImageSafetyError,
+          isRelayBudgetError,
+          isVisionError: Boolean(isVisionError),
+          isTimeout: isModelTimeoutError,
+          isEmptyResponse: isEmptyModelResponseError,
+          isTransient: isTransientProviderError,
+        }, {
+          provider: this.currentProviderName() ?? undefined,
+          model: this.currentModelName() ?? undefined,
+          phase: closestDiagnostics?.phase ?? failurePhase,
+        });
+        const diagnostics = classified.diagnostics;
+        const retry = diagnostics.retry;
+        const errorPayload: TurnErrorPayload = {
+          error_code: classified.error_code,
+          category: classified.category,
+          classification_confidence: classified.confidence,
+          outcome: 'conversation_interrupted',
+          phase: diagnostics.phase ?? failurePhase,
+          error_origin: diagnostics.origin,
+          recovery_action: classified.recovery_action,
+          retry_strategy: classified.retry_strategy,
+          model: diagnostics.model ?? this.currentModelName(),
+          provider: diagnostics.provider ?? this.currentProviderName(),
+          http_status: diagnostics.http_status ?? this.extractErrorStatus(err),
+          provider_code: diagnostics.provider_code,
+          provider_type: diagnostics.provider_type,
+          provider_request_id: diagnostics.request_id,
+          provider_response_id: diagnostics.response_id,
+          terminal_event: diagnostics.terminal_event,
+          provider_failure_phase: diagnostics.failure_phase,
+          error_fingerprint: diagnostics.fingerprint,
+          stack_fingerprint: diagnostics.stack_fingerprint,
+          top_frame: diagnostics.top_frame,
+          error_summary: diagnostics.error_summary,
+          attempt_count: retry?.attempt_count ?? 1,
+          retry_count: retry?.retry_count ?? 0,
+          retry_stop_reason: retry?.stop_reason ?? 'unknown',
+          retry_elapsed_ms: retry?.elapsed_ms ?? 0,
+          turn_elapsed_ms: Date.now() - turnStartedAt,
+          partial_progress_preserved: partialProgressPreserved,
+          episode_id: diagnostics.attempt?.episode_id,
+          model_call_id: diagnostics.attempt?.call_id,
+          model_attempt_id: diagnostics.attempt?.attempt_id,
+          model_attempt_number: diagnostics.attempt?.attempt_number,
+        };
 
-        let errorReply = ERROR_MESSAGE;
-        if (isImageSafetyError) {
-          errorReply = MODEL_IMAGE_SAFETY_MESSAGE;
-        } else if (relayBudgetErrorReply) {
-          errorReply = relayBudgetErrorReply;
-        } else if (isVisionError) {
-          errorReply = '当前模型不支持图片识别。请使用支持多模态的模型（如 Claude 3.5 Sonnet 或 GPT-4V），或者用文字描述图片内容。';
-        } else if (isModelTimeoutError) {
-          errorReply = MODEL_TIMEOUT_MESSAGE;
-        } else if (isEmptyModelResponseError) {
-          errorReply = EMPTY_MODEL_RESPONSE_MESSAGE;
-        } else if (isTransientProviderError) {
-          errorReply = this.formatTransientProviderErrorReply();
-        }
+        // 只有真正退出本轮并返回 taskOutcome=failed 的路径才写 turn_error。
+        Logger.error(
+          `[会话 ${this.key}] 处理中断: ${diagnostics.error_summary}`,
+          {
+            type: 'turn_error',
+            payload: errorPayload as unknown as Record<string, unknown>,
+          } as SessionRuntimeLogEvent,
+        );
+
+        const errorReply = this.formatClassifiedErrorReply(
+          classified.category,
+          classified.user_message,
+          retry?.retry_count ?? 0,
+        );
 
         // 添加错误回复到上下文，保持对话连贯性
         this.messages.push({
@@ -647,6 +836,7 @@ export class AgentSession {
       } finally {
         this.planRuntime.clear();
         scheduleCurrentBotPromptReconcile();
+        (this.services.afterTurnSkillSyncScheduler ?? scheduleCurrentBotSkillSync)();
         this.busy = false;
         this.activeAbortController = null;
       }
@@ -674,8 +864,13 @@ export class AgentSession {
       if (commandName === 'clear') {
         this.requestInterrupt();
         if (args.includes('--all')) {
-          this.clear();
-          return { handled: true, reply: '历史已清空，文件已删除' };
+          const persisted = this.clear();
+          return {
+            handled: true,
+            reply: persisted
+              ? '历史已清空，文件已删除'
+              : '历史已在当前进程清空，但文件删除失败，请重试 /clear --all。',
+          };
         }
         this.reset();
         return { handled: true, reply: '历史已清空' };
@@ -721,18 +916,19 @@ export class AgentSession {
     this.lastActiveAt = state.lastActiveAt;
   }
 
-  /** 清空历史（同时删除文件） */
-  clear(): void {
+  /** 清空历史（同时删除文件），返回本地文件与状态是否都删除成功。 */
+  clear(): boolean {
     this.lifecycleGeneration++;
     this.planRuntime.clear();
     this.stopSubAgents('父会话 clear');
     this.messages = [];
     const state = this.lifecycleManager.clear();
-    this.resetCurrentDirectory();
+    this.currentDirectory = this.defaultDirectory;
     this.initialized = state.initialized;
     this.promptTrace = undefined;
     this.turnLogRecorder.setPromptMetadata(undefined);
     this.lastActiveAt = state.lastActiveAt;
+    return state.persisted;
   }
 
   async summarizeAndDestroy(): Promise<boolean> {
@@ -896,9 +1092,64 @@ export class AgentSession {
     );
   }
 
-  private createContextCompactionNotifier(callbacks?: SessionCallbacks): ((event: ContextCompactionStatusEvent) => Promise<void>) | undefined {
+  private getContextUsageInfo(messages: Message[]): {
+    usedTokens: number;
+    maxTokens: number;
+    usagePercent: number;
+  } {
+    if (!this.useCheckpointCompaction) {
+      return this.contextWindowManager.getUsageInfo(messages);
+    }
+    return this.checkpointCompactionCoordinator.getUsageInfo(
+      messages,
+      this.getToolDefinitionTokens(),
+    );
+  }
+
+  private async compactContextIfNeeded(
+    messages: Message[],
+    phase: CheckpointCompactionPhase,
+    reason: string,
+    signal?: AbortSignal,
+    callbacks?: SessionCallbacks,
+  ): Promise<{ messages: Message[]; compacted: boolean }> {
+    if (!this.useCheckpointCompaction) {
+      const compactedMessages = await this.contextWindowManager.compactIfNeeded(messages, {
+        sessionKey: this.key,
+        reason,
+        signal,
+        onStatus: this.createContextCompactionNotifier(callbacks),
+      });
+      return {
+        messages: compactedMessages,
+        compacted: false,
+      };
+    }
+    return this.checkpointCompactionCoordinator.compactIfNeeded(messages, {
+      sessionKey: this.key,
+      phase,
+      toolTokens: this.getToolDefinitionTokens(),
+      signal,
+      onStatus: this.createContextCompactionNotifier(callbacks),
+    });
+  }
+
+  private getToolDefinitionTokens(): number {
+    return estimateToolsTokens(this.services.toolManager.getToolDefinitions());
+  }
+
+  private persistCheckpoint(messages: Message[]): boolean {
+    const durable = this.turnContextBuilder.removeTransientMessages(
+      stripAssistantArtifactsFromMessages(messages),
+    );
+    return this.lifecycleManager.saveContext(durable);
+  }
+
+  private createContextCompactionNotifier(callbacks?: SessionCallbacks): ((event: {
+    status: 'start' | 'complete' | 'error';
+  }) => Promise<void>) | undefined {
     if (!callbacks?.onThinking) return undefined;
-    return async (event: ContextCompactionStatusEvent) => {
+    return async (event) => {
       const message = this.formatContextCompactionStatus(event);
       if (!message) return;
       try {
@@ -909,7 +1160,9 @@ export class AgentSession {
     };
   }
 
-  private formatContextCompactionStatus(event: ContextCompactionStatusEvent): string {
+  private formatContextCompactionStatus(event: {
+    status: 'start' | 'complete' | 'error';
+  }): string {
     switch (event.status) {
       case 'start':
         return CONTEXT_COMPACTION_START_MESSAGE;
@@ -950,6 +1203,22 @@ export class AgentSession {
     return this.turnContextBuilder.removeTransientMessages(partialMessages);
   }
 
+  private hasRecoverablePartialProgress(messages: Message[]): boolean {
+    let rootIndex = -1;
+    for (let index = messages.length - 1; index >= 0; index--) {
+      if (messages[index].__episodeInputKind === 'root') {
+        rootIndex = index;
+        break;
+      }
+    }
+    if (rootIndex < 0) return false;
+    const episodeId = messages[rootIndex].__episodeId;
+    return messages.slice(rootIndex + 1).some(message =>
+      (!episodeId || message.__episodeId === episodeId)
+      && (message.role === 'tool' || message.role === 'assistant')
+    );
+  }
+
   private isModelTimeoutError(error: any): boolean {
     const text = String(error?.message || error || '');
     return /API错误\s*\(504\)|request_timed_out|request timed out|default_request_timeout_in_seconds|upstream request timeout|gateway timeout/i.test(text);
@@ -973,30 +1242,15 @@ export class AgentSession {
     return /模型未返回有效内容|模型返回了空响应/i.test(String(error?.message || error || ''));
   }
 
-  private formatRelayBudgetErrorReply(error: any): string | null {
+  private isRelayBudgetError(error: any): boolean {
     const text = String(error?.message || error || '');
     const status = this.extractErrorStatus(error);
-    const isBudgetError =
+    return (
       status === 402
       || /api错误\s*\(402\)|status(?:\s*code)?\s*[:=]?\s*402\b|http(?:\s*status)?\s*[:=]?\s*402\b|payment[_\s-]?required/i.test(text)
       || /budget exceeded|quota exceeded|insufficient quota|insufficient balance|credits? exhausted|monthly budget|model budget|relay budget/i.test(text)
-      || /额度.{0,12}(不足|用完|耗尽|超限|达到上限|已用尽)|余额不足|已达.*额度上限/.test(text);
-
-    if (!isBudgetError) {
-      return null;
-    }
-
-    const model = this.currentModelName();
-    const modelLabel = model ? `当前模型 ${model} 的` : '当前模型的';
-    if (/model budget exceeded|model quota|模型.{0,8}额度/i.test(text)) {
-      return `${modelLabel}中转额度已用完，暂时不能继续调用。\n\n你可以切换到还有额度的模型，或到 CatsCompany 中转页面查看额度；如果这是学校/团队账号，请联系管理员调整额度。`;
-    }
-
-    if (/monthly budget exceeded|account budget|user budget|账号.{0,8}额度|本月.{0,8}额度/i.test(text)) {
-      return '当前账号的中转额度已用完，暂时不能继续调用模型。\n\n请到 CatsCompany 中转页面查看额度，或联系管理员调整额度。';
-    }
-
-    return `模型中转额度不足，当前请求没有继续调用${model ? ` ${model}` : ''}。\n\n你可以切换模型、稍后重试，或到 CatsCompany 中转页面查看额度并联系管理员调整。`;
+      || /额度.{0,12}(不足|用完|耗尽|超限|达到上限|已用尽)|余额不足|已达.*额度上限/.test(text)
+    );
   }
 
   private extractErrorStatus(error: any): number | null {
@@ -1018,11 +1272,29 @@ export class AgentSession {
     return model || null;
   }
 
-  private formatTransientProviderErrorReply(): string {
-    const model = this.currentModelName();
-    return model
-      ? `当前模型 ${model} 的服务临时异常，刚才这次请求没有完成。我已经保留上下文；你可以稍后重试，或临时切换到其他模型继续。`
-      : MODEL_TRANSIENT_ERROR_MESSAGE;
+  private currentProviderName(): string | null {
+    const config = typeof (this.services.aiService as any).getConfig === 'function'
+      ? (this.services.aiService as any).getConfig()
+      : {};
+    const provider = String(config?.provider || '').trim();
+    return provider || null;
+  }
+
+  private formatClassifiedErrorReply(
+    category: ModelErrorCategory,
+    fallback: string,
+    retryCount: number,
+  ): string {
+    if (
+      category === 'image_safety'
+      || category === 'vision_unsupported'
+      || category === 'input_too_large'
+    ) {
+      return fallback;
+    }
+    return retryCount > 0
+      ? MODEL_RECOVERY_FAILED_MESSAGE
+      : MODEL_REQUEST_FAILED_MESSAGE;
   }
 
   private formatErrorContextMessage(

@@ -6,7 +6,6 @@ import { resolveActiveBotLLMConfig } from '../bot-definition/llm-config-resolver
 import { loadBranchAgentConfig, resolveMemoryBranchModelOverride } from '../core/branch-agent-config';
 import { Logger } from '../utils/logger';
 import { PromptManager } from '../utils/prompt-manager';
-import { PathResolver } from '../utils/path-resolver';
 import { PromptComposer } from './prompt-composer';
 import { composeSessionSystemPromptProvider } from '../core/session-system-prompt';
 import {
@@ -87,7 +86,6 @@ export class RuntimeFactory {
         enabledToolNames: profile.tools.enabled,
       }),
       skillManager: new SkillManager(),
-      runtimeDataRoot: PathResolver.getRuntimeDataRoot(process.env, profile.workingDirectory),
     };
   }
 

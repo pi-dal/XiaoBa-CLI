@@ -16,6 +16,12 @@ export interface CatsRelayBootstrapOptions {
   modelId: string;
   auth: CatsCoAuthSnapshot;
   reasoningEffort?: ReasoningEffort;
+  /**
+   * Cloud-authoritative context window for the catalog model. When provided it
+   * must win over the local profile so the device follows the catalog.
+   */
+  contextWindowTokens?: number;
+  existingRuntime?: BotCatalogModelRuntime;
   fetchImpl?: typeof fetch;
 }
 
@@ -33,14 +39,39 @@ export async function provisionCatsRelayCatalogRuntime(
   const modelId = String(options.modelId || '').trim();
   const token = String(options.auth.token || '').trim();
   const httpBaseUrl = String(options.auth.httpBaseUrl || '').trim().replace(/\/+$/, '');
+  const ownerUid = relayOwnerUid(options.auth);
   const profile = findRelayModelProfile(modelId);
   if (!botId) throw new Error('Cannot initialize a catalog model without botId.');
   if (!profile) throw new Error(`Unknown CatsCo relay model: ${modelId}`);
+  if (token && options.auth.uid && options.auth.ownerUid && options.auth.uid !== options.auth.ownerUid) {
+    throw new Error('CatsCo account login does not match the bound bot owner.');
+  }
+  const fetchImpl = options.fetchImpl ?? fetch;
   if (!token || !httpBaseUrl) {
-    throw new Error('CatsCo account login is required before the default model can be initialized.');
+    if (!ownerUid) {
+      throw new Error('CatsCo account login is required because the bound bot owner is unknown.');
+    }
+    // 复用已有凭据：runtime 的 ownerUid 必须匹配当前 owner，或者由旧版本
+    // 物化（当时未写入 ownerUid）。后一种情况凭据本身仍属于该 bot，但
+    // 缺少归属标记导致无法复用，这里兼容旧数据并补写 ownerUid。
+    if (
+      options.existingRuntime?.botId === botId
+      && (!options.existingRuntime.ownerUid || options.existingRuntime.ownerUid === ownerUid)
+      && String(options.existingRuntime.apiKey || '').trim()
+    ) {
+      const retargeted = retargetCatsRelayCatalogRuntime(
+        options.existingRuntime,
+        profile.id,
+        options.reasoningEffort,
+        options.contextWindowTokens,
+        ownerUid,
+      );
+      await validateCatsRelayCatalogRuntimeCredential(retargeted, fetchImpl);
+      return retargeted;
+    }
+    throw new Error('CatsCo account login is required before an unbound relay credential can be reused.');
   }
 
-  const fetchImpl = options.fetchImpl ?? fetch;
   const relayConfig = await catsRequest(fetchImpl, httpBaseUrl, token, 'GET', '/api/relay/config');
   if (relayConfig?.self_service_enabled === false) {
     throw new Error('CatsCo relay self-service is unavailable, so the default model cannot be initialized.');
@@ -69,17 +100,50 @@ export async function provisionCatsRelayCatalogRuntime(
   return {
     schema: 'xiaoba.bot-catalog-model-runtime.v1',
     botId,
+    ...(ownerUid ? { ownerUid } : {}),
     modelId: profile.id,
     provider: profile.preferredProvider,
     apiBase: relayEndpointForProvider(relayConfig, profile.preferredProvider),
     apiKey,
     model: profile.model,
-    contextWindowTokens: profile.contextWindowTokens,
+    contextWindowTokens: options.contextWindowTokens ?? profile.contextWindowTokens,
     reasoningEffort: options.reasoningEffort ?? 'high',
     openaiApiMode: profile.openaiApiMode ?? 'chat_completions',
     capabilities,
     capabilitiesSource,
     ...(capabilitiesSource !== 'static' ? { capabilitiesCheckedAt: new Date().toISOString() } : {}),
+  };
+}
+
+export function retargetCatsRelayCatalogRuntime(
+  existing: BotCatalogModelRuntime,
+  modelId: string,
+  reasoningEffort?: ReasoningEffort,
+  contextWindowTokens?: number,
+  ownerUid?: string,
+): BotCatalogModelRuntime {
+  const profile = findRelayModelProfile(modelId);
+  if (!profile) throw new Error(`Unknown CatsCo relay model: ${modelId}`);
+  const apiKey = String(existing.apiKey || '').trim();
+  if (!apiKey) throw new Error('Existing CatsCo relay runtime does not contain a reusable credential.');
+  return {
+    schema: 'xiaoba.bot-catalog-model-runtime.v1',
+    botId: existing.botId,
+    ...(existing.ownerUid || ownerUid ? { ownerUid: existing.ownerUid || ownerUid } : {}),
+    modelId: profile.id,
+    provider: profile.preferredProvider,
+    apiBase: retargetRelayEndpoint(existing, profile.preferredProvider),
+    apiKey,
+    model: profile.model,
+    // 复用路径必然是跨模型（调用方仅在 catalogRuntimeMatchesModelId 不成立时
+    // 传入 existingRuntime），绝不能继承旧模型的窗口值，否则会把旧的漂移值
+    // 带进新模型。云端下发优先，否则使用新模型 profile 的标准窗口。
+    contextWindowTokens: contextWindowTokens ?? profile.contextWindowTokens,
+    reasoningEffort: reasoningEffort ?? 'high',
+    openaiApiMode: profile.openaiApiMode ?? 'chat_completions',
+    capabilities: existing.capabilities ?? { ...profile.capabilities },
+    capabilitiesSource: existing.capabilitiesSource ?? 'static',
+    ...(existing.capabilitiesCheckedAt ? { capabilitiesCheckedAt: existing.capabilitiesCheckedAt } : {}),
   };
 }
 
@@ -188,6 +252,53 @@ async function fetchRelayModelCapabilities(
   }
 }
 
+export class RelayCredentialRejectedError extends Error {
+  constructor() {
+    super('The existing CatsCo relay credential was rejected.');
+    this.name = 'RelayCredentialRejectedError';
+  }
+}
+
+export class RelayCredentialUnreachableError extends Error {
+  constructor(message?: string) {
+    super(message || 'The CatsCo relay credential could not be verified right now.');
+    this.name = 'RelayCredentialUnreachableError';
+  }
+}
+
+export async function validateCatsRelayCatalogRuntimeCredential(
+  runtime: BotCatalogModelRuntime,
+  fetchImpl: typeof fetch = fetch,
+): Promise<void> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), CAPABILITY_REQUEST_TIMEOUT_MS);
+  try {
+    const response = await fetchImpl(relayModelsUrl(runtime.apiBase), {
+      method: 'GET',
+      headers: { Authorization: `Bearer ${runtime.apiKey}` },
+      signal: controller.signal,
+    });
+    if (response.status === 401 || response.status === 403) {
+      throw new RelayCredentialRejectedError();
+    }
+    if (!response.ok) {
+      throw new RelayCredentialUnreachableError(
+        `CatsCo relay credential could not be verified (HTTP ${response.status}).`,
+      );
+    }
+  } catch (error) {
+    if (error instanceof RelayCredentialRejectedError) throw error;
+    if (error instanceof RelayCredentialUnreachableError) throw error;
+    throw new RelayCredentialUnreachableError();
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function relayOwnerUid(auth: CatsCoAuthSnapshot): string {
+  return String(auth.ownerUid || auth.uid || '').trim();
+}
+
 async function ensurePlainRelayKey(
   fetchImpl: typeof fetch,
   httpBaseUrl: string,
@@ -242,6 +353,31 @@ function relayEndpointForProvider(config: any, provider: RelayModelProvider): st
     ? relayModelProviderBaseUrl(provider)
     : provider === 'openai' ? `${baseUrl}/v1` : `${baseUrl}/anthropic`;
   return String(endpoint?.base_url || fallback).trim().replace(/\/+$/, '');
+}
+
+function retargetRelayEndpoint(
+  existing: BotCatalogModelRuntime,
+  provider: RelayModelProvider,
+): string {
+  let parsed: URL;
+  try {
+    parsed = new URL(existing.apiBase);
+  } catch {
+    throw new Error('Existing CatsCo relay endpoint is invalid and cannot be safely reused.');
+  }
+  if (!['http:', 'https:'].includes(parsed.protocol) || parsed.username || parsed.password || parsed.search || parsed.hash) {
+    throw new Error('Existing CatsCo relay endpoint is not safe to reuse.');
+  }
+  const path = parsed.pathname.replace(/\/+$/, '');
+  if (/\/anthropic$/i.test(path) || /\/v1$/i.test(path)) {
+    parsed.pathname = path.replace(
+      /\/(?:anthropic|v1)$/i,
+      provider === 'openai' ? '/v1' : '/anthropic',
+    );
+    return parsed.toString().replace(/\/+$/, '');
+  }
+  if (existing.provider === provider) return parsed.toString().replace(/\/+$/, '');
+  throw new Error('Existing CatsCo relay endpoint cannot be retargeted across protocols without login.');
 }
 
 async function catsRequest(

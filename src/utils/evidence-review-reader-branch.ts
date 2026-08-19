@@ -112,45 +112,68 @@ export async function runModelBackedReaderLane(
   });
 
   if (signal?.aborted) {
+    const abort = classifyReaderAbort(signal.reason);
     logger.write('failed', {
       message: 'Reader branch was aborted before model call.',
-      terminal_abort_reason: 'runtime-shutdown',
-      failure_outcome: 'cancelled',
+      terminal_abort_reason: abort.terminalReason,
+      failure_outcome: abort.failureOutcome,
     });
     logger.write('transcript', { messages });
     throw Object.assign(new Error('Reader branch was aborted before model call.'), {
       name: 'AbortError',
+      kind: abort.kind,
+      reviewFailureReason: abort.failureReason,
       transcriptPaths: pathList(logger),
     });
   }
 
   let rawContent = '';
+  let responseStopReason: string | undefined;
+  let responseUsage: { promptTokens: number; completionTokens: number; totalTokens: number } | undefined;
   try {
     // Responses-compatible relays may stream visible output but omit the final
     // message from their terminal response. AIService.chatStream aggregates the
     // deltas and preserves that output; the non-streaming path cannot recover it.
     const response = await options.aiService.chatStream(messages, undefined, undefined, {
       signal: signal ?? options.signal,
+      // The durable Engine owns retry scheduling. Retrying a Reader request
+      // inside this claimed Quantum can otherwise consume the entire batch
+      // deadline on 429s instead of yielding a single durable retry.
+      retryMode: 'none',
     });
+    responseStopReason = response?.stopReason;
+    responseUsage = response?.usage;
     rawContent = extractChatText(response?.content);
     messages.push({ role: 'assistant', content: rawContent });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
+    const abort = signal?.aborted ? classifyReaderAbort(signal.reason) : undefined;
     logger.write('run_result', {
       outcome: 'failed',
       message,
-      terminal_abort_reason: signal?.aborted ? 'runtime-shutdown' : null,
-      failure_outcome: signal?.aborted ? 'cancelled' : 'branch_failure',
+      stop_reason: responseStopReason ?? null,
+      usage: responseUsage ?? null,
+      terminal_abort_reason: abort?.terminalReason ?? null,
+      failure_outcome: abort?.failureOutcome ?? 'branch_failure',
     });
     logger.write('transcript', { messages });
     logger.write('failed', { message, name: (error as { name?: string })?.name });
     const wrapped = error instanceof Error ? error : new Error(message);
-    Object.assign(wrapped, { transcriptPaths: pathList(logger) });
+    Object.assign(wrapped, {
+      kind: abort?.kind ?? 'branch_failure',
+      reviewFailureReason: abort?.failureReason ?? 'reader-error',
+      transcriptPaths: pathList(logger),
+    });
     throw wrapped;
   }
 
   let findingSet: ShardFindingSet;
   try {
+    if (!rawContent.trim() && isTokenLimitStopReason(responseStopReason)) {
+      throw new Error(
+        `invalid_completion_schema: reader exhausted output budget before returning JSON (stopReason=${responseStopReason})`,
+      );
+    }
     findingSet = parseAndValidateReaderCompletion(rawContent, shard, lane, job);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
@@ -160,11 +183,17 @@ export async function runModelBackedReaderLane(
       terminal_abort_reason: null,
       failure_outcome: 'branch_failure',
       raw_preview: rawContent.slice(0, 500),
+      stop_reason: responseStopReason ?? null,
+      usage: responseUsage ?? null,
     });
     logger.write('transcript', { messages });
     logger.write('failed', { message });
     const wrapped = new Error(message);
-    Object.assign(wrapped, { transcriptPaths: pathList(logger) });
+    Object.assign(wrapped, {
+      kind: 'invalid_completion_schema',
+      reviewFailureReason: 'schema-validation-error',
+      transcriptPaths: pathList(logger),
+    });
     throw wrapped;
   }
 
@@ -173,6 +202,8 @@ export async function runModelBackedReaderLane(
     coverage: findingSet.coverage,
     findingCount: findingSet.findings.length,
     findingIds: findingSet.findings.map(f => f.findingId),
+    stop_reason: responseStopReason ?? null,
+    usage: responseUsage ?? null,
     terminal_abort_reason: null,
     failure_outcome: null,
   });
@@ -388,6 +419,13 @@ function extractJsonObject(raw: string): string {
   return candidate.slice(start, end + 1);
 }
 
+function isTokenLimitStopReason(stopReason: string | undefined): boolean {
+  const normalized = String(stopReason ?? '').trim().toLowerCase();
+  return normalized === 'length'
+    || normalized === 'max_tokens'
+    || normalized === 'max_output_tokens';
+}
+
 function extractChatText(content: unknown): string {
   if (typeof content === 'string') return content;
   if (Array.isArray(content)) {
@@ -402,6 +440,44 @@ function extractChatText(content: unknown): string {
   }
   if (content == null) return '';
   return String(content);
+}
+
+function classifyReaderAbort(reason: unknown): {
+  terminalReason: 'quantum-timeout' | 'attempt-deadline-exceeded' | 'runtime-shutdown' | 'external-abort';
+  failureOutcome: 'branch_timeout' | 'cancelled';
+  kind: 'branch_timeout' | 'branch_failure';
+  failureReason: 'quantum-timeout' | 'attempt-deadline-exceeded' | 'runtime-shutdown' | 'external-abort';
+} {
+  if (reason === 'quantum-timeout') {
+    return {
+      terminalReason: 'quantum-timeout',
+      failureOutcome: 'branch_timeout',
+      kind: 'branch_timeout',
+      failureReason: 'quantum-timeout',
+    };
+  }
+  if (reason === 'attempt-deadline-exceeded' || reason === 'review-timeout') {
+    return {
+      terminalReason: 'attempt-deadline-exceeded',
+      failureOutcome: 'branch_timeout',
+      kind: 'branch_timeout',
+      failureReason: 'attempt-deadline-exceeded',
+    };
+  }
+  if (reason === 'runtime-shutdown') {
+    return {
+      terminalReason: 'runtime-shutdown',
+      failureOutcome: 'cancelled',
+      kind: 'branch_failure',
+      failureReason: 'runtime-shutdown',
+    };
+  }
+  return {
+    terminalReason: 'external-abort',
+    failureOutcome: 'cancelled',
+    kind: 'branch_failure',
+    failureReason: 'external-abort',
+  };
 }
 
 function pathList(logger: BranchSessionLogger): string[] {

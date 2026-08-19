@@ -1,29 +1,15 @@
 import { Message, ContentBlock, ChatConfig, ChatResponse } from '../types';
-import type { ScopedDeviceGrant, ScopedDeviceSelection, ScopedLocalFileGrant } from '../types/session-identity';
+import type { ScopedArtifactContext, ScopedDeviceGrant, ScopedDeviceSelection, ScopedLocalFileGrant } from '../types/session-identity';
 import type { TargetRoutes } from '../types/tool';
 import { AIService } from '../utils/ai-service';
 import { ToolCall, ToolDefinition, ToolExecutionContext, ToolExecutor, ToolResult, ToolTranscriptMode } from '../types/tool';
-import { StreamCallbacks, StreamRetryInfo } from '../providers/provider';
+import { AIRequestOptions, StreamCallbacks, StreamRetryInfo } from '../providers/provider';
 import { Logger } from '../utils/logger';
+import { isRateLimitErrorCode } from '../utils/rate-limit-error';
 import { Metrics } from '../utils/metrics';
 import { ContextCompressor } from './context-compressor';
+import type { CheckpointCompactionCoordinator } from './checkpoint-compaction';
 import { estimateMessagesTokens, estimateToolsTokens } from './token-estimator';
-import { foldHistoricalReadFileMessages, resolveReadFileMessageFoldingOptions } from './read-file-message-folder';
-import { foldHistoricalExecuteShellMessages, resolveExecuteShellMessageFoldingOptions } from './execute-shell-message-folder';
-import {
-  formatToolResultContextReport,
-  resolveToolResultContextReportOptions,
-  summarizeToolResultContext,
-} from './tool-result-context-report';
-import {
-  resolveCurrentRunToolResultFoldingOptions,
-  selectProtectedCurrentRunToolResultIndexes,
-} from './current-run-tool-result-folding';
-import {
-  foldToolResultsTowardPromptBudget,
-  resolveAdaptiveToolResultFoldingOptions,
-} from './adaptive-tool-result-folder';
-import { resolveToolResultArtifactStoreOptions } from './tool-result-artifact-store';
 import {
   buildExplicitPlanRequestHintIfUseful,
   buildInitialDecisionHintIfUseful,
@@ -40,7 +26,9 @@ import {
   TRANSIENT_RUNNER_HINT_PREFIX,
 } from './runner-orchestration-policy';
 import {
+  TRANSIENT_ARTIFACT_OBSERVATION_PREFIX,
   TRANSIENT_RUNTIME_CONTEXT_PREFIX,
+  buildArtifactObservationMessage,
   buildRuntimeContextMessage,
 } from './runtime-context-builder';
 import { buildPendingUserInputBoundaryMessage } from './pending-user-input-boundary';
@@ -54,6 +42,7 @@ import { MODEL_IMAGE_SAFETY_MESSAGE, isModelImageSafetyError } from '../utils/mo
 import { formatProviderErrorForLog } from '../utils/provider-error-log-sanitizer';
 import { renderRequiredDefaultPromptFile } from '../utils/prompt-template';
 import { PromptTraceLogger } from '../utils/prompt-trace-logger';
+import { CacheTraceObserver, type CacheTraceSink } from '../observability/cache-trace';
 import { PathResolver } from '../utils/path-resolver';
 import {
   restoreProviderReplayToolCalls,
@@ -159,6 +148,7 @@ export interface RunResult {
 
 export interface PendingUserInput {
   content: string | ContentBlock[];
+  artifactContext?: ScopedArtifactContext | null;
   deviceGrants?: ScopedDeviceGrant[];
   deviceSelection?: ScopedDeviceSelection;
   targetRoutes?: TargetRoutes;
@@ -214,6 +204,12 @@ export interface RunnerOptions {
   runtimeTransientProvider?: RuntimeTransientProvider;
   /** Internal id that ties all messages created by one externally visible user turn together. */
   episodeId?: string;
+  /** Main-Agent-only continuation compaction. Branch and subagent runners omit it. */
+  checkpointCompactionCoordinator?: CheckpointCompactionCoordinator;
+  /** Persists a successful continuation checkpoint before execution resumes. */
+  onCompactionCheckpoint?: (messages: Message[]) => void | Promise<void>;
+  /** Best-effort observer. Its result never participates in reply control flow. */
+  cacheTraceSink?: CacheTraceSink;
 }
 
 /**
@@ -233,10 +229,13 @@ export class ConversationRunner {
   private sessionLabel: string;
   private pendingUserInputProvider?: PendingUserInputProvider;
   private promptTraceLogger: PromptTraceLogger;
+  private cacheTraceSink?: CacheTraceSink;
   private syntheticObservationProvider?: SyntheticObservationProvider;
   private runtimeTransientProvider?: RuntimeTransientProvider;
   private episodeId?: string;
   private suppressFinalResponse: boolean;
+  private checkpointCompactionCoordinator?: CheckpointCompactionCoordinator;
+  private onCompactionCheckpoint?: (messages: Message[]) => void | Promise<void>;
 
   /** 截断字符串用于日志输出，避免日志过大 */
   private static truncateForLog(text: any, maxLen = 200): string {
@@ -262,6 +261,8 @@ export class ConversationRunner {
     this.syntheticObservationProvider = options?.syntheticObservationProvider;
     this.runtimeTransientProvider = options?.runtimeTransientProvider;
     this.episodeId = options?.episodeId;
+    this.checkpointCompactionCoordinator = options?.checkpointCompactionCoordinator;
+    this.onCompactionCheckpoint = options?.onCompactionCheckpoint;
     this.maxTurns = options?.maxTurns;
     this.suppressFinalResponse = options?.suppressFinalResponse === true;
 
@@ -279,6 +280,24 @@ export class ConversationRunner {
       surface: this.toolExecutionContext?.surface,
       modelConfig: this.resolveModelConfig(),
     });
+    try {
+      if (options?.cacheTraceSink) {
+        this.cacheTraceSink = options.cacheTraceSink;
+      } else {
+        const observer = new CacheTraceObserver({
+          sessionId: this.toolExecutionContext?.sessionId,
+          surface: this.toolExecutionContext?.surface,
+          episodeId: this.episodeId,
+        });
+        this.cacheTraceSink = observer.enabled ? observer : undefined;
+      }
+    } catch {
+      this.cacheTraceSink = undefined;
+    }
+  }
+
+  private runObservation(action: () => void): void {
+    try { action(); } catch { /* Observability must never affect a reply. */ }
   }
 
   /**
@@ -405,103 +424,20 @@ export class ConversationRunner {
         currentDirectory,
       });
       nextTurnTransientHints = [];
-      const toolResultContextReportOptions = resolveToolResultContextReportOptions();
-      const toolResultContextBeforeFolding = toolResultContextReportOptions.enabled
-        ? summarizeToolResultContext(requestMessages, toolResultContextReportOptions)
-        : null;
-      const currentRunToolResultFoldingOptions = resolveCurrentRunToolResultFoldingOptions();
-      const protectedCurrentRunToolResultIndexes = selectProtectedCurrentRunToolResultIndexes(
-        requestMessages,
-        currentRunToolResultFoldingOptions,
-      );
-      const toolResultArtifactStoreOptions = this.resolveToolResultArtifactStoreOptions(turns);
-      const readFileFoldingOptions = {
-        ...resolveReadFileMessageFoldingOptions(),
-        foldCurrentRun: currentRunToolResultFoldingOptions.enabled,
-        protectedCurrentRunToolResultIndexes,
-        artifactStore: toolResultArtifactStoreOptions,
-      };
-      const executeShellFoldingOptions = {
-        ...resolveExecuteShellMessageFoldingOptions(),
-        foldCurrentRun: currentRunToolResultFoldingOptions.enabled,
-        protectedCurrentRunToolResultIndexes,
-        artifactStore: toolResultArtifactStoreOptions,
-      };
-      const readFileFolding = foldHistoricalReadFileMessages(
-        requestMessages,
-        readFileFoldingOptions,
-      );
-      requestMessages = readFileFolding.messages;
-      if (readFileFolding.stats.folded_count > 0) {
-        Logger.info(
-          `[${this.sessionLabel}Turn ${turns}] read_file truncation: `
-          + `truncated=${readFileFolding.stats.folded_count}, `
-          + `current=${readFileFolding.stats.folded_current_turn_count}, `
-          + `saved≈${readFileFolding.stats.saved_tokens_est} tokens`,
-        );
-      }
-      const executeShellFolding = foldHistoricalExecuteShellMessages(
-        requestMessages,
-        executeShellFoldingOptions,
-      );
-      requestMessages = executeShellFolding.messages;
-      if (executeShellFolding.stats.folded_count > 0) {
-        Logger.info(
-          `[${this.sessionLabel}Turn ${turns}] execute_shell truncation: `
-          + `truncated=${executeShellFolding.stats.folded_count}, `
-          + `current=${executeShellFolding.stats.folded_current_turn_count}, `
-          + `saved≈${executeShellFolding.stats.saved_tokens_est} tokens`,
-        );
-      }
-      const adaptiveFolding = foldToolResultsTowardPromptBudget(
-        requestMessages,
-        requestTools,
-        readFileFoldingOptions,
-        executeShellFoldingOptions,
-        this.resolveAdaptiveToolResultFoldingOptions(),
-      );
-      requestMessages = adaptiveFolding.messages;
-      if (adaptiveFolding.stats.folded_count > 0) {
-        Logger.info(
-          `[${this.sessionLabel}Turn ${turns}] adaptive tool_result truncation: `
-          + `passes=${adaptiveFolding.stats.passes}, `
-          + `truncated=${adaptiveFolding.stats.folded_count}, `
-          + `current=${adaptiveFolding.stats.folded_current_turn_count}, `
-          + `saved≈${adaptiveFolding.stats.saved_tokens_est} tokens, `
-          + `prompt≈${adaptiveFolding.stats.started_prompt_tokens_est}->${adaptiveFolding.stats.finished_prompt_tokens_est}, `
-          + `target=${adaptiveFolding.stats.target_prompt_tokens}, `
-          + `thresholds=${adaptiveFolding.stats.thresholds_tried.join('/')}`,
-        );
-      }
-      if (toolResultContextBeforeFolding && toolResultContextBeforeFolding.tool_result_count > 0) {
-        const toolResultContextAfterFolding = summarizeToolResultContext(
-          requestMessages,
-          toolResultContextReportOptions,
-        );
-        for (const line of formatToolResultContextReport(
-          toolResultContextBeforeFolding,
-          toolResultContextAfterFolding,
-        )) {
-          Logger.info(`[${this.sessionLabel}Turn ${turns}] ${line}`);
-        }
-      }
       const promptTrimmed = this.ensurePromptBudget(requestMessages, requestTools);
       if (promptTrimmed && callbacks?.onThinking) {
         await callbacks.onThinking(PROMPT_BUDGET_TRIM_MESSAGE);
       }
       this.logProviderMessagesForDebug(requestMessages, requestTools, turns);
-      this.promptTraceLogger.recordRequest(turns, requestMessages, requestTools);
+      this.runObservation(() => this.promptTraceLogger.recordRequest(turns, requestMessages, requestTools));
       const aiStartTime = Date.now();
       Logger.info(`[${this.sessionLabel}Turn ${turns}] 调用AI推理 (可用工具: ${requestTools.length}个)`);
 
-      let response;
+      let response: ChatResponse;
       try {
-        response = await this.requestModelResponse(requestMessages, requestTools, callbacks);
-        const aiDuration = Date.now() - aiStartTime;
-        this.promptTraceLogger.recordResponse(turns, response, aiDuration);
-        Logger.info(`[${this.sessionLabel}Turn ${turns}] AI推理完成，耗时: ${aiDuration}ms`);
+        response = await this.requestModelResponse(requestMessages, requestTools, turns, callbacks);
       } catch (error: any) {
-        this.promptTraceLogger.recordError(turns, error);
+        this.runObservation(() => this.promptTraceLogger.recordError(turns, error));
         if (this.isMessageSurface() && isModelImageSafetyError(error)) {
           if (!this.suppressFinalResponse && this.toolExecutionContext?.channel && this.toolExecutionContext?.surface !== 'catscompany') {
             try {
@@ -516,6 +452,7 @@ export class ConversationRunner {
           const assistantMessage: Message = {
             role: 'assistant',
             content: MODEL_IMAGE_SAFETY_MESSAGE,
+            ...(this.episodeId ? { __episodeId: this.episodeId } : {}),
           };
           messages.push(assistantMessage);
           newMessages.push(assistantMessage);
@@ -544,6 +481,10 @@ export class ConversationRunner {
         }
         throw error;
       }
+
+      const aiDuration = Date.now() - aiStartTime;
+      this.runObservation(() => this.promptTraceLogger.recordResponse(turns, response, aiDuration));
+      Logger.info(`[${this.sessionLabel}Turn ${turns}] AI推理完成，耗时: ${aiDuration}ms`);
 
       if (response.usage) {
         Metrics.recordAICall(this.stream ? 'stream' : 'chat', response.usage);
@@ -575,6 +516,7 @@ export class ConversationRunner {
               content: restored.visibleText || null,
               toolCalls: restoredToolCalls,
               providerContent: undefined,
+              providerState: undefined,
             };
           }
         }
@@ -603,7 +545,11 @@ export class ConversationRunner {
         Logger.info(`[${this.sessionLabel}Turn ${turns}] AI最终回复: ${ConversationRunner.truncateForLog(visibleContent, 300)}`);
 
         if (visibleContent) {
-          const finalAssistantMessage: Message = { role: 'assistant', content: visibleContent };
+          const finalAssistantMessage: Message = {
+            role: 'assistant',
+            content: visibleContent,
+            ...(this.episodeId ? { __episodeId: this.episodeId } : {}),
+          };
           messages.push(finalAssistantMessage);
           newMessages.push(finalAssistantMessage);
         }
@@ -681,6 +627,7 @@ export class ConversationRunner {
         content: stripAssistantTranscriptArtifacts(response.content || ''),
         tool_calls: response.toolCalls,
         providerContent: response.providerContent,
+        providerState: response.providerState,
       };
       const executionRecords: ToolExecutionRecord[] = [];
       let shouldPauseTurn = false;
@@ -787,6 +734,7 @@ export class ConversationRunner {
         };
       }
 
+      await this.compactMidTurnIfNeeded(messages, requestTools, turns, callbacks);
       await this.appendPendingUserInput(messages, newMessages, turns);
     }
 
@@ -837,6 +785,13 @@ export class ConversationRunner {
       };
       shouldRefreshRuntimeContext = true;
     }
+    if (isPendingUserInput(pending) && Object.prototype.hasOwnProperty.call(pending, 'artifactContext')) {
+      this.toolExecutionContext = {
+        ...(this.toolExecutionContext || {}),
+        artifactContext: pending.artifactContext || undefined,
+      };
+      shouldRefreshRuntimeContext = true;
+    }
     if (isPendingUserInput(pending) && pending.localFileGrants?.length) {
       this.toolExecutionContext = {
         ...(this.toolExecutionContext || {}),
@@ -874,11 +829,67 @@ export class ConversationRunner {
     return true;
   }
 
+  private async compactMidTurnIfNeeded(
+    messages: Message[],
+    tools: ToolDefinition[],
+    turns: number,
+    callbacks?: RunnerCallbacks,
+  ): Promise<void> {
+    if (!this.checkpointCompactionCoordinator) return;
+    const result = await this.checkpointCompactionCoordinator.compactIfNeeded(messages, {
+      sessionKey: this.toolExecutionContext?.sessionId || this.sessionLabel.trim() || 'runner',
+      phase: 'mid_turn',
+      episodeId: this.episodeId,
+      toolTokens: estimateToolsTokens(tools),
+      signal: this.toolExecutionContext?.abortSignal,
+      onStatus: callbacks?.onThinking
+        ? async event => {
+          if (event.status === 'start') {
+            await callbacks.onThinking?.('Context is full. Creating a continuation checkpoint.');
+          } else if (event.status === 'complete') {
+            await callbacks.onThinking?.('Continuation checkpoint created. Preparing to resume the same task.');
+          } else {
+            await callbacks.onThinking?.('Checkpoint creation failed. Continuing with the original context.');
+          }
+        }
+        : undefined,
+    });
+    if (!result.compacted) return;
+
+    try {
+      await this.onCompactionCheckpoint?.(result.messages);
+    } catch (error) {
+      Logger.warning(
+        `[${this.sessionLabel}Turn ${turns}] continuation checkpoint persistence failed; `
+        + `keeping original transcript: ${error instanceof Error ? error.message : String(error)}`,
+      );
+      return;
+    }
+
+    messages.splice(0, messages.length, ...result.messages);
+    this.refreshRuntimeContextForPendingInput(messages);
+    Logger.info(
+      `[${this.sessionLabel}Turn ${turns}] durable mid-turn checkpoint persisted; continuing same episode`,
+    );
+  }
+
   private refreshRuntimeContextForPendingInput(messages: Message[]): void {
     const sessionKey = this.toolExecutionContext?.sessionId
       || this.toolExecutionContext?.executionScope?.sessionKey;
     if (!sessionKey) return;
 
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const message = messages[i];
+      if (
+        typeof message.content === 'string'
+        && (
+          (message.role === 'system' && message.content.startsWith(TRANSIENT_RUNTIME_CONTEXT_PREFIX))
+          || (message.__injected && message.content.startsWith(TRANSIENT_ARTIFACT_OBSERVATION_PREFIX))
+        )
+      ) {
+        messages.splice(i, 1);
+      }
+    }
     const runtimeContext = buildRuntimeContextMessage({
       sessionKey,
       sessionType: this.toolExecutionContext?.surface,
@@ -887,21 +898,12 @@ export class ConversationRunner {
       deviceGrants: this.toolExecutionContext?.deviceGrants,
       deviceSelection: this.toolExecutionContext?.deviceSelection,
       targetRoutes: this.toolExecutionContext?.targetRoutes,
+      artifactContext: this.toolExecutionContext?.artifactContext,
       localFileGrants: this.toolExecutionContext?.localFileGrants,
     });
-    if (!runtimeContext) return;
-
-    for (let i = messages.length - 1; i >= 0; i--) {
-      const message = messages[i];
-      if (
-        message.role === 'system'
-        && typeof message.content === 'string'
-        && message.content.startsWith(TRANSIENT_RUNTIME_CONTEXT_PREFIX)
-      ) {
-        messages.splice(i, 1);
-      }
-    }
-    messages.push(runtimeContext);
+    if (runtimeContext) messages.push(runtimeContext);
+    const artifactObservation = buildArtifactObservationMessage(this.toolExecutionContext?.artifactContext);
+    if (artifactObservation) messages.push(artifactObservation);
   }
 
   private injectSyntheticObservations(messages: Message[], turn: number): void {
@@ -991,8 +993,9 @@ export class ConversationRunner {
         ? { tool_calls: transcriptToolCalls }
         : {}),
       ...(providerContent?.length
-        ? { providerContent }
+        ? { providerContent, providerState: assistantMsg.providerState }
         : {}),
+      ...(this.episodeId ? { __episodeId: this.episodeId } : {}),
     };
 
     if (assistant.content || assistant.tool_calls?.length) {
@@ -1027,6 +1030,7 @@ export class ConversationRunner {
           ],
           tool_call_id: record.result.tool_call_id,
           name: record.result.name,
+          ...(this.episodeId ? { __episodeId: this.episodeId } : {}),
         });
       } else {
         // 正常的 tool result
@@ -1035,15 +1039,24 @@ export class ConversationRunner {
           content: record.toolContent,
           tool_call_id: record.result.tool_call_id,
           name: record.result.name,
+          ...(this.episodeId ? { __episodeId: this.episodeId } : {}),
         });
 
         // 插入额外消息（如图片）
         if (record.newMessages) {
-          messages.push(...record.newMessages);
+          messages.push(...record.newMessages.map(message => ({
+            ...message,
+            ...(message.__episodeId || !this.episodeId ? {} : { __episodeId: this.episodeId }),
+          })));
         }
       }
     }
 
+    if (this.episodeId) {
+      for (const message of messages) {
+        if (!message.__episodeId) message.__episodeId = this.episodeId;
+      }
+    }
     return messages;
   }
 
@@ -1389,6 +1402,7 @@ export class ConversationRunner {
     return {
       role: 'system',
       content: `${TRANSIENT_RUNNER_HINT_PREFIX}\n${renderRequiredDefaultPromptFile('transient/runner-duplicate-outbound.md', { content })}`,
+      __cacheScope: 'dynamic',
     };
   }
 
@@ -1407,6 +1421,7 @@ export class ConversationRunner {
         TRANSIENT_RUNNER_HINT_PREFIX,
         renderRequiredDefaultPromptFile('transient/runner-empty-max-tokens.md', {}),
       ].join('\n'),
+      __cacheScope: 'dynamic',
     };
   }
 
@@ -1496,16 +1511,33 @@ export class ConversationRunner {
   private async requestModelResponse(
     messages: Message[],
     activeTools: ToolDefinition[],
+    episodeNumber: number,
     callbacks?: RunnerCallbacks,
   ) {
-    const requestOptions = {
+    const requestOptions: AIRequestOptions = {
       signal: this.toolExecutionContext?.abortSignal,
+      ...(this.cacheTraceSink ? {
+        modelAttemptSink: this.cacheTraceSink,
+        modelAttemptContext: {
+          sessionId: this.toolExecutionContext?.sessionId,
+          surface: this.toolExecutionContext?.surface,
+          episodeId: this.episodeId,
+          episodeNumber,
+        },
+      } : {}),
+      promptCacheContext: {
+        sessionKey: this.toolExecutionContext?.sessionId || 'unknown',
+        ...(this.episodeId ? { currentEpisodeId: this.episodeId } : {}),
+        phase: 'normal' as const,
+        explicitCaching: true,
+      },
+      streamOutputMode: callbacks?.onText ? 'live' as const : 'buffered' as const,
     };
     try {
       if (this.stream) {
         const streamCallbacks: StreamCallbacks = {
-          onText: (text) => callbacks?.onText?.(text),
           onRetry: (attempt, maxRetries, info) => callbacks?.onRetry?.(attempt, maxRetries, info),
+          ...(callbacks?.onText ? { onText: callbacks.onText } : {}),
         };
         return await this.aiService.chatStream(messages, activeTools, streamCallbacks, requestOptions);
       }
@@ -1524,8 +1556,8 @@ export class ConversationRunner {
 
       if (this.stream) {
         const streamCallbacks: StreamCallbacks = {
-          onText: (text) => callbacks?.onText?.(text),
           onRetry: (attempt, maxRetries, info) => callbacks?.onRetry?.(attempt, maxRetries, info),
+          ...(callbacks?.onText ? { onText: callbacks.onText } : {}),
         };
         return await this.aiService.chatStream(messages, activeTools, streamCallbacks, requestOptions);
       }
@@ -1563,32 +1595,6 @@ export class ConversationRunner {
       `[上下文守门] 裁剪后: messages=${messageTokens}, tools=${toolTokens}, budget=${this.maxPromptTokens}`
     );
     return true;
-  }
-
-  private resolveAdaptiveToolResultFoldingOptions() {
-    const promptBudget = Math.max(1, this.maxPromptTokens);
-    const options = resolveAdaptiveToolResultFoldingOptions(process.env, {
-      targetPromptTokens: promptBudget,
-    });
-    return {
-      ...options,
-      targetPromptTokens: Math.min(options.targetPromptTokens, promptBudget),
-    };
-  }
-
-  private resolveToolResultArtifactStoreOptions(turn: number) {
-    const workspaceRoot = this.toolExecutionContext?.workspaceRoot
-      || this.toolExecutionContext?.workingDirectory;
-    const defaultRoot = workspaceRoot
-      ? path.join(workspaceRoot, '.xiaoba', 'tool-results')
-      : undefined;
-    return resolveToolResultArtifactStoreOptions(process.env, {
-      enabled: Boolean(defaultRoot),
-      rootDirectory: defaultRoot,
-      sessionId: this.toolExecutionContext?.sessionId
-        || this.toolExecutionContext?.executionScope?.sessionKey,
-      turn,
-    });
   }
 
   private fitToolsToPromptBudget(tools: ToolDefinition[]): ToolDefinition[] {
@@ -1711,13 +1717,19 @@ export class ConversationRunner {
           ...message,
           tool_calls: toolCalls,
           providerContent,
+          providerState: providerContent ? message.providerState : undefined,
         });
         continue;
       }
 
       const content = contentToString(message.content).trim();
       if (content) {
-        repaired.push({ ...message, tool_calls: undefined, providerContent: undefined });
+        repaired.push({
+          ...message,
+          tool_calls: undefined,
+          providerContent: undefined,
+          providerState: undefined,
+        });
       }
     }
 
@@ -1737,6 +1749,7 @@ export class ConversationRunner {
       content: `${content.slice(0, maxChars)}\n...[已截断以适配模型上下文预算，原始 ${content.length} 字符]`,
       tool_calls: undefined,
       providerContent: undefined,
+      providerState: undefined,
     };
   }
 
@@ -1765,6 +1778,7 @@ export class ConversationRunner {
 
     if (content.length > maxChars || aggressive) {
       delete next.providerContent;
+      delete next.providerState;
     }
 
     return next;
@@ -1816,48 +1830,9 @@ export class ConversationRunner {
 
   private static readonly MAX_RETRIES = 2;
   private static readonly RETRY_BASE_DELAY_MS = 5000;
-  private static readonly RATE_LIMIT_ERROR_CODES = new Set([
-    'RATE_LIMIT',
-    'HTTP_429',
-    'TOO_MANY_REQUESTS',
-  ]);
-
-  private static hasRateLimitMarkers(text: string): boolean {
-    if (!text) {
-      return false;
-    }
-
-    const lower = text.toLowerCase();
-    if (
-      lower.includes('rate limit')
-      || lower.includes('too many requests')
-      || lower.includes('频率受限')
-      || lower.includes('限流')
-    ) {
-      return true;
-    }
-
-    return /(status(?:\s*code)?|http(?:\s*status)?|错误码|code)\s*[:=]?\s*429\b/i.test(text)
-      || /\b429\b.{0,24}(too many requests|rate limit|频率受限|限流)/i.test(text)
-      || /(too many requests|rate limit|频率受限|限流).{0,24}\b429\b/i.test(text);
-  }
-
-  /** 检测工具结果是否为 429 限流错误（避免把正文里的数字 429 误判为限流） */
+  /** 检测工具结果是否为 429 限流错误；正文和通用 retryable 标记都不能驱动限流退避。 */
   private static isRateLimitError(result: ToolResult): boolean {
-    const content = String(result.content || '');
-    if (result.errorCode && ConversationRunner.RATE_LIMIT_ERROR_CODES.has(result.errorCode)) {
-      return true;
-    }
-
-    const isFailure = result.ok === false
-      || Boolean(result.errorCode)
-      || result.retryable === true;
-
-    if (!isFailure) {
-      return false;
-    }
-
-    return ConversationRunner.hasRateLimitMarkers(content);
+    return isRateLimitErrorCode(result.errorCode);
   }
 
   /** 带 429 重试的工具执行 */

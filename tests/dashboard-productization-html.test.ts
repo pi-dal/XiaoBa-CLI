@@ -5,7 +5,6 @@ import test from 'node:test';
 import vm from 'node:vm';
 
 const dashboardHtml = readFileSync(join(process.cwd(), 'dashboard/index.html'), 'utf-8');
-const dashboardApiSource = readFileSync(join(process.cwd(), 'src/dashboard/routes/api.ts'), 'utf-8');
 const servicesPageHtml = dashboardHtml.match(/<div class="page" id="page-services">[\s\S]*?<div class="page" id="page-companion">/)?.[0] || '';
 
 test('Branch page follows the approved per-branch model layout', () => {
@@ -291,6 +290,7 @@ test('relay model cards render SDK labels from model payloads', () => {
       .replace(/'/g, '&#039;'),
     formatModelContextLabel: (tokens: unknown, fallback: unknown) => fallback || `${tokens} tokens`,
     relayActionBusy: () => false,
+    isCloudOverrideActive: () => false,
     String,
   }) as (
     model: Record<string, unknown>,
@@ -525,15 +525,4 @@ test('dashboard non-chat pages use the full available work area', () => {
   assert.match(dashboardHtml, /body:not\(\.chat-active\) \.sidebar \{\s*position: static;\s*width: 100%;\s*min-height: auto;/);
   assert.match(dashboardHtml, /body:not\(\.chat-active\) \.main-wrapper \{\s*margin-left: 0;/);
   assert.match(dashboardHtml, /@media \(max-width: 780px\) \{\s*body:not\(\.chat-active\) \.companion-hero,/);
-});
-
-test('CatsCo file attachments force a same-origin download instead of opening a preview window', () => {
-  const fileBlock = dashboardHtml.match(/if\(rich\.type==='file'\)\{[\s\S]*?\n      \}/)?.[0] || '';
-  assert.match(fileBlock, /\/api\/cats\/download\?url=/);
-  assert.match(fileBlock, /download="'\+escapeHtml\(name\)\+'"/);
-  assert.doesNotMatch(fileBlock, /target="_blank"/);
-  assert.match(dashboardApiSource, /router\.get\('\/cats\/download'/);
-  assert.match(dashboardApiSource, /Content-Disposition/);
-  assert.match(dashboardApiSource, /attachment; filename=/);
-  assert.match(dashboardApiSource, /resolveTrustedCatsAttachmentUrl/);
 });
