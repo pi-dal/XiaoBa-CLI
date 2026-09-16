@@ -217,6 +217,8 @@ export interface ToolExecutionContext {
   sessionId?: string;
   /** Stable correlation for the externally visible turn / Learning Episode. */
   episodeId?: string;
+  /** Provider tool-use id of the exact tool invocation being executed. Set by ConversationRunner at the execution site for branch-private fetch correlation. */
+  toolUseId?: string;
   surface?: ToolSurface;
   permissionProfile?: ToolPermissionProfile;
   runId?: string;

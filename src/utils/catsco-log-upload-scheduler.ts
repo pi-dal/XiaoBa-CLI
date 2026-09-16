@@ -4,12 +4,13 @@ import * as os from 'os';
 import * as path from 'path';
 import { glob } from 'glob';
 import { APP_VERSION } from '../version';
-import { CatscoLogAgentClient } from './catsco-log-agent-client';
+import { CatscoLogAgentClient, isSafeCatsLogPath } from './catsco-log-agent-client';
 import { getCatscoLogAgentConfig } from './catsco-log-agent-config';
 import {
   CatscoBlockedFileState,
   CatscoAppendFileState,
   CatscoLogAgentState,
+  clearCatscoSkillToken,
   clearCatscoLogToken,
   ensureCatscoDeviceId,
   loadCatscoLogAgentState,
@@ -43,6 +44,20 @@ interface AppendChunk {
   expectedOffset: number;
   expectedRevision: string;
   requestId: string;
+}
+
+function copyCatscoSkillCapability(
+  target: CatscoLogAgentState,
+  source: CatscoLogAgentState,
+): void {
+  target.skillTokenId = source.skillTokenId;
+  target.skillToken = source.skillToken;
+  target.skillTokenExpiresAt = source.skillTokenExpiresAt;
+  target.skillsUrl = source.skillsUrl;
+  target.skillGraphUrl = source.skillGraphUrl;
+  target.memoryUrl = source.memoryUrl;
+  target.memoryRecallUrl = source.memoryRecallUrl;
+  target.memoryNotesUrl = source.memoryNotesUrl;
 }
 
 export class CatscoLogUploadScheduler {
@@ -205,7 +220,7 @@ export class CatscoLogUploadScheduler {
       return null;
     }
 
-    const deviceId = ensureCatscoDeviceId(state);
+    const deviceId = ensureCatscoDeviceId(state, config.stateFilePath);
     const client = new CatscoLogAgentClient(config.apiBaseUrl);
     const response = await client.bootstrap({
       deviceId,
@@ -216,10 +231,16 @@ export class CatscoLogUploadScheduler {
       catscoUserToken: config.catscoUserToken,
     });
 
+    // The memory provider can finish a parallel bootstrap while this upload
+    // handshake is in flight. Snapshot its latest read capability before
+    // saving upload state so an older scheduler object cannot erase it.
+    const latestState = loadCatscoLogAgentState(config.stateFilePath);
+
     state.userId = response.user_id;
     state.externalProvider = response.external_provider;
     state.externalUserId = response.external_user_id;
     state.deviceId = response.device_id;
+    ensureCatscoDeviceId(state, config.stateFilePath);
     state.tokenId = response.token_id;
     state.token = response.token;
     state.tokenIssuedAt = response.issued_at;
@@ -229,10 +250,34 @@ export class CatscoLogUploadScheduler {
       delete state.tokenExpiresAt;
     }
     state.uploadProtocol = Number(response.upload_protocol) >= 2 ? 2 : 1;
-    if (state.uploadProtocol === 2 && response.append_url?.trim()) {
-      state.appendUrl = response.append_url.trim();
+    if (state.uploadProtocol === 2 && isSafeCatsLogPath(response.append_url)) {
+      state.appendUrl = response.append_url;
     } else {
       delete state.appendUrl;
+    }
+    // Keep the read capabilities from the same bootstrap alongside the upload
+    // state. Older CatsLog servers omit these fields; in that case preserve
+    // the latest capability instead of erasing it during an upload refresh.
+    clearCatscoSkillToken(state);
+    if (response.skill_token !== undefined || response.skill_token_expires_at !== undefined) {
+      const skillToken = typeof response.skill_token === 'string' ? response.skill_token.trim() : '';
+      const skillTokenExpiresAt = typeof response.skill_token_expires_at === 'string'
+        ? response.skill_token_expires_at.trim()
+        : '';
+      if (skillToken && skillTokenExpiresAt) {
+        state.skillTokenId = typeof response.skill_token_id === 'string'
+          ? response.skill_token_id.trim() || undefined
+          : undefined;
+        state.skillToken = skillToken;
+        state.skillTokenExpiresAt = skillTokenExpiresAt;
+        state.skillsUrl = isSafeCatsLogPath(response.skills_url) ? response.skills_url : undefined;
+        state.skillGraphUrl = isSafeCatsLogPath(response.skill_graph_url) ? response.skill_graph_url : undefined;
+        state.memoryUrl = isSafeCatsLogPath(response.memory_url) ? response.memory_url : undefined;
+        state.memoryRecallUrl = isSafeCatsLogPath(response.memory_recall_url) ? response.memory_recall_url : undefined;
+        state.memoryNotesUrl = isSafeCatsLogPath(response.memory_notes_url) ? response.memory_notes_url : undefined;
+      }
+    } else if (!latestState.stateCorrupt) {
+      copyCatscoSkillCapability(state, latestState);
     }
     state.uploaded ||= {};
     saveCatscoLogAgentState(config.stateFilePath, state);

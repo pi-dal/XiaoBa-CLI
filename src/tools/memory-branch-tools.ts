@@ -10,6 +10,27 @@ export interface MemorySearchFinishPayload {
 export type MemorySearchFinishHandler = (payload: MemorySearchFinishPayload) => void;
 
 const CANONICAL_REF_PATTERN = /^[^/\\#]+\/\d{4}-\d{2}-\d{2}\/[^/\\#]+\.jsonl#\d+$/;
+// CatsLog refs are path-free stream citations (or the explicitly namespaced
+// hash/skill citations produced by the remote projection). Keep this grammar
+// narrow so finish refs can never become URLs, filesystem paths, or tokens.
+const CATSLOG_STREAM_REF_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:@-]{0,255}#(?:[1-9][0-9]*|summary)$/;
+const CATSLOG_SESSION_HASH_REF_PATTERN = /^catslog:session:[a-f0-9]{24}$/;
+const CATSLOG_SKILL_REF_PATTERN = /^catslog:skill:[A-Za-z0-9][A-Za-z0-9._:@-]{0,255}@[1-9][0-9]*$/;
+// Node-level citation refs extend the skill ref with a program node id
+// (`#<node>`). The node charset mirrors the server's canonical grammar
+// (`^[a-z][a-z0-9_-]{0,63}$`); node refs can only arise from a gated subgraph
+// delivery, and the narrow grammar keeps them from becoming URLs or paths.
+const CATSLOG_SKILL_NODE_REF_PATTERN = /^catslog:skill:[A-Za-z0-9][A-Za-z0-9._:@-]{0,255}@[1-9][0-9]*#[a-z][a-z0-9_-]{0,63}$/;
+const CATSLOG_REF_HASH_PATTERN = /^catslog:ref:[a-f0-9]{24}$/;
+
+export function isMemoryCitationRef(ref: string): boolean {
+  return CANONICAL_REF_PATTERN.test(ref)
+    || CATSLOG_STREAM_REF_PATTERN.test(ref)
+    || CATSLOG_SESSION_HASH_REF_PATTERN.test(ref)
+    || CATSLOG_SKILL_REF_PATTERN.test(ref)
+    || CATSLOG_SKILL_NODE_REF_PATTERN.test(ref)
+    || CATSLOG_REF_HASH_PATTERN.test(ref);
+}
 
 export class MemorySearchTool implements Tool {
   definition: ToolDefinition = {
@@ -222,7 +243,7 @@ function validateFinishArgs(args: any):
   const inject = args?.inject !== false;
   const refs: string[] = args.refs.map((ref: unknown) => String(ref || '').trim()).filter(Boolean);
   for (const ref of refs) {
-    if (!CANONICAL_REF_PATTERN.test(ref)) {
+    if (!isMemoryCitationRef(ref)) {
       return { ok: false, error: `invalid canonical ref: ${ref}` };
     }
   }

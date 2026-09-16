@@ -26,6 +26,12 @@ const LOW_RISK_TOOLS = new Set([
   'memory_read_turn',
   'memory_neighbors',
   'finish_memory_search',
+  // Device-bound CatsLog reads are authenticated and scoped by the provider;
+  // they do not mutate the local machine or send an external side effect.
+  'catslog_skill_memory',
+  'catslog_session_recall',
+  'catslog_skill_fetch',
+  'catslog_skill_subgraph_fetch',
   'finish_prompt_mode_routing',
   // Constrained Author/Verifier branches only return a structured result to
   // their parent runtime. They do not write files, execute commands, or

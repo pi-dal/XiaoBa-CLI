@@ -12,11 +12,25 @@ export interface ObservationBranchDisposition {
 }
 
 /**
+ * Terminal disposition of one observation branch run, resolved on every exit
+ * path of `run()`. Branch-private lifecycle vocabulary for the run's own
+ * outcome; it says nothing about downstream main-agent or task success.
+ */
+export type ObservationBranchRunDisposition =
+  | 'published'
+  | 'suppressed_inject_false'
+  | 'discarded_queue_closed_or_duplicate'
+  | 'cancelled'
+  | 'failed';
+
+/**
  * BranchSession specialization for side branches that publish synthetic
  * runtime observations back to the parent runner.
  */
 export abstract class ObservationBranchSession<TFinishPayload> extends BranchSession {
   private finishPayload: TFinishPayload | null = null;
+  /** Resolved on every run() exit path; 'failed' is the safe fallback. */
+  protected runDisposition: ObservationBranchRunDisposition = 'failed';
 
   protected constructor(protected readonly observationOptions: ObservationBranchSessionOptions) {
     super(observationOptions);
@@ -34,17 +48,20 @@ export abstract class ObservationBranchSession<TFinishPayload> extends BranchSes
 
       if (!this.finishPayload) {
         if (!this.shouldContinue()) {
+          this.runDisposition = 'cancelled';
           this.logCancelledBeforeFinish(false);
         }
         return;
       }
       if (!this.shouldContinue()) {
+        this.runDisposition = 'cancelled';
         this.logger.write('finished_after_cancel', this.buildFinishedAfterCancelLogPayload(this.finishPayload));
         return;
       }
 
       const disposition = this.getObservationDisposition(this.finishPayload);
       if (!disposition.inject) {
+        this.runDisposition = 'suppressed_inject_false';
         this.logger.write('suppressed_observation', {
           reason: 'inject_false',
           ...(disposition.logPayload || {}),
@@ -56,8 +73,10 @@ export abstract class ObservationBranchSession<TFinishPayload> extends BranchSes
       const pushed = this.observationOptions.queue.push(observation);
       const logPayload = this.buildPublishedObservationLogPayload(this.finishPayload, observation);
       if (pushed) {
+        this.runDisposition = 'published';
         this.logger.write('published_observation', logPayload);
       } else {
+        this.runDisposition = 'discarded_queue_closed_or_duplicate';
         this.logger.write('discarded_observation', {
           ...logPayload,
           reason: 'queue_closed_or_duplicate',
@@ -65,8 +84,10 @@ export abstract class ObservationBranchSession<TFinishPayload> extends BranchSes
       }
     } catch (error: any) {
       if (this.isAbortError(error) || !this.shouldContinue()) {
+        this.runDisposition = 'cancelled';
         this.logCancelledBeforeFinish(true);
       } else {
+        this.runDisposition = 'failed';
         this.logFailure(error);
       }
     }

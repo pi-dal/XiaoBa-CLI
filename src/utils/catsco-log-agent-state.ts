@@ -2,6 +2,11 @@ import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
 
+// The upload scheduler and the memory provider can bootstrap concurrently at
+// runtime startup. Reuse one generated identity per state file within this
+// process so those handshakes cannot accidentally create two device scopes.
+const processDeviceIds = new Map<string, string>();
+
 export interface CatscoUploadedFileState {
   size: number;
   mtimeMs: number;
@@ -57,6 +62,15 @@ export interface CatscoLogAgentState {
   tokenExpiresAt?: string;
   uploadProtocol?: 1 | 2;
   appendUrl?: string;
+  /** Short-lived device-bound read capability returned by CatsLog bootstrap. */
+  skillTokenId?: string;
+  skillToken?: string;
+  skillTokenExpiresAt?: string;
+  skillsUrl?: string;
+  skillGraphUrl?: string;
+  memoryUrl?: string;
+  memoryRecallUrl?: string;
+  memoryNotesUrl?: string;
   stateCorrupt?: boolean;
   uploaded: Record<string, CatscoUploadedFileState>;
   conflicts?: Record<string, CatscoUploadConflictState>;
@@ -99,10 +113,26 @@ export function saveCatscoLogAgentState(stateFilePath: string, state: CatscoLogA
   fs.renameSync(tmpPath, stateFilePath);
 }
 
-export function ensureCatscoDeviceId(state: CatscoLogAgentState): string {
-  if (!state.deviceId) {
-    state.deviceId = `device_${crypto.randomUUID().replace(/-/g, '')}`;
+export function ensureCatscoDeviceId(
+  state: CatscoLogAgentState,
+  stateFilePath?: string,
+): string {
+  const cacheKey = stateFilePath ? path.resolve(stateFilePath) : undefined;
+  const current = typeof state.deviceId === 'string' ? state.deviceId.trim() : '';
+  if (current) {
+    state.deviceId = current;
+    if (cacheKey) processDeviceIds.set(cacheKey, current);
+    return current;
   }
+  if (cacheKey) {
+    const cached = processDeviceIds.get(cacheKey);
+    if (cached) {
+      state.deviceId = cached;
+      return cached;
+    }
+  }
+  state.deviceId = `device_${crypto.randomUUID().replace(/-/g, '')}`;
+  if (cacheKey) processDeviceIds.set(cacheKey, state.deviceId);
   return state.deviceId;
 }
 
@@ -116,6 +146,18 @@ export function clearCatscoLogToken(state: CatscoLogAgentState): void {
   delete state.tokenExpiresAt;
   delete state.uploadProtocol;
   delete state.appendUrl;
+}
+
+/** Clear read capabilities while preserving the upload token/session. */
+export function clearCatscoSkillToken(state: CatscoLogAgentState): void {
+  delete state.skillTokenId;
+  delete state.skillToken;
+  delete state.skillTokenExpiresAt;
+  delete state.skillsUrl;
+  delete state.skillGraphUrl;
+  delete state.memoryUrl;
+  delete state.memoryRecallUrl;
+  delete state.memoryNotesUrl;
 }
 
 function quarantineCorruptState(stateFilePath: string): void {

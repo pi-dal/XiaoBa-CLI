@@ -116,6 +116,16 @@ export abstract class BranchSession {
     return this.logger.getFilePath();
   }
 
+  /**
+   * Boundary observer for accepted provider requests. Fired once per request
+   * the provider accepted, immediately after the call resolves, with a deep
+   * snapshot of the exact request messages that attempt used (post-trim on
+   * the overflow retry); rejected attempts never fire it. Default is a no-op.
+   * Specializations may override to correlate private fetch records with what
+   * the model actually saw. The snapshot is a private copy; must not block.
+   */
+  protected handleProviderRequestBoundary(_requestMessages: Message[]): void {}
+
   protected abstract buildInitialMessages(): Promise<Message[]>;
   protected abstract buildTools(): Tool[];
 
@@ -204,6 +214,7 @@ export abstract class BranchSession {
         result,
       }),
       onRetry: (attempt, maxRetries) => this.logger.write('retry', { attempt, max_retries: maxRetries }),
+      onProviderRequestAccepted: messages => this.handleProviderRequestBoundary(messages),
     };
 
     try {
@@ -368,10 +379,13 @@ function sanitizeFilePart(value: string): string {
   return value.replace(/[^a-zA-Z0-9_.-]/g, '_').slice(0, 120) || 'branch';
 }
 
-const CREDENTIAL_FIELD_PATTERN = /(?:api[_-]?key|access[_-]?token|refresh[_-]?token|password|secret|authorization|credential)/i;
-const CREDENTIAL_ASSIGNMENT_PATTERN = /((?:api[_-]?key|access[_-]?token|refresh[_-]?token|password|secret|authorization|credential)\s*[:=]\s*["']?)[^\s,"'}\]]+/gi;
+// `retrieval[_-]?receipt` covers CatsLog one-time body credentials; those must
+// never survive into a branch log even if an upstream layer regresses.
+const CREDENTIAL_FIELD_PATTERN = /(?:api[_-]?key|access[_-]?token|refresh[_-]?token|password|secret|authorization|credential|retrieval[_-]?receipt)/i;
+const CREDENTIAL_ASSIGNMENT_PATTERN = /((?:api[_-]?key|access[_-]?token|refresh[_-]?token|password|secret|authorization|credential|retrieval[_-]?receipt)\s*[:=]\s*["']?)[^\s,"'}\]]+/gi;
 const BEARER_PATTERN = /\bBearer\s+[A-Za-z0-9._~+/=-]+/gi;
-const TOKEN_PATTERN = /\b(?:sk|rk|xox[baprs])-[-_A-Za-z0-9]{8,}\b/g;
+// `catslog_smr_…` is the CatsLog retrieval receipt credential prefix.
+const TOKEN_PATTERN = /\b(?:sk|rk|xox[baprs])-[-_A-Za-z0-9]{8,}\b|\bcatslog_smr_[A-Za-z0-9_-]+\b/g;
 
 function redactRecord(record: Record<string, unknown>): Record<string, unknown> {
   return redactValue(record) as Record<string, unknown>;

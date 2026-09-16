@@ -131,6 +131,16 @@ export interface RunnerCallbacks {
   onToolStart?: (name: string, toolUseId: string, input: any) => void;
   /** 工具执行完成 */
   onToolEnd?: (name: string, toolUseId: string, result: string) => void;
+  /**
+   * Fires exactly once per accepted provider request, immediately after the
+   * provider call resolves, with a deep snapshot of the exact request messages
+   * that attempt used (post-trim on the overflow retry). Attempts rejected
+   * before the model could consume them (e.g. prompt-too-long before the
+   * retry) never fire this callback. Observation-only: the snapshot is a
+   * private copy, so mutating it cannot affect the run, and consumers must
+   * not block the loop.
+   */
+  onProviderRequestAccepted?: (messages: Message[]) => void;
   /** 需要显示工具输出（如 task_planner） */
   onToolDisplay?: (name: string, content: string) => void;
   /** 重试通知 */
@@ -704,6 +714,7 @@ export class ConversationRunner {
           {
             ...(this.toolExecutionContext || {}),
             ...(this.episodeId ? { episodeId: this.episodeId } : {}),
+            toolUseId: toolCall.id,
           },
           turns,
         );
@@ -1498,6 +1509,15 @@ export class ConversationRunner {
     activeTools: ToolDefinition[],
     callbacks?: RunnerCallbacks,
   ) {
+    // Accepted-request boundary (observation-only): fired only after a
+    // provider attempt resolves, with a snapshot of the exact request that
+    // attempt used. An attempt rejected before the model could consume it
+    // (e.g. prompt-too-long) must never imply consumption, so rejected
+    // attempts fire nothing; the post-trim retry reports its own accepted
+    // request instead.
+    const reportAcceptedRequest = (): void => {
+      callbacks?.onProviderRequestAccepted?.(this.snapshotProviderMessages(messages));
+    };
     const requestOptions = {
       signal: this.toolExecutionContext?.abortSignal,
     };
@@ -1507,9 +1527,13 @@ export class ConversationRunner {
           onText: (text) => callbacks?.onText?.(text),
           onRetry: (attempt, maxRetries, info) => callbacks?.onRetry?.(attempt, maxRetries, info),
         };
-        return await this.aiService.chatStream(messages, activeTools, streamCallbacks, requestOptions);
+        const response = await this.aiService.chatStream(messages, activeTools, streamCallbacks, requestOptions);
+        reportAcceptedRequest();
+        return response;
       }
-      return await this.aiService.chat(messages, activeTools, requestOptions);
+      const response = await this.aiService.chat(messages, activeTools, requestOptions);
+      reportAcceptedRequest();
+      return response;
     } catch (error: any) {
       if (!this.isPromptTooLongError(error)) {
         throw error;
@@ -1527,10 +1551,19 @@ export class ConversationRunner {
           onText: (text) => callbacks?.onText?.(text),
           onRetry: (attempt, maxRetries, info) => callbacks?.onRetry?.(attempt, maxRetries, info),
         };
-        return await this.aiService.chatStream(messages, activeTools, streamCallbacks, requestOptions);
+        const response = await this.aiService.chatStream(messages, activeTools, streamCallbacks, requestOptions);
+        reportAcceptedRequest();
+        return response;
       }
-      return await this.aiService.chat(messages, activeTools, requestOptions);
+      const response = await this.aiService.chat(messages, activeTools, requestOptions);
+      reportAcceptedRequest();
+      return response;
     }
+  }
+
+  /** Deep snapshot of an accepted request so observers can never mutate live provider input. */
+  private snapshotProviderMessages(messages: Message[]): Message[] {
+    return JSON.parse(JSON.stringify(messages)) as Message[];
   }
 
   private ensurePromptBudget(messages: Message[], tools: ToolDefinition[]): boolean {

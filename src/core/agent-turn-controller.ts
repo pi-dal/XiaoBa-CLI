@@ -39,6 +39,11 @@ import {
   withSyntheticObservationTiming,
 } from './synthetic-observation';
 import { MemorySidecarBranchHandle, startMemorySidecarBranch } from './sidecar-memory-branch';
+import type { CatsLogMemoryBackend } from '../utils/catslog-memory-provider';
+import { isCatsLogSkillNodesEnvEnabled } from '../utils/catslog-memory-provider';
+import type { CatsLogReceiptLedgerEntry } from '../utils/catslog-receipt-ledger';
+import { CatsLogUseStageReporter } from '../utils/catslog-use-stage-reporter';
+import type { ObservationBranchRunDisposition } from './observation-branch-session';
 
 const EMPTY_FINAL_RESPONSE_MESSAGE = '模型本轮未返回有效内容。请重新发送上一条消息；若仍失败，请切换模型或稍后再试。';
 
@@ -49,6 +54,8 @@ export interface AgentTurnServices {
     modelSource: 'inherit' | 'catalog' | 'custom';
     aiService: AIService;
   };
+  /** Device-bound CatsLog read capability, scoped to the memory branch. */
+  catslogMemory?: CatsLogMemoryBackend;
   toolManager: ToolManager;
   skillManager: SkillManager;
 }
@@ -125,6 +132,12 @@ interface MemoryBranchSlot {
 export class AgentTurnController {
   private turnSequence = 0;
   private memoryBranchCarryover: MemoryBranchSlot | null = null;
+  /**
+   * Process-private reporter consuming the memory branch's run-end receipt
+   * handoff. Created lazily on the first handoff; enqueue is non-blocking,
+   * failure-contained, and never carries receipt material into logs.
+   */
+  private useStageReporter: CatsLogUseStageReporter | null = null;
 
   constructor(private readonly options: AgentTurnControllerOptions) {}
 
@@ -418,6 +431,7 @@ export class AgentTurnController {
     queue: SyntheticObservationQueue;
     abortSignal?: AbortSignal;
   }): MemorySidecarBranchHandle {
+    const catslogMemory = this.options.services.catslogMemory;
     return startMemorySidecarBranch({
       sessionKey: this.options.sessionKey,
       input: options.input,
@@ -427,7 +441,35 @@ export class AgentTurnController {
       aiService: this.options.services.memoryBranch?.aiService ?? this.options.services.aiService,
       queue: options.queue,
       signal: options.abortSignal,
+      catslogMemory,
+      catsLogSkillNodesEnabled: catslogMemory ? isCatsLogSkillNodesEnvEnabled() : false,
+      ...(catslogMemory
+        ? {
+          onRunEndReceipts: (entries: CatsLogReceiptLedgerEntry[], disposition: ObservationBranchRunDisposition) =>
+            this.enqueueUseStageReports(catslogMemory, entries, disposition),
+        }
+        : {}),
     });
+  }
+
+  /**
+   * Production consumer of the branch receipt handoff: forward the final
+   * use facts to the process-private reporter. Enqueue only maps/copies and
+   * returns; the network happens outside the branch and every failure is
+   * contained there. This is branch-native telemetry transport — it is not a
+   * terminal outcome report and main-agent completion is not an input.
+   */
+  private enqueueUseStageReports(
+    backend: CatsLogMemoryBackend,
+    entries: CatsLogReceiptLedgerEntry[],
+    disposition: ObservationBranchRunDisposition,
+  ): void {
+    try {
+      this.useStageReporter ??= new CatsLogUseStageReporter(backend);
+      this.useStageReporter.enqueue(entries, disposition);
+    } catch {
+      Logger.warning(`[${this.options.sessionKey}] use-stage enqueue failed; receipts were dropped`);
+    }
   }
 
   private isMemoryBranchEnabled(): boolean {
