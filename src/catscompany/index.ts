@@ -162,8 +162,9 @@ interface BackgroundSubAgentCompletionBatch {
    *  不能每 1.5s 重跑一次模型回合。 */
   deliveryAttempts?: number;
   /** Set once the cap (or a permanent failure) stopped re-injection. The items
-   *  stay in the batch and are NOT marked handled, so wait_subagents / a later
-   *  result can still surface them. */
+   *  stay in the batch, so a later result for the same session re-flushes them.
+   *  When the model turn ran but the reply failed they are already marked
+   *  handled, so wait_subagents will not surface them again. */
   undelivered?: boolean;
 }
 
@@ -2710,8 +2711,9 @@ export class CatsCompanyBot {
   }
 
   /**
-   * 停止为一个无法投递的批次重新注入。批次条目保留在 map 中且不标记 handled，
-   * 因此 wait_subagents 或后续结果仍可恢复它们；只是不再重跑模型回合。
+   * 停止为一个无法投递的批次重新注入。批次条目保留在 map 中，同一会话的后续结果会
+   * 重新回流它们；若模型回合已执行、仅回复失败，条目已标记 handled，wait_subagents
+   * 不会再取到它们。不再重跑模型回合。
    */
   private abandonSubAgentCompletionBatch(
     sessionKey: string,
@@ -2725,7 +2727,7 @@ export class CatsCompanyBot {
     this.subAgentCompletionBatches.set(sessionKey, batch);
     const labels = items.map(item => item.id || item.displayName).join(', ');
     Logger.error(
-      `[${sessionKey}] 子智能体批量回流已停止重试（${reason}），${items.length} 条结果未送达但保留可恢复: ${labels}`,
+      `[${sessionKey}] 子智能体批量回流已停止重试（${reason}），${items.length} 条结果未送达，保留在批次中待后续结果一并回流: ${labels}`,
     );
   }
 
