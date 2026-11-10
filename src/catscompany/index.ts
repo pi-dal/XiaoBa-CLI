@@ -157,12 +157,25 @@ interface BackgroundSubAgentCompletionBatch {
   clearGeneration: number;
   items: Map<string, BackgroundSubAgentCompletionItem>;
   timer?: ReturnType<typeof setTimeout>;
+  /** Flushes that did not settle this batch (a throw, or reply+fallback both
+   *  failing). Bounds re-injection so a permanent failure (例如 403 不在群内)
+   *  不能每 1.5s 重跑一次模型回合。 */
+  deliveryAttempts?: number;
+  /** Set once the cap (or a permanent failure) stopped re-injection. The items
+   *  stay in the batch and are NOT marked handled, so wait_subagents / a later
+   *  result can still surface them. */
+  undelivered?: boolean;
 }
 
 const TYPING_HEARTBEAT_INTERVAL_MS = 5_000;
 const BACKGROUND_SUBAGENT_COMPLETION_DEBOUNCE_MS = 1_500;
 const BACKGROUND_SUBAGENT_COMPLETION_MAX_DELAY_MS = 15_000;
 const SUBAGENT_FALLBACK_MAX_DELIVERY_ATTEMPTS = 3;
+/** Upper bound on batch flushes that end undelivered. With the 1.5s base and
+ *  exponential backoff this covers ~22s of retries (1.5+3+6+12); a permanent
+ *  403 short-circuits on the first one. Past this point the paid model turn is
+ *  never re-run for an undeliverable batch. */
+const SUBAGENT_BATCH_MAX_FLUSH_ATTEMPTS = 4;
 const NATIVE_FEISHU_CONTEXT_PAGE_SIZE = 100;
 const BACKGROUND_SUBAGENT_COMPLETION_MAX_ITEMS = 6;
 const DEVICE_REGISTRATION_REFRESH_MS = 120_000;
@@ -317,6 +330,19 @@ function formatModelRetryThinking(attempt: number, maxRetries: number, info?: St
     ? `，约 ${Math.ceil(info.delayMs / 1000)} 秒后继续`
     : '';
   return `模型连接不稳定，正在自动恢复 ${attempt}/${maxRetries}${retryIn}...`;
+}
+
+/**
+ * 投递是否已经永久失败（重试只会重复失败）。403 means the bot is not in the
+ * group / is muted / has no send permission: waiting cannot fix it, and each
+ * retry re-runs a paid model turn. CatsSendError carries the status in `code`
+ * (kind 'ack'); the HTTP fallback and a few legacy call sites use
+ * `status`/`statusCode`.
+ */
+function isPermanentSubAgentDeliveryError(err: any): boolean {
+  const status = err?.code ?? err?.status ?? err?.statusCode;
+  if (status !== 403) return false;
+  return err?.kind === undefined || err?.kind === 'ack' || err?.kind === 'http';
 }
 
 function isActiveSubAgentStatusForUi(status?: SubAgentInfo['status']): boolean {
@@ -2489,6 +2515,13 @@ export class CatsCompanyBot {
     batch.channelSource = executionScope?.channelSource ?? batch.channelSource;
     batch.executionScope = executionScope ?? batch.executionScope;
     batch.items.set(item.id || `${item.displayName}:${item.task}:${batch.items.size}`, item);
+    // A newly arrived result starts a fresh delivery episode: earlier items may
+    // have been abandoned as undelivered, and the permanent cause (e.g. the bot
+    // being re-added to the group) may have been fixed since.
+    if (batch.undelivered || batch.deliveryAttempts) {
+      batch.deliveryAttempts = 0;
+      batch.undelivered = false;
+    }
 
     if (batch.timer) clearTimeout(batch.timer);
     batch.timer = setTimeout(() => {
@@ -2606,6 +2639,15 @@ export class CatsCompanyBot {
       }
       const fallback = this.formatSubAgentCompletionNotice(items, activeSubAgents.length);
       let fallbackDelivered = false;
+      // A permanent delivery failure (403: not in the group / muted / no send
+      // permission) cannot be fixed by waiting, and every retry re-runs a paid
+      // model turn. Stop immediately instead of looping.
+      if (isPermanentSubAgentDeliveryError(err)) {
+        batch.deliveryAttempts = (batch.deliveryAttempts ?? 0) + 1;
+        this.abandonSubAgentCompletionBatch(sessionKey, batch, items, `永久投递失败: ${err?.message || err}`);
+        return;
+      }
+      let fallbackError: any;
       if (fallback) {
         try {
           await this.sender.reply(batch.topic, fallback);
@@ -2614,18 +2656,34 @@ export class CatsCompanyBot {
           }
           fallbackDelivered = true;
         } catch (sendErr: any) {
+          fallbackError = sendErr;
           Logger.warning(`后台子任务兜底通知发送失败: ${sendErr.message}`);
         }
       }
       if (!fallbackDelivered && batch.clearGeneration === this.getSessionClearGeneration(sessionKey)) {
+        const attempts = (batch.deliveryAttempts ?? 0) + 1;
+        batch.deliveryAttempts = attempts;
+        if (isPermanentSubAgentDeliveryError(fallbackError) || attempts >= SUBAGENT_BATCH_MAX_FLUSH_ATTEMPTS) {
+          this.abandonSubAgentCompletionBatch(
+            sessionKey,
+            batch,
+            items,
+            isPermanentSubAgentDeliveryError(fallbackError)
+              ? `永久投递失败: ${fallbackError?.message || fallbackError}`
+              : `连续 ${attempts} 次投递失败`,
+          );
+          return;
+        }
+        Logger.warning(`[${sessionKey}] 子智能体批量回流投递失败（第 ${attempts} 次），将退避重试`);
         const pendingBatch = this.subAgentCompletionBatches.get(sessionKey);
         if (pendingBatch && pendingBatch !== batch) {
           for (const [itemKey, item] of batch.items) pendingBatch.items.set(itemKey, item);
           pendingBatch.firstAt = Math.min(pendingBatch.firstAt, batch.firstAt);
-          this.rescheduleSubAgentCompletionBatch(sessionKey, pendingBatch);
+          pendingBatch.deliveryAttempts = attempts;
+          this.rescheduleSubAgentCompletionBatch(sessionKey, pendingBatch, attempts);
         } else {
           this.subAgentCompletionBatches.set(sessionKey, batch);
-          this.rescheduleSubAgentCompletionBatch(sessionKey, batch);
+          this.rescheduleSubAgentCompletionBatch(sessionKey, batch, attempts);
         }
       }
     } finally {
@@ -2639,12 +2697,36 @@ export class CatsCompanyBot {
   private rescheduleSubAgentCompletionBatch(
     sessionKey: string,
     batch: BackgroundSubAgentCompletionBatch,
+    backoffAttempts = 0,
   ): void {
     if (batch.timer) clearTimeout(batch.timer);
+    const delay = backoffAttempts > 0
+      ? BACKGROUND_SUBAGENT_COMPLETION_DEBOUNCE_MS * (2 ** (backoffAttempts - 1))
+      : BACKGROUND_SUBAGENT_COMPLETION_DEBOUNCE_MS;
     batch.timer = setTimeout(() => {
       void this.flushSubAgentCompletionBatch(sessionKey);
-    }, BACKGROUND_SUBAGENT_COMPLETION_DEBOUNCE_MS);
+    }, delay);
     batch.timer.unref?.();
+  }
+
+  /**
+   * 停止为一个无法投递的批次重新注入。批次条目保留在 map 中且不标记 handled，
+   * 因此 wait_subagents 或后续结果仍可恢复它们；只是不再重跑模型回合。
+   */
+  private abandonSubAgentCompletionBatch(
+    sessionKey: string,
+    batch: BackgroundSubAgentCompletionBatch,
+    items: BackgroundSubAgentCompletionItem[],
+    reason: string,
+  ): void {
+    if (batch.timer) clearTimeout(batch.timer);
+    batch.timer = undefined;
+    batch.undelivered = true;
+    this.subAgentCompletionBatches.set(sessionKey, batch);
+    const labels = items.map(item => item.id || item.displayName).join(', ');
+    Logger.error(
+      `[${sessionKey}] 子智能体批量回流已停止重试（${reason}），${items.length} 条结果未送达但保留可恢复: ${labels}`,
+    );
   }
 
   private parseSubAgentCompletionObservation(
